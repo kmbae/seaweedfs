@@ -377,7 +377,7 @@ impl IpcServer {
                     port_lid: device_info.port_lid,
                     supported_auth: vec!["none".to_string()],
                     version: env!("CARGO_PKG_VERSION").to_string(),
-                    real_rdma: cfg!(feature = "real-ucx"),
+                    real_rdma: rdma_context.is_real_rdma(),
                 })
             }
             

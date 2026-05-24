@@ -1,6 +1,8 @@
 # Multi-stage build for Rust RDMA Engine
 FROM rust:1.80-slim AS builder
 
+ARG CARGO_FEATURES=""
+
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -9,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     libc6-dev \
     linux-libc-dev \
+    libucx-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Set work directory
@@ -19,17 +22,26 @@ COPY rdma-engine/Cargo.toml ./
 COPY rdma-engine/Cargo.lock ./
 COPY rdma-engine/src ./src
 
-# Build the release binary
-RUN cargo build --release
+# Build the release binary (pass CARGO_FEATURES=real-ucx for Mellanox UCX)
+RUN if [ -n "$CARGO_FEATURES" ]; then \
+      cargo build --release --features "$CARGO_FEATURES"; \
+    else \
+      cargo build --release; \
+    fi
 
 # Runtime stage
 FROM debian:bookworm-slim
+
+ARG CARGO_FEATURES=""
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
     curl \
+    && if echo "$CARGO_FEATURES" | grep -q real-ucx; then \
+      apt-get install -y libucx0; \
+    fi \
     && rm -rf /var/lib/apt/lists/*
 
 # Create app user
