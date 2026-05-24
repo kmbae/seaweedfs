@@ -8,65 +8,52 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
+	"seaweedfs-rdma-sidecar/pkg/httpserver"
 	"seaweedfs-rdma-sidecar/pkg/rdma"
+	"seaweedfs-rdma-sidecar/pkg/seaweedfs"
 
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
 
 var (
-	port         int
-	engineSocket string
-	debug        bool
-	timeout      time.Duration
+	port              int
+	engineSocket      string
+	volumeServerURL   string
+	volumeDataDir     string
+	volumeIdxDir      string
+	volumeCollection  string
+	enableRDMA        bool
+	enableZeroCopy    bool
+	tempDir           string
+	debug             bool
+	timeout           time.Duration
 )
-
-// Response structs for JSON encoding
-type HealthResponse struct {
-	Status              string `json:"status"`
-	RdmaEngineConnected bool   `json:"rdma_engine_connected"`
-	RdmaEngineLatency   string `json:"rdma_engine_latency"`
-	Timestamp           string `json:"timestamp"`
-}
-
-type CapabilitiesResponse struct {
-	Version         string   `json:"version"`
-	DeviceName      string   `json:"device_name"`
-	VendorId        uint32   `json:"vendor_id"`
-	MaxSessions     uint32   `json:"max_sessions"`
-	MaxTransferSize uint64   `json:"max_transfer_size"`
-	ActiveSessions  uint32   `json:"active_sessions"`
-	RealRdma        bool     `json:"real_rdma"`
-	PortGid         string   `json:"port_gid"`
-	PortLid         uint16   `json:"port_lid"`
-	SupportedAuth   []string `json:"supported_auth"`
-}
-
-type PingResponse struct {
-	Success       bool   `json:"success"`
-	EngineLatency string `json:"engine_latency"`
-	TotalLatency  string `json:"total_latency"`
-	Timestamp     string `json:"timestamp"`
-}
 
 func main() {
 	var rootCmd = &cobra.Command{
 		Use:   "rdma-sidecar",
 		Short: "SeaweedFS RDMA acceleration sidecar",
-		Long: `RDMA sidecar that accelerates SeaweedFS read/write operations using UCX and Rust RDMA engine.
+		Long: `RDMA sidecar that accelerates SeaweedFS read operations using a Rust RDMA engine.
 
-This sidecar acts as a bridge between SeaweedFS volume servers and the high-performance
-Rust RDMA engine, providing significant performance improvements for data-intensive workloads.`,
+Mount clients call GET /read with file_id, offset, size, and volume_server parameters.
+When the engine runs in mock mode, needle data is loaded from the local volume directory
+(if configured) or via HTTP fallback to the volume server.`,
 		RunE: runSidecar,
 	}
 
-	// Flags
 	rootCmd.Flags().IntVarP(&port, "port", "p", 8081, "HTTP server port")
 	rootCmd.Flags().StringVarP(&engineSocket, "engine-socket", "e", "/tmp/rdma-engine.sock", "Path to RDMA engine Unix socket")
+	rootCmd.Flags().StringVarP(&volumeServerURL, "volume-server", "v", "http://127.0.0.1:8444", "Default SeaweedFS volume server URL for HTTP fallback")
+	rootCmd.Flags().StringVar(&volumeDataDir, "volume-data-dir", "", "Local volume data directory shared with the volume server (e.g. /data)")
+	rootCmd.Flags().StringVar(&volumeIdxDir, "volume-idx-dir", "", "Local volume index directory (defaults to volume-data-dir)")
+	rootCmd.Flags().StringVar(&volumeCollection, "volume-collection", "", "Volume collection name when using local reads")
+	rootCmd.Flags().BoolVar(&enableRDMA, "enable-rdma", true, "Enable RDMA engine session coordination")
+	rootCmd.Flags().BoolVar(&enableZeroCopy, "enable-zerocopy", true, "Enable zero-copy temp file optimization")
+	rootCmd.Flags().StringVar(&tempDir, "temp-dir", "/tmp/rdma-cache", "Temp directory for zero-copy files")
 	rootCmd.Flags().BoolVarP(&debug, "debug", "d", false, "Enable debug logging")
 	rootCmd.Flags().DurationVarP(&timeout, "timeout", "t", 30*time.Second, "RDMA operation timeout")
 
@@ -77,269 +64,158 @@ Rust RDMA engine, providing significant performance improvements for data-intens
 }
 
 func runSidecar(cmd *cobra.Command, args []string) error {
-	// Setup logging
 	logger := logrus.New()
 	if debug {
 		logger.SetLevel(logrus.DebugLevel)
-		logger.SetFormatter(&logrus.TextFormatter{
-			FullTimestamp: true,
-			ForceColors:   true,
-		})
 	} else {
 		logger.SetLevel(logrus.InfoLevel)
 	}
 
 	logger.WithFields(logrus.Fields{
-		"port":          port,
-		"engine_socket": engineSocket,
-		"debug":         debug,
-		"timeout":       timeout,
-	}).Info("🚀 Starting SeaweedFS RDMA Sidecar")
+		"port":              port,
+		"engine_socket":     engineSocket,
+		"volume_server_url": volumeServerURL,
+		"volume_data_dir":   volumeDataDir,
+		"enable_rdma":       enableRDMA,
+	}).Info("Starting SeaweedFS RDMA sidecar")
 
-	// Create RDMA client
-	rdmaConfig := &rdma.Config{
+	sfClient, err := seaweedfs.NewSeaweedFSRDMAClient(&seaweedfs.Config{
+		RDMASocketPath:   engineSocket,
+		VolumeServerURL:  volumeServerURL,
+		Enabled:          enableRDMA,
+		DefaultTimeout:   timeout,
+		Logger:           logger,
+		UseZeroCopy:      enableZeroCopy,
+		TempDir:          tempDir,
+		EnablePooling:    true,
+		VolumeDataDir:    volumeDataDir,
+		VolumeIdxDir:     volumeIdxDir,
+		VolumeCollection: volumeCollection,
+	})
+	if err != nil {
+		return fmt.Errorf("create seaweedfs client: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := sfClient.Start(ctx); err != nil {
+		return fmt.Errorf("start seaweedfs client: %w", err)
+	}
+	defer sfClient.Stop()
+
+	rdmaClient := sfClient // health/capabilities use underlying rdma via separate client for ping
+	_ = rdmaClient
+
+	// Separate rdma client reference for health endpoints
+	healthRdma := rdma.NewClient(&rdma.Config{
 		EngineSocketPath: engineSocket,
 		DefaultTimeout:   timeout,
 		Logger:           logger,
-	}
-
-	rdmaClient := rdma.NewClient(rdmaConfig)
-
-	// Connect to RDMA engine
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-
-	logger.Info("🔗 Connecting to RDMA engine...")
-	if err := rdmaClient.Connect(ctx); err != nil {
-		return fmt.Errorf("failed to connect to RDMA engine: %w", err)
-	}
-	logger.Info("✅ Connected to RDMA engine successfully")
-
-	// Create HTTP server
-	sidecar := &Sidecar{
-		rdmaClient: rdmaClient,
-		logger:     logger,
+	})
+	if enableRDMA {
+		if err := healthRdma.Connect(ctx); err != nil {
+			logger.WithError(err).Warn("RDMA engine health client connect failed")
+		} else {
+			defer healthRdma.Disconnect()
+		}
 	}
 
 	mux := http.NewServeMux()
-
-	// Health check endpoint
-	mux.HandleFunc("/health", sidecar.healthHandler)
-
-	// RDMA operations endpoints
-	mux.HandleFunc("/rdma/read", sidecar.rdmaReadHandler)
-	mux.HandleFunc("/rdma/capabilities", sidecar.capabilitiesHandler)
-	mux.HandleFunc("/rdma/ping", sidecar.pingHandler)
+	mux.Handle("/read", &httpserver.ReadHandler{Client: sfClient, Logger: logger})
+	mux.HandleFunc("/health", healthHandler(logger, healthRdma))
+	mux.HandleFunc("/rdma/capabilities", capabilitiesHandler(healthRdma))
+	mux.HandleFunc("/rdma/ping", pingHandler(logger, healthRdma))
 
 	server := &http.Server{
 		Addr:    fmt.Sprintf(":%d", port),
 		Handler: mux,
 	}
 
-	// Handle graceful shutdown
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		logger.WithField("port", port).Info("🌐 HTTP server starting")
+		logger.WithField("port", port).Info("HTTP server starting")
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.WithError(err).Fatal("HTTP server failed")
 		}
 	}()
 
-	// Wait for shutdown signal
 	<-sigChan
-	logger.Info("📡 Received shutdown signal, gracefully shutting down...")
+	logger.Info("Shutting down sidecar")
 
-	// Shutdown HTTP server
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
-
-	if err := server.Shutdown(shutdownCtx); err != nil {
-		logger.WithError(err).Error("HTTP server shutdown failed")
-	} else {
-		logger.Info("🌐 HTTP server shutdown complete")
-	}
-
-	// Disconnect from RDMA engine
-	rdmaClient.Disconnect()
-	logger.Info("🛑 RDMA sidecar shutdown complete")
-
-	return nil
+	return server.Shutdown(shutdownCtx)
 }
 
-// Sidecar represents the main sidecar service
-type Sidecar struct {
-	rdmaClient *rdma.Client
-	logger     *logrus.Logger
-}
-
-// Health check handler
-func (s *Sidecar) healthHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
-	defer cancel()
-
-	// Test RDMA engine connectivity
-	if !s.rdmaClient.IsConnected() {
-		s.logger.Warn("⚠️  RDMA engine not connected")
-		http.Error(w, "RDMA engine not connected", http.StatusServiceUnavailable)
-		return
-	}
-
-	// Ping RDMA engine
-	latency, err := s.rdmaClient.Ping(ctx)
-	if err != nil {
-		s.logger.WithError(err).Error("❌ RDMA engine ping failed")
-		http.Error(w, "RDMA engine ping failed", http.StatusServiceUnavailable)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	response := HealthResponse{
-		Status:              "healthy",
-		RdmaEngineConnected: true,
-		RdmaEngineLatency:   latency.String(),
-		Timestamp:           time.Now().Format(time.RFC3339),
-	}
-	json.NewEncoder(w).Encode(response)
-}
-
-// RDMA capabilities handler
-func (s *Sidecar) capabilitiesHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	caps := s.rdmaClient.GetCapabilities()
-	if caps == nil {
-		http.Error(w, "No capabilities available", http.StatusServiceUnavailable)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	response := CapabilitiesResponse{
-		Version:         caps.Version,
-		DeviceName:      caps.DeviceName,
-		VendorId:        caps.VendorId,
-		MaxSessions:     uint32(caps.MaxSessions),
-		MaxTransferSize: caps.MaxTransferSize,
-		ActiveSessions:  uint32(caps.ActiveSessions),
-		RealRdma:        caps.RealRdma,
-		PortGid:         caps.PortGid,
-		PortLid:         caps.PortLid,
-		SupportedAuth:   caps.SupportedAuth,
-	}
-	json.NewEncoder(w).Encode(response)
-}
-
-// RDMA ping handler
-func (s *Sidecar) pingHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
-	defer cancel()
-
-	start := time.Now()
-	latency, err := s.rdmaClient.Ping(ctx)
-	totalLatency := time.Since(start)
-
-	if err != nil {
-		s.logger.WithError(err).Error("❌ RDMA ping failed")
-		http.Error(w, fmt.Sprintf("Ping failed: %v", err), http.StatusInternalServerError)
-		return
-	}
-
-	w.Header().Set("Content-Type", "application/json")
-	response := PingResponse{
-		Success:       true,
-		EngineLatency: latency.String(),
-		TotalLatency:  totalLatency.String(),
-		Timestamp:     time.Now().Format(time.RFC3339),
-	}
-	json.NewEncoder(w).Encode(response)
-}
-
-// RDMA read handler - uses GET method with query parameters for RESTful read operations
-func (s *Sidecar) rdmaReadHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
-	// Parse query parameters
-	query := r.URL.Query()
-
-	// Get file ID (e.g., "3,01637037d6") - this is the natural SeaweedFS identifier
-	fileID := query.Get("file_id")
-	if fileID == "" {
-		http.Error(w, "missing 'file_id' parameter", http.StatusBadRequest)
-		return
-	}
-
-	// Parse optional offset and size parameters
-	offset := uint64(0) // default value
-	if offsetStr := query.Get("offset"); offsetStr != "" {
-		val, err := strconv.ParseUint(offsetStr, 10, 64)
-		if err != nil {
-			http.Error(w, "invalid 'offset' parameter", http.StatusBadRequest)
+func healthHandler(logger *logrus.Logger, rdmaClient *rdma.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		offset = val
-	}
 
-	size := uint64(4096) // default value
-	if sizeStr := query.Get("size"); sizeStr != "" {
-		val, err := strconv.ParseUint(sizeStr, 10, 64)
-		if err != nil {
-			http.Error(w, "invalid 'size' parameter", http.StatusBadRequest)
+		status := "healthy"
+		latency := ""
+		if rdmaClient.IsConnected() {
+			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+			defer cancel()
+			d, err := rdmaClient.Ping(ctx)
+			if err != nil {
+				http.Error(w, "RDMA engine ping failed", http.StatusServiceUnavailable)
+				return
+			}
+			latency = d.String()
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":                status,
+			"rdma_engine_connected": rdmaClient.IsConnected(),
+			"rdma_engine_latency":   latency,
+			"real_rdma":             rdmaClient.IsRealRdma(),
+			"timestamp":             time.Now().Format(time.RFC3339),
+		})
+	}
+}
+
+func capabilitiesHandler(rdmaClient *rdma.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 			return
 		}
-		size = val
+		caps := rdmaClient.GetCapabilities()
+		if caps == nil {
+			http.Error(w, "No capabilities available", http.StatusServiceUnavailable)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(caps)
 	}
+}
 
-	s.logger.WithFields(logrus.Fields{
-		"file_id": fileID,
-		"offset":  offset,
-		"size":    size,
-	}).Info("📖 Processing RDMA read request")
-
-	ctx, cancel := context.WithTimeout(r.Context(), timeout)
-	defer cancel()
-
-	start := time.Now()
-	resp, err := s.rdmaClient.ReadFileRange(ctx, fileID, offset, size)
-	duration := time.Since(start)
-
-	if err != nil {
-		s.logger.WithError(err).Error("❌ RDMA read failed")
-		http.Error(w, fmt.Sprintf("RDMA read failed: %v", err), http.StatusInternalServerError)
-		return
+func pingHandler(logger *logrus.Logger, rdmaClient *rdma.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+		defer cancel()
+		start := time.Now()
+		latency, err := rdmaClient.Ping(ctx)
+		if err != nil {
+			http.Error(w, fmt.Sprintf("Ping failed: %v", err), http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success":        true,
+			"engine_latency": latency.String(),
+			"total_latency":  time.Since(start).String(),
+			"timestamp":      time.Now().Format(time.RFC3339),
+		})
 	}
-
-	s.logger.WithFields(logrus.Fields{
-		"file_id":       fileID,
-		"bytes_read":    resp.BytesRead,
-		"duration":      duration,
-		"transfer_rate": resp.TransferRate,
-		"session_id":    resp.SessionID,
-	}).Info("✅ RDMA read completed successfully")
-
-	// Set response headers
-	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("X-RDMA-Session-ID", resp.SessionID)
-	w.Header().Set("X-RDMA-Duration", duration.String())
-	w.Header().Set("X-RDMA-Transfer-Rate", fmt.Sprintf("%.2f", resp.TransferRate))
-	w.Header().Set("X-RDMA-Bytes-Read", fmt.Sprintf("%d", resp.BytesRead))
-
-	// Write the data
-	w.Write(resp.Data)
 }

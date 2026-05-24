@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"seaweedfs-rdma-sidecar/pkg/rdma"
+	"seaweedfs-rdma-sidecar/pkg/volumeread"
 
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
@@ -21,6 +22,7 @@ import (
 // SeaweedFSRDMAClient provides SeaweedFS-specific RDMA operations
 type SeaweedFSRDMAClient struct {
 	rdmaClient      *rdma.Client
+	localReader     *volumeread.Reader
 	logger          *logrus.Logger
 	volumeServerURL string
 	enabled         bool
@@ -46,6 +48,11 @@ type Config struct {
 	EnablePooling  bool          // Enable RDMA connection pooling (default: true)
 	MaxConnections int           // Max connections in pool (default: 10)
 	MaxIdleTime    time.Duration // Max idle time before connection cleanup (default: 5min)
+
+	// Local volume directory for colocated sidecar (shared PVC with volume server).
+	VolumeDataDir    string
+	VolumeIdxDir     string
+	VolumeCollection string
 }
 
 // NeedleReadRequest represents a SeaweedFS needle read request
@@ -104,14 +111,18 @@ func NewSeaweedFSRDMAClient(config *Config) (*SeaweedFSRDMAClient, error) {
 		}
 	}
 
-	return &SeaweedFSRDMAClient{
+	client := &SeaweedFSRDMAClient{
 		rdmaClient:      rdmaClient,
 		logger:          config.Logger,
 		volumeServerURL: config.VolumeServerURL,
 		enabled:         config.Enabled,
 		tempDir:         tempDir,
 		useZeroCopy:     config.UseZeroCopy,
-	}, nil
+	}
+	if config.VolumeDataDir != "" {
+		client.localReader = volumeread.NewReader(config.VolumeDataDir, config.VolumeIdxDir, config.VolumeCollection)
+	}
+	return client, nil
 }
 
 // Start initializes the RDMA client connection
@@ -134,6 +145,9 @@ func (c *SeaweedFSRDMAClient) Start(ctx context.Context) error {
 
 // Stop shuts down the RDMA client
 func (c *SeaweedFSRDMAClient) Stop() {
+	if c.localReader != nil {
+		c.localReader.Close()
+	}
 	if c.rdmaClient != nil {
 		c.rdmaClient.Disconnect()
 		c.logger.Info("🔌 SeaweedFS RDMA client stopped")
@@ -167,50 +181,49 @@ func (c *SeaweedFSRDMAClient) ReadNeedle(ctx context.Context, req *NeedleReadReq
 			Size:     req.Size,
 		}
 
-		resp, err := c.rdmaClient.Read(ctx, rdmaReq)
+		_, err := c.rdmaClient.Read(ctx, rdmaReq)
 		if err != nil {
 			c.logger.WithError(err).Warn("⚠️  RDMA read failed, falling back to HTTP")
 			rdmaErr = err
 		} else {
-			c.logger.WithFields(logrus.Fields{
-				"volume_id":     req.VolumeID,
-				"needle_id":     req.NeedleID,
-				"bytes_read":    resp.BytesRead,
-				"transfer_rate": resp.TransferRate,
-				"latency":       time.Since(start),
-			}).Info("🚀 RDMA fast path successful")
+			data, source, fetchErr := c.fetchNeedleData(ctx, req)
+			if fetchErr != nil {
+				c.logger.WithError(fetchErr).Warn("⚠️  RDMA session ok but data fetch failed, falling back to HTTP")
+				rdmaErr = fetchErr
+			} else {
+				isRealRDMA := c.rdmaClient.IsRealRdma()
+				c.logger.WithFields(logrus.Fields{
+					"volume_id":  req.VolumeID,
+					"needle_id":  req.NeedleID,
+					"source":     source,
+					"real_rdma":  isRealRDMA,
+					"latency":    time.Since(start),
+					"bytes_read": len(data),
+				}).Info("🚀 RDMA fast path successful")
 
-			// Try zero-copy optimization if enabled and data is large enough
-			if c.useZeroCopy && len(resp.Data) > 64*1024 { // 64KB threshold
-				tempFilePath, err := c.writeToTempFile(req, resp.Data)
-				if err != nil {
-					c.logger.WithError(err).Warn("Failed to write temp file, using regular response")
-					// Fall back to regular response
-				} else {
-					c.logger.WithFields(logrus.Fields{
-						"temp_file": tempFilePath,
-						"size":      len(resp.Data),
-					}).Info("🔥 Zero-copy temp file created")
-
-					return &NeedleReadResponse{
-						Data:         nil, // Don't duplicate data in memory
-						IsRDMA:       true,
-						Latency:      time.Since(start),
-						Source:       "rdma-zerocopy",
-						SessionID:    resp.SessionID,
-						TempFilePath: tempFilePath,
-						UseTempFile:  true,
-					}, nil
+				if c.useZeroCopy && len(data) > 64*1024 {
+					tempFilePath, err := c.writeToTempFile(req, data)
+					if err != nil {
+						c.logger.WithError(err).Warn("Failed to write temp file, using regular response")
+					} else {
+						return &NeedleReadResponse{
+							Data:         nil,
+							IsRDMA:       isRealRDMA,
+							Latency:      time.Since(start),
+							Source:       source + "-zerocopy",
+							TempFilePath: tempFilePath,
+							UseTempFile:  true,
+						}, nil
+					}
 				}
-			}
 
-			return &NeedleReadResponse{
-				Data:      resp.Data,
-				IsRDMA:    true,
-				Latency:   time.Since(start),
-				Source:    "rdma",
-				SessionID: resp.SessionID,
-			}, nil
+				return &NeedleReadResponse{
+					Data:    data,
+					IsRDMA:  isRealRDMA,
+					Latency: time.Since(start),
+					Source:  source,
+				}, nil
+			}
 		}
 	}
 
@@ -247,6 +260,24 @@ func (c *SeaweedFSRDMAClient) ReadNeedleRange(ctx context.Context, volumeID uint
 		Size:     size,
 	}
 	return c.ReadNeedle(ctx, req)
+}
+
+// fetchNeedleData loads actual needle bytes after an RDMA session completes.
+// Mock engines only coordinate the session; data always comes from local files or HTTP.
+func (c *SeaweedFSRDMAClient) fetchNeedleData(ctx context.Context, req *NeedleReadRequest) ([]byte, string, error) {
+	if c.localReader != nil {
+		data, err := c.localReader.ReadNeedle(req.VolumeID, req.NeedleID, req.Cookie, req.Offset, req.Size)
+		if err == nil {
+			return data, "local-volume", nil
+		}
+		c.logger.WithError(err).Debug("local volume read failed, trying HTTP fallback")
+	}
+
+	data, err := c.httpFallback(ctx, req)
+	if err != nil {
+		return nil, "", err
+	}
+	return data, "http", nil
 }
 
 // httpFallback performs HTTP fallback read from SeaweedFS volume server

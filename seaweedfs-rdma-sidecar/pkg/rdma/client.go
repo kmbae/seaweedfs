@@ -334,6 +334,14 @@ func (c *Client) GetCapabilities() *ipc.GetCapabilitiesResponse {
 	return c.capabilities
 }
 
+// IsRealRdma reports whether the connected engine uses hardware RDMA (vs mock).
+func (c *Client) IsRealRdma() bool {
+	if c.capabilities == nil {
+		return false
+	}
+	return c.capabilities.RealRdma
+}
+
 // Read performs an RDMA read operation for a SeaweedFS needle
 func (c *Client) Read(ctx context.Context, req *ReadRequest) (*ReadResponse, error) {
 	if !c.IsConnected() {
