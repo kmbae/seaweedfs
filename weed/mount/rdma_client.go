@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -27,12 +28,19 @@ type RDMAMountClient struct {
 	// Volume lookup
 	lookupFileIdFn wdclient.LookupFileIdFunctionType
 
-	// Statistics
+	// Read statistics
 	totalRequests   atomic.Int64
 	successfulReads atomic.Int64
 	failedReads     atomic.Int64
 	totalBytesRead  atomic.Int64
 	totalLatencyNs  atomic.Int64
+
+	// Write statistics
+	totalWriteRequests   atomic.Int64
+	successfulWrites     atomic.Int64
+	failedWrites         atomic.Int64
+	totalBytesWritten    atomic.Int64
+	totalWriteLatencyNs  atomic.Int64
 }
 
 // RDMAReadRequest represents a request to read data via RDMA
@@ -57,6 +65,15 @@ type RDMAReadResponse struct {
 	// Zero-copy optimization fields
 	UseTempFile bool   `json:"use_temp_file"`
 	TempFile    string `json:"temp_file"`
+}
+
+// RDMAWriteResponse represents the response from an RDMA write operation
+type RDMAWriteResponse struct {
+	Success bool   `json:"success"`
+	IsRDMA  bool   `json:"is_rdma"`
+	Source  string `json:"source"`
+	FileID  string `json:"file_id"`
+	Size    int    `json:"size"`
 }
 
 // RDMAHealthResponse represents the health status of the RDMA sidecar
@@ -264,6 +281,75 @@ func (c *RDMAMountClient) ReadNeedle(ctx context.Context, fileID string, offset,
 	return data, isRDMA, nil
 }
 
+// WriteNeedle writes data to a volume server via the RDMA sidecar
+func (c *RDMAMountClient) WriteNeedle(ctx context.Context, fileID string, data []byte, volumeServer string) (*RDMAWriteResponse, error) {
+	select {
+	case c.semaphore <- struct{}{}:
+		defer func() { <-c.semaphore }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+
+	c.totalWriteRequests.Add(1)
+	startTime := time.Now()
+
+	if volumeServer == "" {
+		var err error
+		volumeServer, err = c.lookupVolumeLocationByFileID(ctx, fileID)
+		if err != nil {
+			c.failedWrites.Add(1)
+			return nil, fmt.Errorf("failed to lookup volume for file %s: %w", fileID, err)
+		}
+	}
+
+	reqURL := fmt.Sprintf("http://%s/write?file_id=%s&volume_server=%s",
+		c.sidecarAddr,
+		url.QueryEscape(fileID),
+		url.QueryEscape(volumeServer))
+
+	req, err := http.NewRequestWithContext(ctx, "POST", reqURL, bytes.NewReader(data))
+	if err != nil {
+		c.failedWrites.Add(1)
+		return nil, fmt.Errorf("failed to create RDMA write request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/octet-stream")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		c.failedWrites.Add(1)
+		return nil, fmt.Errorf("RDMA write request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	duration := time.Since(startTime)
+	c.totalWriteLatencyNs.Add(duration.Nanoseconds())
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		c.failedWrites.Add(1)
+		return nil, fmt.Errorf("failed to read write response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		c.failedWrites.Add(1)
+		return nil, fmt.Errorf("RDMA write failed with status %s: %s", resp.Status, string(body))
+	}
+
+	var writeResp RDMAWriteResponse
+	if err := json.Unmarshal(body, &writeResp); err != nil {
+		c.failedWrites.Add(1)
+		return nil, fmt.Errorf("failed to parse write response: %w", err)
+	}
+
+	c.successfulWrites.Add(1)
+	c.totalBytesWritten.Add(int64(len(data)))
+
+	glog.V(4).Infof("RDMA write completed: fileID=%s, size=%d, duration=%v, rdma=%v, source=%s",
+		fileID, len(data), duration, writeResp.IsRDMA, writeResp.Source)
+
+	return &writeResp, nil
+}
+
 // cleanupTempFile requests cleanup of a temp file from the sidecar
 func (c *RDMAMountClient) cleanupTempFile(tempFilePath string) {
 	if tempFilePath == "" {
@@ -307,26 +393,42 @@ func (c *RDMAMountClient) GetStats() map[string]interface{} {
 	failedReads := c.failedReads.Load()
 	totalBytesRead := c.totalBytesRead.Load()
 	totalLatencyNs := c.totalLatencyNs.Load()
+	totalWriteRequests := c.totalWriteRequests.Load()
+	successfulWrites := c.successfulWrites.Load()
+	failedWrites := c.failedWrites.Load()
+	totalBytesWritten := c.totalBytesWritten.Load()
+	totalWriteLatencyNs := c.totalWriteLatencyNs.Load()
 
-	successRate := float64(0)
-	avgLatencyNs := int64(0)
-
+	readSuccessRate := float64(0)
+	avgReadLatencyNs := int64(0)
 	if totalRequests > 0 {
-		successRate = float64(successfulReads) / float64(totalRequests) * 100
-		avgLatencyNs = totalLatencyNs / totalRequests
+		readSuccessRate = float64(successfulReads) / float64(totalRequests) * 100
+		avgReadLatencyNs = totalLatencyNs / totalRequests
+	}
+
+	writeSuccessRate := float64(0)
+	avgWriteLatencyNs := int64(0)
+	if totalWriteRequests > 0 {
+		writeSuccessRate = float64(successfulWrites) / float64(totalWriteRequests) * 100
+		avgWriteLatencyNs = totalWriteLatencyNs / totalWriteRequests
 	}
 
 	return map[string]interface{}{
-		"sidecar_addr":     c.sidecarAddr,
-		"max_concurrent":   c.maxConcurrent,
-		"timeout_ms":       int(c.timeout / time.Millisecond),
-		"total_requests":   totalRequests,
-		"successful_reads": successfulReads,
-		"failed_reads":     failedReads,
-		"success_rate_pct": fmt.Sprintf("%.1f", successRate),
-		"total_bytes_read": totalBytesRead,
-		"avg_latency_ns":   avgLatencyNs,
-		"avg_latency_ms":   fmt.Sprintf("%.3f", float64(avgLatencyNs)/1000000),
+		"sidecar_addr":           c.sidecarAddr,
+		"max_concurrent":         c.maxConcurrent,
+		"timeout_ms":             int(c.timeout / time.Millisecond),
+		"total_read_requests":    totalRequests,
+		"successful_reads":       successfulReads,
+		"failed_reads":           failedReads,
+		"read_success_rate_pct":  fmt.Sprintf("%.1f", readSuccessRate),
+		"total_bytes_read":       totalBytesRead,
+		"avg_read_latency_ms":    fmt.Sprintf("%.3f", float64(avgReadLatencyNs)/1000000),
+		"total_write_requests":   totalWriteRequests,
+		"successful_writes":      successfulWrites,
+		"failed_writes":          failedWrites,
+		"write_success_rate_pct": fmt.Sprintf("%.1f", writeSuccessRate),
+		"total_bytes_written":    totalBytesWritten,
+		"avg_write_latency_ms":   fmt.Sprintf("%.3f", float64(avgWriteLatencyNs)/1000000),
 	}
 }
 

@@ -1,6 +1,8 @@
 package mount
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"io"
 
@@ -21,6 +23,20 @@ func (wfs *WFS) saveDataAsChunk(fullPath util.FullPath) filer.SaveDataAsChunkFun
 	assignPath := fullPath.Sanitized()
 
 	return func(reader io.Reader, filename string, offset int64, tsNs int64, _ uint64) (chunk *filer_pb.FileChunk, err error) {
+
+		// Try RDMA write path first if enabled and not read-only
+		if wfs.rdmaClient != nil && wfs.option.RdmaEnabled && !wfs.option.RdmaReadOnly {
+			chunk, err = wfs.rdmaUploadChunk(reader, assignPath, filename, offset, tsNs)
+			if err == nil {
+				return chunk, nil
+			}
+			if !wfs.option.RdmaFallback {
+				return nil, fmt.Errorf("RDMA write failed (no fallback): %w", err)
+			}
+			glog.V(2).Infof("RDMA write failed for %s, falling back to HTTP: %v", filename, err)
+		}
+
+		// Normal HTTP upload path
 		uploader, err := operation.NewUploader()
 		if err != nil {
 			return
@@ -64,26 +80,10 @@ func (wfs *WFS) saveDataAsChunk(fullPath util.FullPath) filer.SaveDataAsChunkFun
 			return nil, fmt.Errorf("upload result: %v", uploadResult.Error)
 		}
 
-		// When peer sharing is enabled we need EVERY chunk in the
-		// local cache so we can actually serve it back to peers on
-		// FetchChunk — otherwise the directory would advertise us as
-		// a holder and the fetcher would get NOT_FOUND from our
-		// chunk cache. When peer sharing is off we preserve the
-		// original behavior of caching only the first chunk (small
-		// files) to avoid blowing the cache on large uploads. Both
-		// paths gate on chunkCache != nil: -cacheCapacityMB=0 disables
-		// the cache entirely, in which case SetChunk would panic.
 		shouldCache := wfs.chunkCache != nil && (offset == 0 || wfs.peerAnnouncer != nil)
 		if shouldCache {
 			wfs.chunkCache.SetChunk(fileId, data)
 		}
-		// Announce every uploaded chunk so the tier-2 directory fills
-		// in as the file is written. Without this, the per-fetch
-		// announce path only bootstraps after someone else has already
-		// pulled a chunk via peer — which can't happen if nobody has
-		// told the directory who holds the chunk. Skip the announce
-		// when we couldn't cache (no point advertising bytes we can't
-		// actually serve back).
 		if wfs.peerAnnouncer != nil && shouldCache {
 			wfs.peerAnnouncer.EnqueueAnnounce(fileId)
 		}
@@ -92,3 +92,76 @@ func (wfs *WFS) saveDataAsChunk(fullPath util.FullPath) filer.SaveDataAsChunkFun
 		return chunk, nil
 	}
 }
+
+// rdmaUploadChunk assigns a volume via filer gRPC and uploads data through the RDMA sidecar.
+func (wfs *WFS) rdmaUploadChunk(reader io.Reader, assignPath string, filename string, offset int64, tsNs int64) (*filer_pb.FileChunk, error) {
+	data, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, fmt.Errorf("read input for RDMA: %w", err)
+	}
+
+	var fileId string
+	var volumeServerUrl string
+
+	if grpcErr := wfs.WithFilerClient(false, func(client filer_pb.SeaweedFilerClient) error {
+		resp, assignErr := client.AssignVolume(context.Background(), &filer_pb.AssignVolumeRequest{
+			Count:            1,
+			Replication:      wfs.option.Replication,
+			Collection:       wfs.option.Collection,
+			TtlSec:           wfs.option.TtlSec,
+			DiskType:         string(wfs.option.DiskType),
+			DataCenter:       wfs.option.DataCenter,
+			Path:             assignPath,
+			ExpectedDataSize: uint64(len(data)),
+		})
+		if assignErr != nil {
+			return assignErr
+		}
+		if resp.Error != "" {
+			return fmt.Errorf("assign volume: %s", resp.Error)
+		}
+		fileId = resp.FileId
+		volumeServerUrl = fmt.Sprintf("http://%s", wfs.AdjustedUrl(resp.Location))
+		return nil
+	}); grpcErr != nil {
+		return nil, fmt.Errorf("RDMA assign volume: %w", grpcErr)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), wfs.rdmaClient.timeout)
+	defer cancel()
+
+	writeResp, err := wfs.rdmaClient.WriteNeedle(ctx, fileId, data, volumeServerUrl)
+	if err != nil {
+		return nil, fmt.Errorf("RDMA write needle: %w", err)
+	}
+
+	if !writeResp.Success {
+		return nil, fmt.Errorf("RDMA write not successful for %s", fileId)
+	}
+
+	glog.V(3).Infof("RDMA upload %s to %s: %d bytes, rdma=%v", fileId, volumeServerUrl, len(data), writeResp.IsRDMA)
+
+	shouldCache := wfs.chunkCache != nil && (offset == 0 || wfs.peerAnnouncer != nil)
+	if shouldCache {
+		wfs.chunkCache.SetChunk(fileId, data)
+	}
+	if wfs.peerAnnouncer != nil && shouldCache {
+		wfs.peerAnnouncer.EnqueueAnnounce(fileId)
+	}
+
+	chunk := &filer_pb.FileChunk{
+		FileId:       fileId,
+		Offset:       offset,
+		Size:         uint64(len(data)),
+		ModifiedTsNs: tsNs,
+		Fid:          &filer_pb.FileId{},
+	}
+
+	return chunk, nil
+}
+
+// rdmaUploadChunkFromBuffer is a convenience wrapper for callers that already have data in a buffer.
+func (wfs *WFS) rdmaUploadChunkFromBuffer(data []byte, assignPath string, filename string, offset int64, tsNs int64) (*filer_pb.FileChunk, error) {
+	return wfs.rdmaUploadChunk(bytes.NewReader(data), assignPath, filename, offset, tsNs)
+}
+

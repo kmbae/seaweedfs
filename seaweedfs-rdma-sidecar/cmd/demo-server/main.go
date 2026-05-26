@@ -612,10 +612,29 @@ func (s *DemoServer) writeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	volumeID, err := strconv.ParseUint(query.Get("volume"), 10, 32)
-	if err != nil || volumeID == 0 {
-		http.Error(w, "invalid or missing 'volume' parameter", http.StatusBadRequest)
-		return
+	var volumeID uint64
+	var needleID uint64
+	var cookie uint64
+
+	fileID := query.Get("file_id")
+	if fileID != "" {
+		fid, parseErr := needle.ParseFileIdFromString(fileID)
+		if parseErr != nil {
+			http.Error(w, fmt.Sprintf("invalid file_id: %v", parseErr), http.StatusBadRequest)
+			return
+		}
+		volumeID = uint64(fid.VolumeId)
+		needleID = uint64(fid.Key)
+		cookie = uint64(fid.Cookie)
+	} else {
+		var err error
+		volumeID, err = strconv.ParseUint(query.Get("volume"), 10, 32)
+		if err != nil || volumeID == 0 {
+			http.Error(w, "invalid or missing 'volume' or 'file_id' parameter", http.StatusBadRequest)
+			return
+		}
+		needleID = uint64(time.Now().UnixNano())
+		cookie = 0x12345678
 	}
 
 	body, err := io.ReadAll(r.Body)
@@ -632,6 +651,7 @@ func (s *DemoServer) writeHandler(w http.ResponseWriter, r *http.Request) {
 
 	s.logger.WithFields(logrus.Fields{
 		"volume_id":     volumeID,
+		"file_id":       fileID,
 		"volume_server": volumeServer,
 		"data_size":     len(body),
 	}).Info("📝 Processing needle write request")
@@ -643,8 +663,8 @@ func (s *DemoServer) writeHandler(w http.ResponseWriter, r *http.Request) {
 
 	writeReq := &seaweedfs.NeedleWriteRequest{
 		VolumeID:     uint32(volumeID),
-		NeedleID:     uint64(time.Now().UnixNano()),
-		Cookie:       0x12345678,
+		NeedleID:     needleID,
+		Cookie:       uint32(cookie),
 		Data:         body,
 		VolumeServer: volumeServer,
 	}
@@ -670,6 +690,7 @@ func (s *DemoServer) writeHandler(w http.ResponseWriter, r *http.Request) {
 	result["is_rdma"] = resp.IsRDMA
 	result["source"] = resp.Source
 	result["file_id"] = resp.FileID
+	result["size"] = resp.Size
 
 	s.logger.WithFields(logrus.Fields{
 		"volume_id": volumeID,

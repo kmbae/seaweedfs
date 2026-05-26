@@ -145,9 +145,13 @@ pub const UCP_MEM_MAP_NONBLOCK: u64 = 1 << 0;
 pub const UCP_MEM_MAP_ALLOCATE: u64 = 1 << 1;
 pub const UCP_MEM_MAP_FIXED: u64 = 1 << 2;
 
+/// UCX API version — must match the installed UCX headers (UCP_API_MAJOR, UCP_API_MINOR).
+const UCP_API_MAJOR: libc::c_uint = 1;
+const UCP_API_MINOR: libc::c_uint = 19;
+
 /// UCX FFI function signatures
 pub struct UcxApi {
-    pub ucp_init: Symbol<'static, unsafe extern "C" fn(*const UcpParams, *const c_void, *mut UcpContext) -> c_int>,
+    pub ucp_init_version: Symbol<'static, unsafe extern "C" fn(libc::c_uint, libc::c_uint, *const UcpParams, *const c_void, *mut UcpContext) -> c_int>,
     pub ucp_cleanup: Symbol<'static, unsafe extern "C" fn(UcpContext)>,
     pub ucp_worker_create: Symbol<'static, unsafe extern "C" fn(UcpContext, *const UcpWorkerParams, *mut UcpWorker) -> c_int>,
     pub ucp_worker_destroy: Symbol<'static, unsafe extern "C" fn(UcpWorker)>,
@@ -166,20 +170,25 @@ pub struct UcxApi {
 }
 
 impl UcxApi {
-    /// Load UCX library and resolve symbols
+    /// Load UCX libraries and resolve symbols.
+    ///
+    /// `libucp.so` provides the UCP transport API while `libucs.so` contains
+    /// utility symbols such as `ucs_status_string`.  The real shared-library
+    /// export is `ucp_init_version` (the C header's `ucp_init` is an inline
+    /// wrapper around it).
     pub fn load() -> RdmaResult<Self> {
         info!("🔗 Loading UCX library");
         
-        // Try to load UCX library
-        let lib_names = [
-            "libucp.so.0",      // Most common
-            "libucp.so",        // Generic
-            "libucp.dylib",     // macOS
-            "/usr/lib/x86_64-linux-gnu/libucp.so.0",  // Ubuntu/Debian
-            "/usr/lib64/libucp.so.0",                 // RHEL/CentOS
+        let ucp_names = [
+            "libucp.so.0",
+            "libucp.so",
+            "libucp.dylib",
+            "/usr/lib/x86_64-linux-gnu/libucp.so.0",
+            "/usr/lib64/libucp.so.0",
+            "/lib/libucp.so.0",
         ];
         
-        let library = lib_names.iter()
+        let ucp_lib = ucp_names.iter()
             .find_map(|name| {
                 debug!("Trying to load UCX library: {}", name);
                 match unsafe { Library::new(name) } {
@@ -193,44 +202,68 @@ impl UcxApi {
                     }
                 }
             })
-            .ok_or_else(|| RdmaError::context_init_failed("UCX library not found"))?;
+            .ok_or_else(|| RdmaError::context_init_failed("UCX libucp library not found"))?;
 
-        // Leak the library to get 'static lifetime for symbols
-        let library: &'static Library = Box::leak(Box::new(library));
+        let ucs_names = [
+            "libucs.so.0",
+            "libucs.so",
+            "/usr/lib/x86_64-linux-gnu/libucs.so.0",
+            "/usr/lib64/libucs.so.0",
+            "/lib/libucs.so.0",
+        ];
+
+        let ucs_lib = ucs_names.iter()
+            .find_map(|name| {
+                debug!("Trying to load UCS library: {}", name);
+                match unsafe { Library::new(name) } {
+                    Ok(lib) => {
+                        info!("✅ Successfully loaded UCS library: {}", name);
+                        Some(lib)
+                    }
+                    Err(e) => {
+                        debug!("Failed to load {}: {}", name, e);
+                        None
+                    }
+                }
+            })
+            .ok_or_else(|| RdmaError::context_init_failed("UCX libucs library not found"))?;
+
+        let ucp_lib: &'static Library = Box::leak(Box::new(ucp_lib));
+        let ucs_lib: &'static Library = Box::leak(Box::new(ucs_lib));
         
         unsafe {
             Ok(UcxApi {
-                ucp_init: library.get(b"ucp_init")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_init symbol: {}", e)))?,
-                ucp_cleanup: library.get(b"ucp_cleanup")
+                ucp_init_version: ucp_lib.get(b"ucp_init_version")
+                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_init_version symbol: {}", e)))?,
+                ucp_cleanup: ucp_lib.get(b"ucp_cleanup")
                     .map_err(|e| RdmaError::context_init_failed(format!("ucp_cleanup symbol: {}", e)))?,
-                ucp_worker_create: library.get(b"ucp_worker_create")
+                ucp_worker_create: ucp_lib.get(b"ucp_worker_create")
                     .map_err(|e| RdmaError::context_init_failed(format!("ucp_worker_create symbol: {}", e)))?,
-                ucp_worker_destroy: library.get(b"ucp_worker_destroy")
+                ucp_worker_destroy: ucp_lib.get(b"ucp_worker_destroy")
                     .map_err(|e| RdmaError::context_init_failed(format!("ucp_worker_destroy symbol: {}", e)))?,
-                ucp_ep_create: library.get(b"ucp_ep_create")
+                ucp_ep_create: ucp_lib.get(b"ucp_ep_create")
                     .map_err(|e| RdmaError::context_init_failed(format!("ucp_ep_create symbol: {}", e)))?,
-                ucp_ep_destroy: library.get(b"ucp_ep_destroy")
+                ucp_ep_destroy: ucp_lib.get(b"ucp_ep_destroy")
                     .map_err(|e| RdmaError::context_init_failed(format!("ucp_ep_destroy symbol: {}", e)))?,
-                ucp_mem_map: library.get(b"ucp_mem_map")
+                ucp_mem_map: ucp_lib.get(b"ucp_mem_map")
                     .map_err(|e| RdmaError::context_init_failed(format!("ucp_mem_map symbol: {}", e)))?,
-                ucp_mem_unmap: library.get(b"ucp_mem_unmap")
+                ucp_mem_unmap: ucp_lib.get(b"ucp_mem_unmap")
                     .map_err(|e| RdmaError::context_init_failed(format!("ucp_mem_unmap symbol: {}", e)))?,
-                ucp_put_nb: library.get(b"ucp_put_nb")
+                ucp_put_nb: ucp_lib.get(b"ucp_put_nb")
                     .map_err(|e| RdmaError::context_init_failed(format!("ucp_put_nb symbol: {}", e)))?,
-                ucp_get_nb: library.get(b"ucp_get_nb")
+                ucp_get_nb: ucp_lib.get(b"ucp_get_nb")
                     .map_err(|e| RdmaError::context_init_failed(format!("ucp_get_nb symbol: {}", e)))?,
-                ucp_worker_progress: library.get(b"ucp_worker_progress")
+                ucp_worker_progress: ucp_lib.get(b"ucp_worker_progress")
                     .map_err(|e| RdmaError::context_init_failed(format!("ucp_worker_progress symbol: {}", e)))?,
-                ucp_request_check_status: library.get(b"ucp_request_check_status")
+                ucp_request_check_status: ucp_lib.get(b"ucp_request_check_status")
                     .map_err(|e| RdmaError::context_init_failed(format!("ucp_request_check_status symbol: {}", e)))?,
-                ucp_request_free: library.get(b"ucp_request_free")
+                ucp_request_free: ucp_lib.get(b"ucp_request_free")
                     .map_err(|e| RdmaError::context_init_failed(format!("ucp_request_free symbol: {}", e)))?,
-                ucp_worker_get_address: library.get(b"ucp_worker_get_address")
+                ucp_worker_get_address: ucp_lib.get(b"ucp_worker_get_address")
                     .map_err(|e| RdmaError::context_init_failed(format!("ucp_worker_get_address symbol: {}", e)))?,
-                ucp_worker_release_address: library.get(b"ucp_worker_release_address")
+                ucp_worker_release_address: ucp_lib.get(b"ucp_worker_release_address")
                     .map_err(|e| RdmaError::context_init_failed(format!("ucp_worker_release_address symbol: {}", e)))?,
-                ucs_status_string: library.get(b"ucs_status_string")
+                ucs_status_string: ucs_lib.get(b"ucs_status_string")
                     .map_err(|e| RdmaError::context_init_failed(format!("ucs_status_string symbol: {}", e)))?,
             })
         }
@@ -282,10 +315,12 @@ impl UcxContext {
         };
         
         let mut context = ptr::null_mut();
-        let status = unsafe { (api.ucp_init)(&params, ptr::null(), &mut context) };
+        let status = unsafe {
+            (api.ucp_init_version)(UCP_API_MAJOR, UCP_API_MINOR, &params, ptr::null(), &mut context)
+        };
         if status != UCS_OK {
             return Err(RdmaError::context_init_failed(format!(
-                "ucp_init failed: {} ({})", 
+                "ucp_init_version failed: {} ({})", 
                 api.status_string(status), status
             )));
         }

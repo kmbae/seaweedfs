@@ -38,9 +38,10 @@ func main() {
 	var rootCmd = &cobra.Command{
 		Use:   "rdma-sidecar",
 		Short: "SeaweedFS RDMA acceleration sidecar",
-		Long: `RDMA sidecar that accelerates SeaweedFS read operations using a Rust RDMA engine.
+		Long: `RDMA sidecar that accelerates SeaweedFS read/write operations using a Rust RDMA engine.
 
 Mount clients call GET /read with file_id, offset, size, and volume_server parameters.
+Mount clients call POST /write with file_id and volume_server query params, body = raw data.
 When the engine runs in mock mode, needle data is loaded from the local volume directory
 (if configured) or via HTTP fallback to the volume server.`,
 		RunE: runSidecar,
@@ -123,6 +124,7 @@ func runSidecar(cmd *cobra.Command, args []string) error {
 
 	mux := http.NewServeMux()
 	mux.Handle("/read", &httpserver.ReadHandler{Client: sfClient, Logger: logger})
+	mux.Handle("/write", &httpserver.WriteHandler{Client: sfClient, Logger: logger})
 	mux.HandleFunc("/health", healthHandler(logger, healthRdma))
 	mux.HandleFunc("/rdma/worker-address", workerAddressHandler(healthRdma))
 	mux.HandleFunc("/rdma/capabilities", capabilitiesHandler(healthRdma))

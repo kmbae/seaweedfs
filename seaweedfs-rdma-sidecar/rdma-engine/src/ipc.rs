@@ -126,7 +126,7 @@ pub struct CompleteReadResponse {
 }
 
 /// Request to start RDMA write operation
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct StartWriteRequest {
     pub volume_id: u32,
     pub needle_id: u64,
@@ -136,6 +136,20 @@ pub struct StartWriteRequest {
     pub data: Vec<u8>,
     pub timeout_secs: u64,
     pub auth_token: Option<String>,
+}
+
+impl std::fmt::Debug for StartWriteRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StartWriteRequest")
+            .field("volume_id", &self.volume_id)
+            .field("needle_id", &self.needle_id)
+            .field("cookie", &self.cookie)
+            .field("size", &self.size)
+            .field("data", &format_args!("[{} bytes]", self.data.len()))
+            .field("timeout_secs", &self.timeout_secs)
+            .field("auth_token", &self.auth_token)
+            .finish()
+    }
 }
 
 /// Response with write session details
