@@ -2,9 +2,11 @@
 package seaweedfs
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
+	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -372,6 +374,177 @@ func (c *SeaweedFSRDMAClient) httpFallback(ctx context.Context, req *NeedleReadR
 	}).Debug("📥 HTTP fallback successful")
 
 	return data, nil
+}
+
+// NeedleWriteRequest represents a SeaweedFS needle write request
+type NeedleWriteRequest struct {
+	VolumeID     uint32
+	NeedleID     uint64
+	Cookie       uint32
+	Data         []byte
+	VolumeServer string
+}
+
+// NeedleWriteResponse represents the result of a needle write
+type NeedleWriteResponse struct {
+	Success bool
+	IsRDMA  bool
+	Source  string
+	Latency time.Duration
+	FileID  string
+	Size    int
+}
+
+// WriteNeedle writes a needle using RDMA fast path + persist, or HTTP fallback
+func (c *SeaweedFSRDMAClient) WriteNeedle(ctx context.Context, req *NeedleWriteRequest) (*NeedleWriteResponse, error) {
+	start := time.Now()
+	var rdmaErr error
+
+	if c.IsEnabled() {
+		c.logger.WithFields(logrus.Fields{
+			"volume_id": req.VolumeID,
+			"needle_id": req.NeedleID,
+			"data_size": len(req.Data),
+		}).Debug("📝 Attempting RDMA write fast path")
+
+		writeReq := &rdma.WriteRequest{
+			VolumeID: req.VolumeID,
+			NeedleID: req.NeedleID,
+			Cookie:   req.Cookie,
+			Data:     req.Data,
+		}
+
+		writeResp, err := c.rdmaClient.Write(ctx, writeReq)
+		if err != nil {
+			c.logger.WithError(err).Warn("⚠️  RDMA write failed, falling back to HTTP")
+			rdmaErr = err
+		} else {
+			fileID, source, persistErr := c.persistNeedleData(ctx, req)
+			if persistErr != nil {
+				c.logger.WithError(persistErr).Warn("⚠️  RDMA session ok but persist failed, falling back to HTTP")
+				rdmaErr = persistErr
+			} else {
+				rdmaSource := "rdma+" + source
+				c.logger.WithFields(logrus.Fields{
+					"volume_id":     req.VolumeID,
+					"needle_id":     req.NeedleID,
+					"source":        rdmaSource,
+					"bytes_written": writeResp.BytesWritten,
+					"latency":       time.Since(start),
+					"file_id":       fileID,
+				}).Info("📝 RDMA write path successful")
+
+				return &NeedleWriteResponse{
+					Success: true,
+					IsRDMA:  true,
+					Source:  rdmaSource,
+					Latency: time.Since(start),
+					FileID:  fileID,
+					Size:    len(req.Data),
+				}, nil
+			}
+		}
+	}
+
+	c.logger.WithFields(logrus.Fields{
+		"volume_id": req.VolumeID,
+		"needle_id": req.NeedleID,
+		"reason":    "rdma_unavailable",
+	}).Debug("🌐 Using HTTP-only write fallback")
+
+	fileID, err := c.httpWriteFallback(ctx, req)
+	if err != nil {
+		if rdmaErr != nil {
+			return nil, fmt.Errorf("both RDMA and HTTP write failed: RDMA=%v, HTTP=%v", rdmaErr, err)
+		}
+		return nil, fmt.Errorf("HTTP write failed: %w", err)
+	}
+
+	return &NeedleWriteResponse{
+		Success: true,
+		IsRDMA:  false,
+		Source:  "http",
+		Latency: time.Since(start),
+		FileID:  fileID,
+		Size:    len(req.Data),
+	}, nil
+}
+
+// persistNeedleData submits data to the volume server after RDMA buffering.
+// Returns (fileID, source, error).
+func (c *SeaweedFSRDMAClient) persistNeedleData(ctx context.Context, req *NeedleWriteRequest) (string, string, error) {
+	volumeServer := req.VolumeServer
+	if volumeServer == "" {
+		volumeServer = c.volumeServerURL
+	}
+
+	if !remote.IsLocalHost(volumeServer) {
+		fileID, err := remote.WriteNeedle(ctx, volumeServer, c.remoteReadPort, &remote.NeedleWriteRequest{
+			VolumeID: req.VolumeID,
+			NeedleID: req.NeedleID,
+			Cookie:   req.Cookie,
+			Data:     req.Data,
+		})
+		if err == nil {
+			return fileID, "remote-write", nil
+		}
+		c.logger.WithError(err).Debug("remote write failed, trying HTTP submit")
+	}
+
+	fileID, err := c.httpSubmit(ctx, volumeServer, req.Data)
+	if err != nil {
+		return "", "", err
+	}
+	return fileID, "http-submit", nil
+}
+
+// httpSubmit posts data to volume server /submit endpoint
+func (c *SeaweedFSRDMAClient) httpSubmit(ctx context.Context, volumeServer string, data []byte) (string, error) {
+	if volumeServer == "" {
+		volumeServer = c.volumeServerURL
+	}
+	submitURL := fmt.Sprintf("%s/submit", strings.TrimRight(volumeServer, "/"))
+
+	var buf bytes.Buffer
+	writer := multipart.NewWriter(&buf)
+	part, err := writer.CreateFormFile("file", "needle.dat")
+	if err != nil {
+		return "", fmt.Errorf("failed to create form file: %w", err)
+	}
+	if _, err := part.Write(data); err != nil {
+		return "", fmt.Errorf("failed to write form data: %w", err)
+	}
+	writer.Close()
+
+	httpReq, err := http.NewRequestWithContext(ctx, "POST", submitURL, &buf)
+	if err != nil {
+		return "", fmt.Errorf("failed to create HTTP submit request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", writer.FormDataContentType())
+
+	client := &http.Client{Timeout: 30 * time.Second}
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return "", fmt.Errorf("HTTP submit failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return "", fmt.Errorf("HTTP submit status %d: %s", resp.StatusCode, string(body))
+	}
+
+	fileID := strings.TrimSpace(string(body))
+	return fileID, nil
+}
+
+// httpWriteFallback performs HTTP-only write to volume server /submit
+func (c *SeaweedFSRDMAClient) httpWriteFallback(ctx context.Context, req *NeedleWriteRequest) (string, error) {
+	volumeServer := req.VolumeServer
+	if volumeServer == "" {
+		volumeServer = c.volumeServerURL
+	}
+	return c.httpSubmit(ctx, volumeServer, req.Data)
 }
 
 // HealthCheck verifies that the RDMA client is healthy

@@ -31,6 +31,16 @@ pub enum IpcMessage {
     /// Response confirming completion
     CompleteReadResponse(CompleteReadResponse),
     
+    /// Request to start an RDMA write operation
+    StartWrite(StartWriteRequest),
+    /// Response with write session information
+    StartWriteResponse(StartWriteResponse),
+
+    /// Request to complete an RDMA write operation
+    CompleteWrite(CompleteWriteRequest),
+    /// Response confirming write completion
+    CompleteWriteResponse(CompleteWriteResponse),
+
     /// Request for engine capabilities
     GetCapabilities(GetCapabilitiesRequest),
     /// Response with engine capabilities
@@ -112,6 +122,46 @@ pub struct CompleteReadResponse {
     /// Server-computed CRC for verification
     pub server_crc: Option<u32>,
     /// Any cleanup messages
+    pub message: Option<String>,
+}
+
+/// Request to start RDMA write operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartWriteRequest {
+    pub volume_id: u32,
+    pub needle_id: u64,
+    pub cookie: u32,
+    pub size: u64,
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
+    pub timeout_secs: u64,
+    pub auth_token: Option<String>,
+}
+
+/// Response with write session details
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StartWriteResponse {
+    pub session_id: String,
+    pub bytes_buffered: u64,
+    pub success: bool,
+}
+
+/// Request to complete RDMA write operation
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompleteWriteRequest {
+    pub session_id: String,
+    pub success: bool,
+    pub bytes_written: u64,
+    pub client_crc: Option<u32>,
+    pub error_message: Option<String>,
+}
+
+/// Response confirming write completion
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompleteWriteResponse {
+    pub success: bool,
+    pub server_crc: Option<u32>,
+    pub file_id: String,
     pub message: Option<String>,
 }
 
@@ -423,6 +473,20 @@ impl IpcServer {
                 }
             }
 
+            IpcMessage::StartWrite(req) => {
+                match Self::handle_start_write(req, rdma_context, session_manager).await {
+                    Ok(response) => IpcMessage::StartWriteResponse(response),
+                    Err(error) => IpcMessage::Error(ErrorResponse::from(&error)),
+                }
+            }
+
+            IpcMessage::CompleteWrite(req) => {
+                match Self::handle_complete_write(req, session_manager).await {
+                    Ok(response) => IpcMessage::CompleteWriteResponse(response),
+                    Err(error) => IpcMessage::Error(ErrorResponse::from(&error)),
+                }
+            }
+
             IpcMessage::GetWorkerAddress(_req) => {
                 let listen_port = std::env::var("RDMA_LISTEN_PORT")
                     .ok()
@@ -533,6 +597,84 @@ impl IpcServer {
         })
     }
     
+    /// Handle StartWrite request
+    async fn handle_start_write(
+        req: StartWriteRequest,
+        rdma_context: &Arc<RdmaContext>,
+        session_manager: &Arc<SessionManager>,
+    ) -> RdmaResult<StartWriteResponse> {
+        info!("📝 Starting RDMA write: volume={}, needle={}, size={}",
+              req.volume_id, req.needle_id, req.data.len());
+
+        let session_id = Uuid::new_v4().to_string();
+        let data_len = req.data.len();
+
+        // Allocate buffer and copy incoming data (mock: inline copy)
+        let mut buffer = vec![0u8; data_len];
+        buffer.copy_from_slice(&req.data);
+        let local_addr = buffer.as_ptr() as u64;
+
+        let memory_region = rdma_context.register_memory(local_addr, data_len).await?;
+
+        session_manager.create_session(
+            session_id.clone(),
+            req.volume_id,
+            req.needle_id,
+            0,
+            0,
+            data_len as u64,
+            buffer,
+            memory_region.clone(),
+            chrono::Duration::seconds(req.timeout_secs as i64),
+        ).await?;
+
+        let wr_id = NEXT_WR_ID.fetch_add(1, Ordering::Relaxed);
+        rdma_context.post_write(
+            local_addr,
+            0,
+            0,
+            data_len,
+            wr_id,
+        ).await?;
+
+        let completions = rdma_context.poll_completion(1).await?;
+        if completions.is_empty() {
+            return Err(RdmaError::operation_failed("RDMA write", -1));
+        }
+
+        let completion = &completions[0];
+        if completion.status != crate::rdma::CompletionStatus::Success {
+            return Err(RdmaError::operation_failed("RDMA write", completion.status as i32));
+        }
+
+        info!("✅ RDMA write buffered: {} bytes", data_len);
+
+        Ok(StartWriteResponse {
+            session_id,
+            bytes_buffered: data_len as u64,
+            success: true,
+        })
+    }
+
+    /// Handle CompleteWrite request
+    async fn handle_complete_write(
+        req: CompleteWriteRequest,
+        session_manager: &Arc<SessionManager>,
+    ) -> RdmaResult<CompleteWriteResponse> {
+        info!("🏁 Completing RDMA write session: {}", req.session_id);
+
+        session_manager.remove_session(&req.session_id).await?;
+
+        let file_id = format!("rdma-{}", &req.session_id[..8]);
+
+        Ok(CompleteWriteResponse {
+            success: req.success,
+            server_crc: Some(0x12345678),
+            file_id,
+            message: Some("Write session completed successfully".to_string()),
+        })
+    }
+
     /// Shutdown the IPC server
     pub async fn shutdown(&mut self) -> RdmaResult<()> {
         info!("Shutting down IPC server");

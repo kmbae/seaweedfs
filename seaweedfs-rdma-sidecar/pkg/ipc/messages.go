@@ -14,6 +14,8 @@ type IpcMessage struct {
 const (
 	MsgStartRead         = "StartRead"
 	MsgCompleteRead      = "CompleteRead"
+	MsgStartWrite        = "StartWrite"
+	MsgCompleteWrite     = "CompleteWrite"
 	MsgGetCapabilities   = "GetCapabilities"
 	MsgGetWorkerAddress  = "GetWorkerAddress"
 	MsgPing              = "Ping"
@@ -23,6 +25,8 @@ const (
 const (
 	MsgStartReadResponse        = "StartReadResponse"
 	MsgCompleteReadResponse     = "CompleteReadResponse"
+	MsgStartWriteResponse       = "StartWriteResponse"
+	MsgCompleteWriteResponse    = "CompleteWriteResponse"
 	MsgGetCapabilitiesResponse  = "GetCapabilitiesResponse"
 	MsgGetWorkerAddressResponse = "GetWorkerAddressResponse"
 	MsgPong                     = "Pong"
@@ -65,6 +69,41 @@ type CompleteReadRequest struct {
 type CompleteReadResponse struct {
 	Success   bool    `msgpack:"success"`
 	ServerCrc *uint32 `msgpack:"server_crc,omitempty"`
+	Message   *string `msgpack:"message,omitempty"`
+}
+
+// StartWriteRequest corresponds to Rust StartWriteRequest
+type StartWriteRequest struct {
+	VolumeID    uint32  `msgpack:"volume_id"`
+	NeedleID    uint64  `msgpack:"needle_id"`
+	Cookie      uint32  `msgpack:"cookie"`
+	Size        uint64  `msgpack:"size"`
+	Data        []byte  `msgpack:"data"`
+	TimeoutSecs uint64  `msgpack:"timeout_secs"`
+	AuthToken   *string `msgpack:"auth_token,omitempty"`
+}
+
+// StartWriteResponse corresponds to Rust StartWriteResponse
+type StartWriteResponse struct {
+	SessionID    string `msgpack:"session_id"`
+	BytesBuffered uint64 `msgpack:"bytes_buffered"`
+	Success      bool   `msgpack:"success"`
+}
+
+// CompleteWriteRequest corresponds to Rust CompleteWriteRequest
+type CompleteWriteRequest struct {
+	SessionID    string  `msgpack:"session_id"`
+	Success      bool    `msgpack:"success"`
+	BytesWritten uint64  `msgpack:"bytes_written"`
+	ClientCrc    *uint32 `msgpack:"client_crc,omitempty"`
+	ErrorMessage *string `msgpack:"error_message,omitempty"`
+}
+
+// CompleteWriteResponse corresponds to Rust CompleteWriteResponse
+type CompleteWriteResponse struct {
+	Success   bool    `msgpack:"success"`
+	ServerCrc *uint32 `msgpack:"server_crc,omitempty"`
+	FileID    string  `msgpack:"file_id"`
 	Message   *string `msgpack:"message,omitempty"`
 }
 
@@ -137,6 +176,26 @@ func NewCompleteReadMessage(sessionID string, success bool, bytesTransferred uin
 			BytesTransferred: bytesTransferred,
 			ClientCrc:        clientCrc,
 			ErrorMessage:     errorMessage,
+		},
+	}
+}
+
+func NewStartWriteMessage(req *StartWriteRequest) *IpcMessage {
+	return &IpcMessage{
+		Type: MsgStartWrite,
+		Data: req,
+	}
+}
+
+func NewCompleteWriteMessage(sessionID string, success bool, bytesWritten uint64, clientCrc *uint32, errorMessage *string) *IpcMessage {
+	return &IpcMessage{
+		Type: MsgCompleteWrite,
+		Data: &CompleteWriteRequest{
+			SessionID:    sessionID,
+			Success:      success,
+			BytesWritten: bytesWritten,
+			ClientCrc:    clientCrc,
+			ErrorMessage: errorMessage,
 		},
 	}
 }

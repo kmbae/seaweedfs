@@ -113,6 +113,59 @@ func ReadNeedle(ctx context.Context, volumeServer string, port uint16, req *Need
 	return resp.Data, nil
 }
 
+// NeedleWriteRequest matches the Rust RemoteNeedleWriteRequest.
+type NeedleWriteRequest struct {
+	VolumeID uint32 `msgpack:"volume_id"`
+	NeedleID uint64 `msgpack:"needle_id"`
+	Cookie   uint32 `msgpack:"cookie"`
+	Data     []byte `msgpack:"data"`
+}
+
+// NeedleWriteResponse matches the Rust RemoteNeedleWriteResponse.
+type NeedleWriteResponse struct {
+	Success bool   `msgpack:"success"`
+	FileID  string `msgpack:"file_id"`
+	Message string `msgpack:"message,omitempty"`
+}
+
+// WriteNeedle performs a remote needle write over TCP.
+func WriteNeedle(ctx context.Context, volumeServer string, port uint16, req *NeedleWriteRequest) (string, error) {
+	host, err := ParseVolumeHost(volumeServer)
+	if err != nil {
+		return "", err
+	}
+	if port == 0 {
+		port = DefaultRemotePort
+	}
+
+	dialer := &net.Dialer{Timeout: 30 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
+	if err != nil {
+		return "", fmt.Errorf("remote rdma write connect %s:%d: %w", host, port, err)
+	}
+	defer conn.Close()
+
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+
+	if err := writeMsgpack(conn, req); err != nil {
+		return "", fmt.Errorf("remote rdma write request: %w", err)
+	}
+
+	var resp NeedleWriteResponse
+	if err := readMsgpack(conn, &resp); err != nil {
+		return "", fmt.Errorf("remote rdma write response: %w", err)
+	}
+	if !resp.Success {
+		if resp.Message != "" {
+			return "", fmt.Errorf("remote rdma write failed: %s", resp.Message)
+		}
+		return "", fmt.Errorf("remote rdma write failed")
+	}
+	return resp.FileID, nil
+}
+
 // FetchWorkerAddress queries a remote sidecar for its UCX worker address.
 func FetchWorkerAddress(ctx context.Context, sidecarBase string) (*WorkerAddressInfo, error) {
 	base := strings.TrimRight(sidecarBase, "/")

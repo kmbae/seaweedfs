@@ -315,6 +315,82 @@ func (c *Client) StartRead(ctx context.Context, req *StartReadRequest) (*StartRe
 	return &startResp, nil
 }
 
+// StartWrite initiates an RDMA write operation
+func (c *Client) StartWrite(ctx context.Context, req *StartWriteRequest) (*StartWriteResponse, error) {
+	msg := NewStartWriteMessage(req)
+
+	response, err := c.SendMessage(ctx, msg)
+	if err != nil {
+		return nil, err
+	}
+
+	if response.Type == MsgError {
+		errorData, err := msgpack.Marshal(response.Data)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal engine error data: %w", err)
+		}
+		var errorResp ErrorResponse
+		if err := msgpack.Unmarshal(errorData, &errorResp); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal engine error response: %w", err)
+		}
+		return nil, fmt.Errorf("engine error: %s - %s", errorResp.Code, errorResp.Message)
+	}
+
+	if response.Type != MsgStartWriteResponse {
+		return nil, fmt.Errorf("unexpected response type: %s", response.Type)
+	}
+
+	startData, err := msgpack.Marshal(response.Data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal start write data: %w", err)
+	}
+
+	var startResp StartWriteResponse
+	if err := msgpack.Unmarshal(startData, &startResp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal start write response: %w", err)
+	}
+
+	return &startResp, nil
+}
+
+// CompleteWrite completes an RDMA write operation
+func (c *Client) CompleteWrite(ctx context.Context, sessionID string, success bool, bytesWritten uint64, clientCrc *uint32) (*CompleteWriteResponse, error) {
+	msg := NewCompleteWriteMessage(sessionID, success, bytesWritten, clientCrc, nil)
+
+	response, err := c.SendMessage(ctx, msg)
+	if err != nil {
+		return nil, err
+	}
+
+	if response.Type == MsgError {
+		errorData, err := msgpack.Marshal(response.Data)
+		if err != nil {
+			return nil, fmt.Errorf("failed to marshal engine error data: %w", err)
+		}
+		var errorResp ErrorResponse
+		if err := msgpack.Unmarshal(errorData, &errorResp); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal engine error response: %w", err)
+		}
+		return nil, fmt.Errorf("engine error: %s - %s", errorResp.Code, errorResp.Message)
+	}
+
+	if response.Type != MsgCompleteWriteResponse {
+		return nil, fmt.Errorf("unexpected response type: %s", response.Type)
+	}
+
+	completeData, err := msgpack.Marshal(response.Data)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal complete write data: %w", err)
+	}
+
+	var completeResp CompleteWriteResponse
+	if err := msgpack.Unmarshal(completeData, &completeResp); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal complete write response: %w", err)
+	}
+
+	return &completeResp, nil
+}
+
 // CompleteRead completes an RDMA read operation
 func (c *Client) CompleteRead(ctx context.Context, sessionID string, success bool, bytesTransferred uint64, clientCrc *uint32) (*CompleteReadResponse, error) {
 	msg := NewCompleteReadMessage(sessionID, success, bytesTransferred, clientCrc, nil)

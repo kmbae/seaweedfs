@@ -2,7 +2,6 @@
 package main
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -193,8 +192,15 @@ func (s *DemoServer) homeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Detect volume data requests: path = /{vid},{nid_hex}
 	path := strings.TrimPrefix(r.URL.Path, "/")
+
+	// Handle mock /submit endpoint for write persist
+	if path == "submit" && r.Method == http.MethodPost {
+		s.submitHandler(w, r)
+		return
+	}
+
+	// Detect volume data requests: path = /{vid},{nid_hex}
 	if path != "" && strings.Contains(path, ",") {
 		s.volumeDataHandler(w, r, path)
 		return
@@ -304,6 +310,43 @@ func (s *DemoServer) volumeDataHandler(w http.ResponseWriter, r *http.Request, f
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.FormatUint(size, 10))
 	w.Write(data)
+}
+
+// submitHandler provides a mock /submit endpoint for needle write persistence
+func (s *DemoServer) submitHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	if err := r.ParseMultipartForm(32 << 20); err != nil {
+		body, _ := io.ReadAll(r.Body)
+		fileID := fmt.Sprintf("1,mock%x", time.Now().UnixNano()&0xFFFFFFFF)
+		s.logger.WithFields(logrus.Fields{
+			"file_id":   fileID,
+			"data_size": len(body),
+		}).Debug("Mock submit (raw body)")
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprint(w, fileID)
+		return
+	}
+
+	var dataSize int64
+	file, _, err := r.FormFile("file")
+	if err == nil {
+		data, _ := io.ReadAll(file)
+		dataSize = int64(len(data))
+		file.Close()
+	}
+
+	fileID := fmt.Sprintf("1,mock%x", time.Now().UnixNano()&0xFFFFFFFF)
+	s.logger.WithFields(logrus.Fields{
+		"file_id":   fileID,
+		"data_size": dataSize,
+	}).Debug("Mock submit accepted")
+
+	w.Header().Set("Content-Type", "text/plain")
+	fmt.Fprint(w, fileID)
 }
 
 // healthHandler checks server and RDMA health
@@ -555,7 +598,7 @@ func (s *DemoServer) readHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(result)
 }
 
-// writeHandler demonstrates needle writing via volume server HTTP API
+// writeHandler demonstrates needle writing via RDMA fast path + HTTP persist
 func (s *DemoServer) writeHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed (use POST)", http.StatusMethodNotAllowed)
@@ -575,7 +618,6 @@ func (s *DemoServer) writeHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Read body as needle data
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		http.Error(w, fmt.Sprintf("failed to read request body: %v", err), http.StatusBadRequest)
@@ -599,16 +641,15 @@ func (s *DemoServer) writeHandler(w http.ResponseWriter, r *http.Request) {
 
 	start := time.Now()
 
-	// POST to volume server submit endpoint
-	submitURL := fmt.Sprintf("%s/submit", volumeServer)
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, submitURL, bytes.NewReader(body))
-	if err != nil {
-		http.Error(w, fmt.Sprintf("failed to create request: %v", err), http.StatusInternalServerError)
-		return
+	writeReq := &seaweedfs.NeedleWriteRequest{
+		VolumeID:     uint32(volumeID),
+		NeedleID:     uint64(time.Now().UnixNano()),
+		Cookie:       0x12345678,
+		Data:         body,
+		VolumeServer: volumeServer,
 	}
-	httpReq.Header.Set("Content-Type", "application/octet-stream")
 
-	resp, err := http.DefaultClient.Do(httpReq)
+	resp, writeErr := s.rdmaClient.WriteNeedle(ctx, writeReq)
 	duration := time.Since(start)
 
 	result := map[string]interface{}{
@@ -619,38 +660,30 @@ func (s *DemoServer) writeHandler(w http.ResponseWriter, r *http.Request) {
 		"timestamp":     time.Now().Format(time.RFC3339),
 	}
 
-	if err != nil {
-		s.logger.WithError(err).Warn("⚠️  Volume server write failed, returning mock success for demo")
-		result["success"] = true
-		result["message"] = "mock write (volume server unreachable)"
-		result["file_id"] = fmt.Sprintf("%d,mock%x", volumeID, time.Now().UnixNano()&0xFFFFFFFF)
-	} else {
-		defer resp.Body.Close()
-		respBody, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			result["success"] = true
-			result["message"] = "write accepted by volume server"
-			var parsed map[string]interface{}
-			if json.Unmarshal(respBody, &parsed) == nil {
-				for k, v := range parsed {
-					result[k] = v
-				}
-			}
-		} else {
-			result["success"] = true
-			result["message"] = fmt.Sprintf("mock write (volume server returned %d)", resp.StatusCode)
-			result["file_id"] = fmt.Sprintf("%d,mock%x", volumeID, time.Now().UnixNano()&0xFFFFFFFF)
-		}
+	if writeErr != nil {
+		s.logger.WithError(writeErr).Error("❌ Needle write failed")
+		http.Error(w, fmt.Sprintf("Write failed: %v", writeErr), http.StatusInternalServerError)
+		return
 	}
+
+	result["success"] = resp.Success
+	result["is_rdma"] = resp.IsRDMA
+	result["source"] = resp.Source
+	result["file_id"] = resp.FileID
 
 	s.logger.WithFields(logrus.Fields{
 		"volume_id": volumeID,
-		"success":   result["success"],
+		"success":   resp.Success,
+		"is_rdma":   resp.IsRDMA,
+		"source":    resp.Source,
 		"duration":  duration,
 		"data_size": len(body),
+		"file_id":   resp.FileID,
 	}).Info("✅ Needle write completed")
 
 	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("X-Source", resp.Source)
+	w.Header().Set("X-RDMA-Used", fmt.Sprintf("%t", resp.IsRDMA))
 	json.NewEncoder(w).Encode(result)
 }
 

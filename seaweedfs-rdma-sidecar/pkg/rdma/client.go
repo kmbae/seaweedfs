@@ -78,6 +78,26 @@ type ReadResponse struct {
 	Message      string
 }
 
+// WriteRequest represents a SeaweedFS needle write request
+type WriteRequest struct {
+	VolumeID uint32
+	NeedleID uint64
+	Cookie   uint32
+	Data     []byte
+}
+
+// WriteResponse represents the result of an RDMA write operation
+type WriteResponse struct {
+	SessionID    string
+	BytesWritten uint64
+	ServerCRC    *uint32
+	FileID       string
+	Duration     time.Duration
+	TransferRate float64
+	Success      bool
+	Message      string
+}
+
 // NewConnectionPool creates a new connection pool
 func NewConnectionPool(enginePath string, maxConnections int, maxIdleTime time.Duration, logger *logrus.Logger) *ConnectionPool {
 	if maxConnections <= 0 {
@@ -572,6 +592,100 @@ func (c *Client) Ping(ctx context.Context) (time.Duration, error) {
 	}).Debug("🏓 RDMA engine ping successful")
 
 	return totalLatency, nil
+}
+
+// Write performs an RDMA write operation for a SeaweedFS needle
+func (c *Client) Write(ctx context.Context, req *WriteRequest) (*WriteResponse, error) {
+	if !c.IsConnected() {
+		return nil, fmt.Errorf("not connected to RDMA engine")
+	}
+
+	startTime := time.Now()
+
+	c.logger.WithFields(logrus.Fields{
+		"volume_id": req.VolumeID,
+		"needle_id": req.NeedleID,
+		"data_size": len(req.Data),
+	}).Debug("📝 Starting RDMA write operation")
+
+	if c.pool != nil {
+		return c.writeWithPool(ctx, req, startTime)
+	}
+
+	ipcReq := &ipc.StartWriteRequest{
+		VolumeID:    req.VolumeID,
+		NeedleID:    req.NeedleID,
+		Cookie:      req.Cookie,
+		Size:        uint64(len(req.Data)),
+		Data:        req.Data,
+		TimeoutSecs: uint64(c.defaultTimeout.Seconds()),
+	}
+
+	startResp, err := c.ipcClient.StartWrite(ctx, ipcReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start RDMA write: %w", err)
+	}
+
+	completeResp, err := c.ipcClient.CompleteWrite(ctx, startResp.SessionID, true, startResp.BytesBuffered, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to complete RDMA write: %w", err)
+	}
+
+	duration := time.Since(startTime)
+	transferRate := float64(startResp.BytesBuffered) / duration.Seconds()
+
+	return &WriteResponse{
+		SessionID:    startResp.SessionID,
+		BytesWritten: startResp.BytesBuffered,
+		ServerCRC:    completeResp.ServerCrc,
+		FileID:       completeResp.FileID,
+		Duration:     duration,
+		TransferRate: transferRate,
+		Success:      completeResp.Success,
+		Message:      "RDMA write completed successfully",
+	}, nil
+}
+
+// writeWithPool performs RDMA write using connection pooling
+func (c *Client) writeWithPool(ctx context.Context, req *WriteRequest, startTime time.Time) (*WriteResponse, error) {
+	conn, err := c.pool.getConnection(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get pooled connection: %w", err)
+	}
+	defer c.pool.releaseConnection(conn)
+
+	ipcReq := &ipc.StartWriteRequest{
+		VolumeID:    req.VolumeID,
+		NeedleID:    req.NeedleID,
+		Cookie:      req.Cookie,
+		Size:        uint64(len(req.Data)),
+		Data:        req.Data,
+		TimeoutSecs: uint64(c.defaultTimeout.Seconds()),
+	}
+
+	startResp, err := conn.ipcClient.StartWrite(ctx, ipcReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to start RDMA write (pooled): %w", err)
+	}
+
+	completeResp, err := conn.ipcClient.CompleteWrite(ctx, startResp.SessionID, true, startResp.BytesBuffered, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to complete RDMA write (pooled): %w", err)
+	}
+
+	duration := time.Since(startTime)
+	transferRate := float64(startResp.BytesBuffered) / duration.Seconds()
+
+	return &WriteResponse{
+		SessionID:    startResp.SessionID,
+		BytesWritten: startResp.BytesBuffered,
+		ServerCRC:    completeResp.ServerCrc,
+		FileID:       completeResp.FileID,
+		Duration:     duration,
+		TransferRate: transferRate,
+		Success:      completeResp.Success,
+		Message:      "RDMA write successful (pooled)",
+	}, nil
 }
 
 // readWithPool performs RDMA read using connection pooling

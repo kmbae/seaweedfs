@@ -75,6 +75,27 @@ cleanup() {
     print_success "Cleanup complete"
 }
 
+kill_port() {
+    local port=$1
+    local pids
+    pids=$(lsof -ti :"$port" 2>/dev/null || true)
+    if [[ -n "$pids" ]]; then
+        print_warning "Killing existing process(es) on port $port: $pids"
+        echo "$pids" | xargs kill -9 2>/dev/null || true
+        sleep 1
+    fi
+}
+
+preflight_cleanup() {
+    print_step "Pre-flight: cleaning up stale processes and sockets..."
+    kill_port "$DEMO_SERVER_PORT"
+    kill_port "$WEED_MASTER_PORT"
+    kill_port "$WEED_VOLUME_PORT"
+    kill_port 18515
+    rm -f "$RDMA_ENGINE_SOCKET"
+    rm -rf "$WEED_VOLUME_DIR"
+}
+
 # Set up cleanup on exit
 trap cleanup EXIT
 
@@ -136,9 +157,14 @@ start_demo_server() {
     ./bin/demo-server $DEMO_SERVER_ARGS &
     DEMO_SERVER_PID=$!
     
-    # Wait for server to be ready
+    # Wait for server to be ready (check both PID alive and HTTP responding)
     print_step "Waiting for demo server to be ready..."
     for i in {1..10}; do
+        if ! kill -0 $DEMO_SERVER_PID 2>/dev/null; then
+            print_error "Demo server process died (PID: $DEMO_SERVER_PID)"
+            DEMO_SERVER_PID=""
+            exit 1
+        fi
         if curl -s "http://localhost:$DEMO_SERVER_PORT/health" > /dev/null 2>&1; then
             print_success "Demo server ready (PID: $DEMO_SERVER_PID)"
             return 0
@@ -254,9 +280,9 @@ test_needle_read() {
 }
 
 test_needle_write() {
-    print_header "NEEDLE WRITE TEST"
+    print_header "NEEDLE WRITE TEST (rdma+http-submit)"
     
-    print_step "Testing needle write via volume server..."
+    print_step "Testing RDMA write path with local volume server..."
     WRITE_DATA="Hello SeaweedFS RDMA write test - $(date +%s)"
     response=$(curl -s -X POST \
         "http://localhost:$DEMO_SERVER_PORT/write?volume=1&volume_server=http://localhost:$DEMO_SERVER_PORT" \
@@ -267,13 +293,58 @@ test_needle_write() {
         file_id=$(echo "$response" | jq -r '.file_id // "N/A"')
         data_size=$(echo "$response" | jq -r '.data_size')
         duration=$(echo "$response" | jq -r '.duration')
-        message=$(echo "$response" | jq -r '.message')
+        is_rdma=$(echo "$response" | jq -r '.is_rdma // "N/A"')
+        source=$(echo "$response" | jq -r '.source // "N/A"')
         
-        print_success "Needle write completed: file_id=$file_id, size=$data_size bytes, duration=$duration"
-        echo -e "  ${BLUE}Message:${NC} $message"
+        if [[ "$is_rdma" == "true" ]]; then
+            print_success "RDMA write path used! source=$source, file_id=$file_id, size=$data_size bytes, duration=$duration"
+        else
+            print_warning "HTTP-only write. source=$source, duration=$duration"
+        fi
+        
         echo "$response" | jq '.'
     else
         print_error "Needle write failed"
+        echo "$response"
+        exit 1
+    fi
+}
+
+test_remote_rdma_write() {
+    print_header "REMOTE RDMA WRITE TEST"
+    
+    HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    if [[ -z "$HOST_IP" ]]; then
+        HOST_IP=$(hostname)
+    fi
+    
+    REMOTE_VOLUME_SERVER="http://${HOST_IP}:${DEMO_SERVER_PORT}"
+    print_step "Testing remote-write path with volume_server=$REMOTE_VOLUME_SERVER ..."
+    
+    WRITE_DATA="Remote RDMA write test data - $(date +%s)"
+    response=$(curl -s -X POST \
+        "http://localhost:$DEMO_SERVER_PORT/write?volume=1&volume_server=$REMOTE_VOLUME_SERVER" \
+        -H "Content-Type: application/octet-stream" \
+        -d "$WRITE_DATA")
+    
+    if echo "$response" | jq -e '.success == true' > /dev/null 2>&1; then
+        source=$(echo "$response" | jq -r '.source // "N/A"')
+        is_rdma=$(echo "$response" | jq -r '.is_rdma // "N/A"')
+        file_id=$(echo "$response" | jq -r '.file_id // "N/A"')
+        duration=$(echo "$response" | jq -r '.duration')
+        data_size=$(echo "$response" | jq -r '.data_size')
+        
+        if [[ "$source" == *"remote-write"* ]]; then
+            print_success "Remote RDMA write path verified! source=$source, file_id=$file_id, duration=$duration, size=$data_size bytes"
+        elif [[ "$is_rdma" == "true" ]]; then
+            print_warning "RDMA used but source=$source (expected remote-write). duration=$duration"
+        else
+            print_warning "HTTP fallback used. source=$source, duration=$duration"
+        fi
+        
+        echo "$response" | jq '.'
+    else
+        print_error "Remote RDMA write failed"
         echo "$response"
         exit 1
     fi
@@ -437,6 +508,9 @@ main() {
         exit 1
     fi
     
+    # Clean up any leftover processes from previous runs
+    preflight_cleanup
+    
     # Build and start components
     build_components
     
@@ -457,6 +531,7 @@ main() {
     test_needle_read
     test_needle_write
     test_remote_rdma_read
+    test_remote_rdma_write
     test_local_volume_read
     test_benchmark
     test_direct_rdma
@@ -469,6 +544,8 @@ main() {
     echo -e "  🔄 Automatic HTTP fallback when RDMA unavailable"
     echo -e "  🌐 Remote RDMA read path (rdma+remote-rdma)"
     echo -e "  💾 Local volume read path (rdma+local-volume)"
+    echo -e "  📝 RDMA write path (rdma+http-submit)"
+    echo -e "  📡 Remote RDMA write path (rdma+remote-write)"
     echo -e "  📊 Performance monitoring and benchmarking"
     echo -e "  🛡️  Robust error handling and graceful degradation"
     echo -e "  🔌 Complete IPC protocol between Go and Rust"
