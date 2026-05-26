@@ -7,6 +7,7 @@ import (
 
 	"github.com/seaweedfs/seaweedfs/weed/storage"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
+	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
 
 // Reader loads volume files from a shared data directory (colocated sidecar use case).
@@ -44,8 +45,8 @@ func (r *Reader) ReadNeedle(volumeID uint32, needleID uint64, cookie uint32, off
 	}
 
 	return vol.ReadNeedleRange(
-		needleID,
-		cookie,
+		types.NeedleId(needleID),
+		types.Cookie(cookie),
 		int64(offset),
 		int64(size),
 	)

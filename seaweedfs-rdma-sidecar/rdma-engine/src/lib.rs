@@ -31,6 +31,7 @@ pub mod ipc;
 pub mod session;
 pub mod memory;
 pub mod error;
+pub mod network;
 
 pub use error::{RdmaError, RdmaResult};
 
@@ -114,6 +115,14 @@ impl RdmaEngine {
         let session_manager = self.session_manager.clone();
         tokio::spawn(async move {
             session_manager.start_cleanup_task().await;
+        });
+
+        // Remote read listener (TCP over IB/RoCE CNI IP, port from config)
+        let network_server = network::NetworkServer::new(&self.config);
+        tokio::spawn(async move {
+            if let Err(e) = network_server.run().await {
+                tracing::error!("Network server error: {}", e);
+            }
         });
         
         // Run IPC server

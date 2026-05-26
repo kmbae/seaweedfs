@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"seaweedfs-rdma-sidecar/pkg/rdma"
+	"seaweedfs-rdma-sidecar/pkg/remote"
 	"seaweedfs-rdma-sidecar/pkg/volumeread"
 
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
@@ -26,6 +27,7 @@ type SeaweedFSRDMAClient struct {
 	logger          *logrus.Logger
 	volumeServerURL string
 	enabled         bool
+	remoteReadPort  uint16
 
 	// Zero-copy optimization
 	tempDir     string
@@ -53,6 +55,9 @@ type Config struct {
 	VolumeDataDir    string
 	VolumeIdxDir     string
 	VolumeCollection string
+
+	// RemoteReadPort is the TCP port for remote needle reads (default 18515).
+	RemoteReadPort uint16
 }
 
 // NeedleReadRequest represents a SeaweedFS needle read request
@@ -118,6 +123,10 @@ func NewSeaweedFSRDMAClient(config *Config) (*SeaweedFSRDMAClient, error) {
 		enabled:         config.Enabled,
 		tempDir:         tempDir,
 		useZeroCopy:     config.UseZeroCopy,
+		remoteReadPort:  config.RemoteReadPort,
+	}
+	if client.remoteReadPort == 0 {
+		client.remoteReadPort = remote.DefaultRemotePort
 	}
 	if config.VolumeDataDir != "" {
 		client.localReader = volumeread.NewReader(config.VolumeDataDir, config.VolumeIdxDir, config.VolumeCollection)
@@ -191,11 +200,12 @@ func (c *SeaweedFSRDMAClient) ReadNeedle(ctx context.Context, req *NeedleReadReq
 				c.logger.WithError(fetchErr).Warn("⚠️  RDMA session ok but data fetch failed, falling back to HTTP")
 				rdmaErr = fetchErr
 			} else {
-				isRealRDMA := c.rdmaClient.IsRealRdma()
+				isRealRDMA := c.rdmaClient.IsRealRdma() || source == "remote-rdma"
+				rdmaSource := "rdma+" + source
 				c.logger.WithFields(logrus.Fields{
 					"volume_id":  req.VolumeID,
 					"needle_id":  req.NeedleID,
-					"source":     source,
+					"source":     rdmaSource,
 					"real_rdma":  isRealRDMA,
 					"latency":    time.Since(start),
 					"bytes_read": len(data),
@@ -208,9 +218,9 @@ func (c *SeaweedFSRDMAClient) ReadNeedle(ctx context.Context, req *NeedleReadReq
 					} else {
 						return &NeedleReadResponse{
 							Data:         nil,
-							IsRDMA:       isRealRDMA,
+							IsRDMA:       true,
 							Latency:      time.Since(start),
-							Source:       source + "-zerocopy",
+							Source:       rdmaSource + "-zerocopy",
 							TempFilePath: tempFilePath,
 							UseTempFile:  true,
 						}, nil
@@ -219,9 +229,9 @@ func (c *SeaweedFSRDMAClient) ReadNeedle(ctx context.Context, req *NeedleReadReq
 
 				return &NeedleReadResponse{
 					Data:    data,
-					IsRDMA:  isRealRDMA,
+					IsRDMA:  true,
 					Latency: time.Since(start),
-					Source:  source,
+					Source:  rdmaSource,
 				}, nil
 			}
 		}
@@ -263,14 +273,36 @@ func (c *SeaweedFSRDMAClient) ReadNeedleRange(ctx context.Context, volumeID uint
 }
 
 // fetchNeedleData loads actual needle bytes after an RDMA session completes.
-// Mock engines only coordinate the session; data always comes from local files or HTTP.
 func (c *SeaweedFSRDMAClient) fetchNeedleData(ctx context.Context, req *NeedleReadRequest) ([]byte, string, error) {
-	if c.localReader != nil {
+	volumeServer := req.VolumeServer
+	if volumeServer == "" {
+		volumeServer = c.volumeServerURL
+	}
+
+	if c.localReader != nil && remote.IsLocalHost(volumeServer) {
 		data, err := c.localReader.ReadNeedle(req.VolumeID, req.NeedleID, req.Cookie, req.Offset, req.Size)
 		if err == nil {
 			return data, "local-volume", nil
 		}
-		c.logger.WithError(err).Debug("local volume read failed, trying HTTP fallback")
+		c.logger.WithError(err).Debug("local volume read failed, trying remote/HTTP")
+	}
+
+	if !remote.IsLocalHost(volumeServer) {
+		size := req.Size
+		if size == 0 {
+			size = 4096
+		}
+		data, err := remote.ReadNeedle(ctx, volumeServer, c.remoteReadPort, &remote.NeedleReadRequest{
+			VolumeID: req.VolumeID,
+			NeedleID: req.NeedleID,
+			Cookie:   req.Cookie,
+			Offset:   req.Offset,
+			Size:     size,
+		})
+		if err == nil {
+			return data, "remote-rdma", nil
+		}
+		c.logger.WithError(err).Debug("remote RDMA read failed, trying HTTP fallback")
 	}
 
 	data, err := c.httpFallback(ctx, req)

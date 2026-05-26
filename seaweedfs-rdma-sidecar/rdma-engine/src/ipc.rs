@@ -40,6 +40,10 @@ pub enum IpcMessage {
     Ping(PingRequest),
     /// Ping response
     Pong(PongResponse),
+
+    /// Request local UCX worker address (for peer connection)
+    GetWorkerAddress(GetWorkerAddressRequest),
+    GetWorkerAddressResponse(GetWorkerAddressResponse),
     
     /// Error response
     Error(ErrorResponse),
@@ -163,6 +167,18 @@ pub struct PongResponse {
     pub server_rtt_ns: u64,
 }
 
+/// Request for UCX worker address
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetWorkerAddressRequest {}
+
+/// UCX worker address for peer connection (base64)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GetWorkerAddressResponse {
+    pub worker_address_b64: String,
+    pub listen_port: u16,
+    pub real_rdma: bool,
+}
+
 /// Error response
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
@@ -243,17 +259,29 @@ impl IpcServer {
                 match accept_result {
                     Ok(Ok((stream, addr))) => {
                         debug!("New IPC connection from: {:?}", addr);
-                        
-                        // Spawn handler for this connection
+
                         let rdma_context = self.rdma_context.clone();
                         let session_manager = self.session_manager.clone();
                         let shutdown_flag = self.shutdown_flag.clone();
-                        
-                        tokio::spawn(async move {
-                            if let Err(e) = Self::handle_connection(stream, rdma_context, session_manager, shutdown_flag).await {
+
+                        #[cfg(feature = "real-ucx")]
+                        {
+                            if let Err(e) = Self::handle_connection(
+                                stream, rdma_context, session_manager, shutdown_flag,
+                            ).await {
                                 error!("IPC connection error: {}", e);
                             }
-                        });
+                        }
+                        #[cfg(not(feature = "real-ucx"))]
+                        {
+                            tokio::spawn(async move {
+                                if let Err(e) = Self::handle_connection(
+                                    stream, rdma_context, session_manager, shutdown_flag,
+                                ).await {
+                                    error!("IPC connection error: {}", e);
+                                }
+                            });
+                        }
                     }
                     Ok(Err(e)) => {
                         error!("Failed to accept IPC connection: {}", e);
@@ -393,6 +421,21 @@ impl IpcServer {
                     Ok(response) => IpcMessage::CompleteReadResponse(response),
                     Err(error) => IpcMessage::Error(ErrorResponse::from(&error)),
                 }
+            }
+
+            IpcMessage::GetWorkerAddress(_req) => {
+                let listen_port = std::env::var("RDMA_LISTEN_PORT")
+                    .ok()
+                    .and_then(|s| s.parse().ok())
+                    .unwrap_or(18515u16);
+                let worker_address_b64 = rdma_context
+                    .worker_address_b64()
+                    .unwrap_or_default();
+                IpcMessage::GetWorkerAddressResponse(GetWorkerAddressResponse {
+                    worker_address_b64,
+                    listen_port,
+                    real_rdma: rdma_context.is_real_rdma(),
+                })
             }
             
             _ => IpcMessage::Error(ErrorResponse {

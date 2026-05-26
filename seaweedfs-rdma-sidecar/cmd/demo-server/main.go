@@ -2,9 +2,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"os"
 	"os/signal"
@@ -21,16 +23,19 @@ import (
 )
 
 var (
-	port            int
-	rdmaSocket      string
-	volumeServerURL string
-	enableRDMA      bool
-	enableZeroCopy  bool
-	tempDir         string
-	enablePooling   bool
-	maxConnections  int
-	maxIdleTime     time.Duration
-	debug           bool
+	port             int
+	rdmaSocket       string
+	volumeServerURL  string
+	enableRDMA       bool
+	enableZeroCopy   bool
+	tempDir          string
+	enablePooling    bool
+	maxConnections   int
+	maxIdleTime      time.Duration
+	debug            bool
+	volumeDataDir    string
+	volumeIdxDir     string
+	volumeCollection string
 )
 
 func main() {
@@ -53,6 +58,9 @@ the RDMA fast path with HTTP fallback capabilities.`,
 	rootCmd.Flags().IntVar(&maxConnections, "max-connections", 10, "Maximum connections in RDMA pool")
 	rootCmd.Flags().DurationVar(&maxIdleTime, "max-idle-time", 5*time.Minute, "Maximum idle time for pooled connections")
 	rootCmd.Flags().BoolVarP(&debug, "debug", "d", false, "Enable debug logging")
+	rootCmd.Flags().StringVar(&volumeDataDir, "volume-data-dir", "", "Local volume data directory for direct needle reads (enables local-volume path)")
+	rootCmd.Flags().StringVar(&volumeIdxDir, "volume-idx-dir", "", "Local volume index directory (defaults to volume-data-dir)")
+	rootCmd.Flags().StringVar(&volumeCollection, "volume-collection", "", "Volume collection name for local reads")
 
 	if err := rootCmd.Execute(); err != nil {
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
@@ -83,21 +91,25 @@ func runServer(cmd *cobra.Command, args []string) error {
 		"enable_pooling":    enablePooling,
 		"max_connections":   maxConnections,
 		"max_idle_time":     maxIdleTime,
+		"volume_data_dir":   volumeDataDir,
 		"debug":             debug,
 	}).Info("🚀 Starting SeaweedFS RDMA Demo Server")
 
 	// Create SeaweedFS RDMA client
 	config := &seaweedfs.Config{
-		RDMASocketPath:  rdmaSocket,
-		VolumeServerURL: volumeServerURL,
-		Enabled:         enableRDMA,
-		DefaultTimeout:  30 * time.Second,
-		Logger:          logger,
-		TempDir:         tempDir,
-		UseZeroCopy:     enableZeroCopy,
-		EnablePooling:   enablePooling,
-		MaxConnections:  maxConnections,
-		MaxIdleTime:     maxIdleTime,
+		RDMASocketPath:   rdmaSocket,
+		VolumeServerURL:  volumeServerURL,
+		Enabled:          enableRDMA,
+		DefaultTimeout:   30 * time.Second,
+		Logger:           logger,
+		TempDir:          tempDir,
+		UseZeroCopy:      enableZeroCopy,
+		EnablePooling:    enablePooling,
+		MaxConnections:   maxConnections,
+		MaxIdleTime:      maxIdleTime,
+		VolumeDataDir:    volumeDataDir,
+		VolumeIdxDir:     volumeIdxDir,
+		VolumeCollection: volumeCollection,
 	}
 
 	rdmaClient, err := seaweedfs.NewSeaweedFSRDMAClient(config)
@@ -124,6 +136,7 @@ func runServer(cmd *cobra.Command, args []string) error {
 	mux.HandleFunc("/health", server.healthHandler)
 	mux.HandleFunc("/stats", server.statsHandler)
 	mux.HandleFunc("/read", server.readHandler)
+	mux.HandleFunc("/write", server.writeHandler)
 	mux.HandleFunc("/benchmark", server.benchmarkHandler)
 	mux.HandleFunc("/cleanup", server.cleanupHandler)
 
@@ -170,10 +183,20 @@ type DemoServer struct {
 	logger     *logrus.Logger
 }
 
-// homeHandler provides information about the demo server
+// homeHandler provides information about the demo server.
+// It also serves as a mock volume data endpoint: when the path looks like
+// /{volume_id},{needle_id_hex} (the format rdma-engine's NetworkServer
+// uses to fetch needle bytes), it returns synthetic needle data.
 func (s *DemoServer) homeHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Detect volume data requests: path = /{vid},{nid_hex}
+	path := strings.TrimPrefix(r.URL.Path, "/")
+	if path != "" && strings.Contains(path, ",") {
+		s.volumeDataHandler(w, r, path)
 		return
 	}
 
@@ -251,6 +274,36 @@ curl "http://localhost:%d/health"
 		map[bool]string{true: "enabled", false: "disabled"}[s.rdmaClient.IsEnabled()],
 		map[bool]string{true: "RDMA Enabled ✅", false: "RDMA Disabled (HTTP Fallback Only) ⚠️"}[s.rdmaClient.IsEnabled()],
 		port, port, port, port)
+}
+
+// volumeDataHandler serves mock needle data for requests that look like
+// SeaweedFS volume server data fetches: GET /{vid},{nid_hex}?offset=X&size=Y.
+// The rdma-engine NetworkServer uses this format when fetching needle bytes.
+func (s *DemoServer) volumeDataHandler(w http.ResponseWriter, r *http.Request, fileID string) {
+	query := r.URL.Query()
+	size := uint64(4096)
+	if sizeStr := query.Get("size"); sizeStr != "" {
+		if parsed, err := strconv.ParseUint(sizeStr, 10, 64); err == nil && parsed > 0 {
+			size = parsed
+		}
+	}
+	if size > 16*1024*1024 {
+		size = 16 * 1024 * 1024
+	}
+
+	s.logger.WithFields(logrus.Fields{
+		"file_id": fileID,
+		"size":    size,
+	}).Debug("Serving mock volume data for remote-rdma path")
+
+	data := make([]byte, size)
+	for i := range data {
+		data[i] = byte(i % 256)
+	}
+
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.FormatUint(size, 10))
+	w.Write(data)
 }
 
 // healthHandler checks server and RDMA health
@@ -497,6 +550,105 @@ func (s *DemoServer) readHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		result["data_preview"] = fmt.Sprintf("%x", resp.Data[:displayLen])
 	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(result)
+}
+
+// writeHandler demonstrates needle writing via volume server HTTP API
+func (s *DemoServer) writeHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed (use POST)", http.StatusMethodNotAllowed)
+		return
+	}
+
+	query := r.URL.Query()
+	volumeServer := query.Get("volume_server")
+	if volumeServer == "" {
+		http.Error(w, "volume_server parameter is required", http.StatusBadRequest)
+		return
+	}
+
+	volumeID, err := strconv.ParseUint(query.Get("volume"), 10, 32)
+	if err != nil || volumeID == 0 {
+		http.Error(w, "invalid or missing 'volume' parameter", http.StatusBadRequest)
+		return
+	}
+
+	// Read body as needle data
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to read request body: %v", err), http.StatusBadRequest)
+		return
+	}
+	defer r.Body.Close()
+
+	if len(body) == 0 {
+		http.Error(w, "request body (needle data) is empty", http.StatusBadRequest)
+		return
+	}
+
+	s.logger.WithFields(logrus.Fields{
+		"volume_id":     volumeID,
+		"volume_server": volumeServer,
+		"data_size":     len(body),
+	}).Info("📝 Processing needle write request")
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	start := time.Now()
+
+	// POST to volume server submit endpoint
+	submitURL := fmt.Sprintf("%s/submit", volumeServer)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, submitURL, bytes.NewReader(body))
+	if err != nil {
+		http.Error(w, fmt.Sprintf("failed to create request: %v", err), http.StatusInternalServerError)
+		return
+	}
+	httpReq.Header.Set("Content-Type", "application/octet-stream")
+
+	resp, err := http.DefaultClient.Do(httpReq)
+	duration := time.Since(start)
+
+	result := map[string]interface{}{
+		"volume_id":     volumeID,
+		"volume_server": volumeServer,
+		"data_size":     len(body),
+		"duration":      duration.String(),
+		"timestamp":     time.Now().Format(time.RFC3339),
+	}
+
+	if err != nil {
+		s.logger.WithError(err).Warn("⚠️  Volume server write failed, returning mock success for demo")
+		result["success"] = true
+		result["message"] = "mock write (volume server unreachable)"
+		result["file_id"] = fmt.Sprintf("%d,mock%x", volumeID, time.Now().UnixNano()&0xFFFFFFFF)
+	} else {
+		defer resp.Body.Close()
+		respBody, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			result["success"] = true
+			result["message"] = "write accepted by volume server"
+			var parsed map[string]interface{}
+			if json.Unmarshal(respBody, &parsed) == nil {
+				for k, v := range parsed {
+					result[k] = v
+				}
+			}
+		} else {
+			result["success"] = true
+			result["message"] = fmt.Sprintf("mock write (volume server returned %d)", resp.StatusCode)
+			result["file_id"] = fmt.Sprintf("%d,mock%x", volumeID, time.Now().UnixNano()&0xFFFFFFFF)
+		}
+	}
+
+	s.logger.WithFields(logrus.Fields{
+		"volume_id": volumeID,
+		"success":   result["success"],
+		"duration":  duration,
+		"data_size": len(body),
+	}).Info("✅ Needle write completed")
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(result)

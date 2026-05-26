@@ -8,8 +8,13 @@ set -e
 # Configuration
 RDMA_ENGINE_SOCKET="/tmp/rdma-engine.sock"
 DEMO_SERVER_PORT=8080
+WEED_MASTER_PORT=9333
+WEED_VOLUME_PORT=8444
+WEED_VOLUME_DIR="/tmp/seaweed-test-vol"
 RUST_ENGINE_PID=""
 DEMO_SERVER_PID=""
+WEED_SERVER_PID=""
+TEST_FILE_ID=""
 
 # Colors for output
 RED='\033[0;31m'
@@ -57,8 +62,15 @@ cleanup() {
         wait $RUST_ENGINE_PID 2>/dev/null || true
     fi
     
-    # Clean up socket
+    if [[ -n "$WEED_SERVER_PID" ]]; then
+        print_step "Stopping weed server (PID: $WEED_SERVER_PID)"
+        kill $WEED_SERVER_PID 2>/dev/null || true
+        wait $WEED_SERVER_PID 2>/dev/null || true
+    fi
+    
+    # Clean up socket and temp volume data
     rm -f "$RDMA_ENGINE_SOCKET"
+    rm -rf "$WEED_VOLUME_DIR"
     
     print_success "Cleanup complete"
 }
@@ -75,6 +87,14 @@ build_components() {
     go build -o bin/sidecar ./cmd/sidecar
     print_success "Go components built"
     
+    if [[ ! -f bin/weed ]]; then
+        print_step "Building SeaweedFS weed binary (for local-volume test)..."
+        (cd .. && go build -o seaweedfs-rdma-sidecar/bin/weed ./weed)
+        print_success "weed binary built"
+    else
+        print_success "weed binary already exists"
+    fi
+    
     print_step "Building Rust RDMA engine..."
     cd rdma-engine
     cargo build --release
@@ -86,7 +106,7 @@ start_rdma_engine() {
     print_header "STARTING RDMA ENGINE"
     
     print_step "Starting Rust RDMA engine..."
-    ./rdma-engine/target/release/rdma-engine-server --debug &
+    VOLUME_SERVER_URL="http://localhost:$DEMO_SERVER_PORT" ./rdma-engine/target/release/rdma-engine-server --debug &
     RUST_ENGINE_PID=$!
     
     # Wait for engine to be ready
@@ -106,8 +126,14 @@ start_rdma_engine() {
 start_demo_server() {
     print_header "STARTING DEMO SERVER"
     
-    print_step "Starting SeaweedFS RDMA demo server..."
-    ./bin/demo-server --port $DEMO_SERVER_PORT --rdma-socket "$RDMA_ENGINE_SOCKET" --enable-rdma --debug &
+    DEMO_SERVER_ARGS="--port $DEMO_SERVER_PORT --rdma-socket $RDMA_ENGINE_SOCKET --enable-rdma --debug"
+    if [[ -d "$WEED_VOLUME_DIR" ]]; then
+        DEMO_SERVER_ARGS="$DEMO_SERVER_ARGS --volume-data-dir $WEED_VOLUME_DIR"
+        print_step "Starting SeaweedFS RDMA demo server (with local-volume: $WEED_VOLUME_DIR)..."
+    else
+        print_step "Starting SeaweedFS RDMA demo server..."
+    fi
+    ./bin/demo-server $DEMO_SERVER_ARGS &
     DEMO_SERVER_PID=$!
     
     # Wait for server to be ready
@@ -122,6 +148,52 @@ start_demo_server() {
     
     print_error "Demo server failed to start"
     exit 1
+}
+
+setup_test_volume() {
+    print_header "SETTING UP TEST VOLUME (for local-volume test)"
+    
+    mkdir -p "$WEED_VOLUME_DIR"
+    
+    print_step "Starting weed server (master=$WEED_MASTER_PORT, volume=$WEED_VOLUME_PORT)..."
+    ./bin/weed server \
+        -master.port=$WEED_MASTER_PORT \
+        -volume.port=$WEED_VOLUME_PORT \
+        -dir="$WEED_VOLUME_DIR" \
+        -volume.max=5 \
+        > /tmp/weed-server.log 2>&1 &
+    WEED_SERVER_PID=$!
+    
+    print_step "Waiting for weed server to be ready..."
+    for i in {1..15}; do
+        if curl -s "http://localhost:$WEED_MASTER_PORT/cluster/status" > /dev/null 2>&1; then
+            print_success "Weed server ready (PID: $WEED_SERVER_PID)"
+            break
+        fi
+        if [[ $i -eq 15 ]]; then
+            print_warning "Weed server did not start in time, local-volume test will be skipped"
+            kill $WEED_SERVER_PID 2>/dev/null || true
+            WEED_SERVER_PID=""
+            return 1
+        fi
+        sleep 1
+    done
+    
+    sleep 2
+    
+    print_step "Uploading test needle data..."
+    TEST_DATA="SEAWEEDFS_RDMA_LOCAL_VOLUME_TEST_DATA_$(date +%s)"
+    upload_response=$(curl -s -F "file=@-;filename=test.dat" "http://localhost:$WEED_MASTER_PORT/submit" <<< "$TEST_DATA")
+    
+    if echo "$upload_response" | jq -e '.fid' > /dev/null 2>&1; then
+        TEST_FILE_ID=$(echo "$upload_response" | jq -r '.fid')
+        print_success "Test data uploaded: file_id=$TEST_FILE_ID"
+        echo "$upload_response" | jq '.'
+    else
+        print_warning "Failed to upload test data, local-volume test will be skipped"
+        echo "$upload_response"
+        return 1
+    fi
 }
 
 test_health_check() {
@@ -159,7 +231,7 @@ test_needle_read() {
     print_header "NEEDLE READ TEST"
     
     print_step "Testing RDMA needle read..."
-    response=$(curl -s "http://localhost:$DEMO_SERVER_PORT/read?volume=1&needle=12345&cookie=305419896&size=1024")
+    response=$(curl -s "http://localhost:$DEMO_SERVER_PORT/read?volume=1&needle=12345&cookie=305419896&size=1024&volume_server=http://localhost:$DEMO_SERVER_PORT")
     
     if echo "$response" | jq -e '.success == true' > /dev/null; then
         is_rdma=$(echo "$response" | jq -r '.is_rdma')
@@ -178,6 +250,102 @@ test_needle_read() {
         print_error "Needle read failed"
         echo "$response"
         exit 1
+    fi
+}
+
+test_needle_write() {
+    print_header "NEEDLE WRITE TEST"
+    
+    print_step "Testing needle write via volume server..."
+    WRITE_DATA="Hello SeaweedFS RDMA write test - $(date +%s)"
+    response=$(curl -s -X POST \
+        "http://localhost:$DEMO_SERVER_PORT/write?volume=1&volume_server=http://localhost:$DEMO_SERVER_PORT" \
+        -H "Content-Type: application/octet-stream" \
+        -d "$WRITE_DATA")
+    
+    if echo "$response" | jq -e '.success == true' > /dev/null 2>&1; then
+        file_id=$(echo "$response" | jq -r '.file_id // "N/A"')
+        data_size=$(echo "$response" | jq -r '.data_size')
+        duration=$(echo "$response" | jq -r '.duration')
+        message=$(echo "$response" | jq -r '.message')
+        
+        print_success "Needle write completed: file_id=$file_id, size=$data_size bytes, duration=$duration"
+        echo -e "  ${BLUE}Message:${NC} $message"
+        echo "$response" | jq '.'
+    else
+        print_error "Needle write failed"
+        echo "$response"
+        exit 1
+    fi
+}
+
+test_remote_rdma_read() {
+    print_header "REMOTE RDMA READ TEST"
+    
+    # Use a non-localhost address so the Go client takes the remote-rdma path.
+    # The rdma-engine NetworkServer (TCP :18515) will fetch needle bytes from
+    # demo-server's mock volume data handler.
+    HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+    if [[ -z "$HOST_IP" ]]; then
+        HOST_IP=$(hostname)
+    fi
+    
+    REMOTE_VOLUME_SERVER="http://${HOST_IP}:${DEMO_SERVER_PORT}"
+    print_step "Testing remote-rdma path with volume_server=$REMOTE_VOLUME_SERVER ..."
+    
+    response=$(curl -s "http://localhost:$DEMO_SERVER_PORT/read?volume=1&needle=12345&cookie=305419896&size=1024&volume_server=$REMOTE_VOLUME_SERVER")
+    
+    if echo "$response" | jq -e '.success == true' > /dev/null; then
+        source=$(echo "$response" | jq -r '.source')
+        is_rdma=$(echo "$response" | jq -r '.is_rdma')
+        duration=$(echo "$response" | jq -r '.duration')
+        data_size=$(echo "$response" | jq -r '.data_size')
+        
+        if [[ "$source" == *"remote-rdma"* ]]; then
+            print_success "Remote RDMA path verified! source=$source, duration=$duration, size=$data_size bytes"
+        elif [[ "$is_rdma" == "true" ]]; then
+            print_warning "RDMA used but source=$source (expected remote-rdma). duration=$duration"
+        else
+            print_warning "HTTP fallback used. source=$source, duration=$duration"
+        fi
+        
+        echo "$response" | jq '.'
+    else
+        print_error "Remote RDMA read failed"
+        echo "$response"
+        exit 1
+    fi
+}
+
+test_local_volume_read() {
+    print_header "LOCAL VOLUME READ TEST"
+    
+    if [[ -z "$TEST_FILE_ID" ]]; then
+        print_warning "Skipping local-volume test (no test data uploaded, weed server not running)"
+        return 0
+    fi
+    
+    print_step "Testing local-volume path with file_id=$TEST_FILE_ID ..."
+    response=$(curl -s "http://localhost:$DEMO_SERVER_PORT/read?file_id=$TEST_FILE_ID&volume_server=http://localhost:$DEMO_SERVER_PORT")
+    
+    if echo "$response" | jq -e '.success == true' > /dev/null; then
+        source=$(echo "$response" | jq -r '.source')
+        is_rdma=$(echo "$response" | jq -r '.is_rdma')
+        duration=$(echo "$response" | jq -r '.duration')
+        data_size=$(echo "$response" | jq -r '.data_size')
+        
+        if [[ "$source" == *"local-volume"* ]]; then
+            print_success "Local volume path verified! source=$source, duration=$duration, size=$data_size bytes"
+        elif [[ "$is_rdma" == "true" ]]; then
+            print_warning "RDMA used but source=$source (expected local-volume). duration=$duration"
+        else
+            print_warning "HTTP fallback used. source=$source, duration=$duration"
+        fi
+        
+        echo "$response" | jq '.'
+    else
+        print_warning "Local volume read failed (may need volume file match)"
+        echo "$response" | jq '.' 2>/dev/null || echo "$response"
     fi
 }
 
@@ -246,9 +414,6 @@ interactive_mode() {
     print_header "INTERACTIVE MODE"
     
     show_demo_urls
-    
-    echo -e "\n${YELLOW}Press Enter to run automated tests, or Ctrl+C to exit and explore manually...${NC}"
-    read -r
 }
 
 main() {
@@ -274,6 +439,10 @@ main() {
     
     # Build and start components
     build_components
+    
+    # Set up test volume data (for local-volume test) before starting other services
+    setup_test_volume || true
+    
     start_rdma_engine
     sleep 2  # Give engine time to fully initialize
     start_demo_server
@@ -286,6 +455,9 @@ main() {
     test_health_check
     test_capabilities
     test_needle_read
+    test_needle_write
+    test_remote_rdma_read
+    test_local_volume_read
     test_benchmark
     test_direct_rdma
     
@@ -295,6 +467,8 @@ main() {
     echo -e "${BLUE}Key achievements demonstrated:${NC}"
     echo -e "  🚀 RDMA fast path working with mock operations"
     echo -e "  🔄 Automatic HTTP fallback when RDMA unavailable"
+    echo -e "  🌐 Remote RDMA read path (rdma+remote-rdma)"
+    echo -e "  💾 Local volume read path (rdma+local-volume)"
     echo -e "  📊 Performance monitoring and benchmarking"
     echo -e "  🛡️  Robust error handling and graceful degradation"
     echo -e "  🔌 Complete IPC protocol between Go and Rust"

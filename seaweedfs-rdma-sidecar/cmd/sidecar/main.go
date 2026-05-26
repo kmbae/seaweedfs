@@ -13,6 +13,7 @@ import (
 
 	"seaweedfs-rdma-sidecar/pkg/httpserver"
 	"seaweedfs-rdma-sidecar/pkg/rdma"
+	"seaweedfs-rdma-sidecar/pkg/remote"
 	"seaweedfs-rdma-sidecar/pkg/seaweedfs"
 
 	"github.com/sirupsen/logrus"
@@ -123,6 +124,7 @@ func runSidecar(cmd *cobra.Command, args []string) error {
 	mux := http.NewServeMux()
 	mux.Handle("/read", &httpserver.ReadHandler{Client: sfClient, Logger: logger})
 	mux.HandleFunc("/health", healthHandler(logger, healthRdma))
+	mux.HandleFunc("/rdma/worker-address", workerAddressHandler(healthRdma))
 	mux.HandleFunc("/rdma/capabilities", capabilitiesHandler(healthRdma))
 	mux.HandleFunc("/rdma/ping", pingHandler(logger, healthRdma))
 
@@ -193,6 +195,32 @@ func capabilitiesHandler(rdmaClient *rdma.Client) http.HandlerFunc {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(caps)
+	}
+}
+
+func workerAddressHandler(rdmaClient *rdma.Client) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		info := map[string]interface{}{
+			"worker_address_b64": "",
+			"listen_port":        remote.DefaultRemotePort,
+			"real_rdma":          rdmaClient.IsRealRdma(),
+		}
+		if rdmaClient.IsConnected() {
+			if wa, err := rdmaClient.GetWorkerAddress(ctx); err == nil {
+				info["worker_address_b64"] = wa.WorkerAddressB64
+				info["listen_port"] = wa.ListenPort
+				info["real_rdma"] = wa.RealRdma
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(info)
 	}
 }
 

@@ -334,6 +334,22 @@ func (c *Client) GetCapabilities() *ipc.GetCapabilitiesResponse {
 	return c.capabilities
 }
 
+// GetWorkerAddress returns UCX worker address info from the engine.
+func (c *Client) GetWorkerAddress(ctx context.Context) (*ipc.GetWorkerAddressResponse, error) {
+	if !c.IsConnected() {
+		return nil, fmt.Errorf("not connected to RDMA engine")
+	}
+	if c.pool != nil {
+		conn, err := c.pool.getConnection(ctx)
+		if err != nil {
+			return nil, err
+		}
+		defer c.pool.releaseConnection(conn)
+		return conn.ipcClient.GetWorkerAddress(ctx)
+	}
+	return c.ipcClient.GetWorkerAddress(ctx)
+}
+
 // IsRealRdma reports whether the connected engine uses hardware RDMA (vs mock).
 func (c *Client) IsRealRdma() bool {
 	if c.capabilities == nil {
@@ -527,7 +543,21 @@ func (c *Client) Ping(ctx context.Context) (time.Duration, error) {
 
 	clientID := "health-check"
 	start := time.Now()
-	pong, err := c.ipcClient.Ping(ctx, &clientID)
+
+	var pong *ipc.PongResponse
+	var err error
+
+	if c.pool != nil {
+		conn, connErr := c.pool.getConnection(ctx)
+		if connErr != nil {
+			return 0, fmt.Errorf("failed to get pooled connection for ping: %w", connErr)
+		}
+		defer c.pool.releaseConnection(conn)
+		pong, err = conn.ipcClient.Ping(ctx, &clientID)
+	} else {
+		pong, err = c.ipcClient.Ping(ctx, &clientID)
+	}
+
 	if err != nil {
 		return 0, err
 	}

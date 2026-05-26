@@ -252,6 +252,30 @@ func (c *Client) GetCapabilities(ctx context.Context, clientID *string) (*GetCap
 	return &caps, nil
 }
 
+// GetWorkerAddress returns the UCX worker address for peer connection.
+func (c *Client) GetWorkerAddress(ctx context.Context) (*GetWorkerAddressResponse, error) {
+	msg := NewGetWorkerAddressMessage()
+	response, err := c.SendMessage(ctx, msg)
+	if err != nil {
+		return nil, err
+	}
+	if response.Type == MsgError {
+		return nil, fmt.Errorf("engine error on GetWorkerAddress")
+	}
+	if response.Type != MsgGetWorkerAddressResponse {
+		return nil, fmt.Errorf("unexpected response type: %s", response.Type)
+	}
+	data, err := msgpack.Marshal(response.Data)
+	if err != nil {
+		return nil, err
+	}
+	var out GetWorkerAddressResponse
+	if err := msgpack.Unmarshal(data, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
 // StartRead initiates an RDMA read operation
 func (c *Client) StartRead(ctx context.Context, req *StartReadRequest) (*StartReadResponse, error) {
 	msg := NewStartReadMessage(req)

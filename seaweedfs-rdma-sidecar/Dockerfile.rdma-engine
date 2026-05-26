@@ -1,5 +1,5 @@
 # Multi-stage build for Rust RDMA Engine
-FROM rust:1.80-slim AS builder
+FROM rust:1.95-slim AS builder
 
 ARG CARGO_FEATURES=""
 

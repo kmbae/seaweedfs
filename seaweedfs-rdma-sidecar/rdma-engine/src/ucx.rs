@@ -259,9 +259,14 @@ pub struct UcxContext {
     memory_regions: Mutex<HashMap<u64, UcpMem>>,
 }
 
+// Safety: UCX handles are created once and never moved. Endpoints and memory regions
+// are guarded by Mutex; the worker is configured single-threaded (see UcpWorkerParams).
+unsafe impl Send for UcxContext {}
+unsafe impl Sync for UcxContext {}
+
 impl UcxContext {
     /// Initialize UCX context with RMA support
-    pub async fn new() -> RdmaResult<Self> {
+    pub fn new() -> RdmaResult<Self> {
         info!("🚀 Initializing UCX context for RDMA operations");
         
         let api = Arc::new(UcxApi::load()?);
@@ -342,7 +347,7 @@ impl UcxContext {
     }
     
     /// Map memory for RDMA operations
-    pub async fn map_memory(&self, addr: u64, size: usize) -> RdmaResult<u64> {
+    pub fn map_memory(&self, addr: u64, size: usize) -> RdmaResult<u64> {
         debug!("📍 Mapping memory for RDMA: addr=0x{:x}, size={}", addr, size);
         
         let params = UcpMemMapParams {
@@ -374,7 +379,7 @@ impl UcxContext {
     }
     
     /// Unmap memory
-    pub async fn unmap_memory(&self, addr: u64) -> RdmaResult<()> {
+    pub fn unmap_memory(&self, addr: u64) -> RdmaResult<()> {
         debug!("🗑️ Unmapping memory: addr=0x{:x}", addr);
         
         let mem_handle = {
@@ -394,7 +399,7 @@ impl UcxContext {
     }
     
     /// Perform RDMA GET (read from remote memory)
-    pub async fn get(&self, local_addr: u64, remote_addr: u64, size: usize) -> RdmaResult<()> {
+    pub fn get(&self, local_addr: u64, remote_addr: u64, size: usize) -> RdmaResult<()> {
         debug!("📥 RDMA GET: local=0x{:x}, remote=0x{:x}, size={}", 
                local_addr, remote_addr, size);
         
@@ -402,7 +407,7 @@ impl UcxContext {
         // In production, this would be properly async with completion callbacks
         
         // Find or create endpoint (simplified - would need proper address resolution)
-        let ep = self.get_or_create_endpoint("default").await?;
+        let ep = self.get_or_create_endpoint("default")?;
         
         let request = unsafe {
             (self.api.ucp_get_nb)(
@@ -432,7 +437,7 @@ impl UcxContext {
                 
                 // Progress the worker
                 unsafe { (self.api.ucp_worker_progress)(self.worker) };
-                tokio::task::yield_now().await;
+                std::thread::yield_now();
             }
         }
         
@@ -441,11 +446,11 @@ impl UcxContext {
     }
     
     /// Perform RDMA PUT (write to remote memory)
-    pub async fn put(&self, local_addr: u64, remote_addr: u64, size: usize) -> RdmaResult<()> {
+    pub fn put(&self, local_addr: u64, remote_addr: u64, size: usize) -> RdmaResult<()> {
         debug!("📤 RDMA PUT: local=0x{:x}, remote=0x{:x}, size={}", 
                local_addr, remote_addr, size);
         
-        let ep = self.get_or_create_endpoint("default").await?;
+        let ep = self.get_or_create_endpoint("default")?;
         
         let request = unsafe {
             (self.api.ucp_put_nb)(
@@ -474,7 +479,7 @@ impl UcxContext {
                 }
                 
                 unsafe { (self.api.ucp_worker_progress)(self.worker) };
-                tokio::task::yield_now().await;
+                std::thread::yield_now();
             }
         }
         
@@ -487,37 +492,49 @@ impl UcxContext {
         &self.worker_address
     }
     
-    /// Create endpoint for communication (simplified version)
-    async fn get_or_create_endpoint(&self, key: &str) -> RdmaResult<UcpEp> {
+    /// Create endpoint to a remote UCX peer using its worker address bytes.
+    pub fn connect_peer(&self, key: &str, worker_address: &[u8]) -> RdmaResult<UcpEp> {
+        let mut endpoints = self.endpoints.lock();
+        if let Some(&ep) = endpoints.get(key) {
+            return Ok(ep);
+        }
+
+        let ep_params = UcpEpParams {
+            field_mask: UCP_EP_PARAM_FIELD_REMOTE_ADDRESS,
+            address: worker_address.as_ptr() as *const c_void,
+            flags: 0,
+            sock_addr: ptr::null(),
+            err_handler: error_handler_cb,
+            user_data: ptr::null_mut(),
+        };
+
+        let mut endpoint = ptr::null_mut();
+        let status = unsafe { (self.api.ucp_ep_create)(self.worker, &ep_params, &mut endpoint) };
+        if status != UCS_OK {
+            return Err(RdmaError::context_init_failed(format!(
+                "ucp_ep_create to peer failed: {} ({})",
+                self.api.status_string(status),
+                status
+            )));
+        }
+
+        info!("✅ UCX peer endpoint created for key={} ({} bytes worker addr)", key, worker_address.len());
+        endpoints.insert(key.to_string(), endpoint);
+        Ok(endpoint)
+    }
+
+    /// Create endpoint for communication (legacy default key — local only)
+    fn get_or_create_endpoint(&self, key: &str) -> RdmaResult<UcpEp> {
         let mut endpoints = self.endpoints.lock();
         
         if let Some(&ep) = endpoints.get(key) {
             return Ok(ep);
         }
         
-        // For simplicity, create a dummy endpoint
-        // In production, this would use actual peer address
-        let ep_params = UcpEpParams {
-            field_mask: 0, // Simplified for mock
-            address: ptr::null(),
-            flags: 0,
-            sock_addr: ptr::null(),
-            err_handler: error_handler_cb,
-            user_data: ptr::null_mut(),
-        };
-        
-        let mut endpoint = ptr::null_mut();
-        let status = unsafe { (self.api.ucp_ep_create)(self.worker, &ep_params, &mut endpoint) };
-        
-        if status != UCS_OK {
-            return Err(RdmaError::context_init_failed(format!(
-                "ucp_ep_create failed: {} ({})",
-                self.api.status_string(status), status
-            )));
-        }
-        
-        endpoints.insert(key.to_string(), endpoint);
-        Ok(endpoint)
+        // Without a remote worker address, cannot create a useful peer endpoint.
+        Err(RdmaError::context_init_failed(
+            "no peer worker address; call connect_peer first".to_string(),
+        ))
     }
 }
 

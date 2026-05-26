@@ -289,6 +289,7 @@ func createClient() *rdma.Client {
 		EngineSocketPath: socketPath,
 		DefaultTimeout:   timeout,
 		Logger:           logger,
+		EnablePooling:    false,
 	}
 
 	return rdma.NewClient(config)

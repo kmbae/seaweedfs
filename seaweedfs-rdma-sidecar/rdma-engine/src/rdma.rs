@@ -272,7 +272,7 @@ pub struct UcxRdmaContext {
 #[cfg(feature = "real-ucx")]
 impl UcxRdmaContext {
     pub async fn new(config: &RdmaEngineConfig) -> RdmaResult<Self> {
-        let ucx = std::sync::Arc::new(crate::ucx::UcxContext::new().await?);
+        let ucx = std::sync::Arc::new(crate::ucx::UcxContext::new()?);
         let device_info = RdmaDeviceInfo {
             name: config.device_name.clone(),
             vendor_id: 0x02c9,
@@ -293,7 +293,7 @@ impl UcxRdmaContext {
     }
 
     pub async fn register_memory(&self, addr: u64, size: usize) -> RdmaResult<MemoryRegion> {
-        self.ucx.map_memory(addr, size).await?;
+        self.ucx.map_memory(addr, size)?;
         Ok(MemoryRegion {
             addr,
             rkey: 0,
@@ -304,7 +304,7 @@ impl UcxRdmaContext {
     }
 
     pub async fn deregister_memory(&self, region: &MemoryRegion) -> RdmaResult<()> {
-        self.ucx.unmap_memory(region.addr).await
+        self.ucx.unmap_memory(region.addr)
     }
 
     pub async fn post_read(
@@ -316,7 +316,7 @@ impl UcxRdmaContext {
         wr_id: u64,
     ) -> RdmaResult<()> {
         if remote_addr != 0 {
-            self.ucx.get(local_addr, remote_addr, size).await?;
+            self.ucx.get(local_addr, remote_addr, size)?;
         } else {
             // Local session coordination without a remote peer yet.
             let data_ptr = local_addr as *mut u8;
@@ -341,12 +341,12 @@ impl UcxRdmaContext {
         &self,
         local_addr: u64,
         remote_addr: u64,
-        rkey: u32,
+        _rkey: u32,
         size: usize,
         wr_id: u64,
     ) -> RdmaResult<()> {
         if remote_addr != 0 {
-            self.ucx.put(local_addr, remote_addr, size).await?;
+            self.ucx.put(local_addr, remote_addr, size)?;
         }
         self.pending_operations.write().push(WorkCompletion {
             wr_id,
@@ -395,8 +395,9 @@ pub struct RdmaContext {
 
 impl RdmaContext {
     pub async fn new(config: &RdmaEngineConfig) -> RdmaResult<Self> {
-        let inner = if cfg!(feature = "real-ucx") {
-            match UcxRdmaContext::new(config).await {
+        #[cfg(feature = "real-ucx")]
+        {
+            let inner = match UcxRdmaContext::new(config).await {
                 Ok(ctx) => {
                     info!("✅ Using UCX-backed RDMA context");
                     RdmaContextImpl::Ucx(ctx)
@@ -405,19 +406,43 @@ impl RdmaContext {
                     warn!("⚠️  UCX init failed ({}), falling back to mock RDMA", err);
                     RdmaContextImpl::Mock(MockRdmaContext::new(config).await?)
                 }
-            }
-        } else {
-            RdmaContextImpl::Mock(MockRdmaContext::new(config).await?)
-        };
+            };
+            return Ok(Self {
+                inner,
+                config: config.clone(),
+            });
+        }
 
-        Ok(Self {
-            inner,
-            config: config.clone(),
-        })
+        #[cfg(not(feature = "real-ucx"))]
+        {
+            Ok(Self {
+                inner: RdmaContextImpl::Mock(MockRdmaContext::new(config).await?),
+                config: config.clone(),
+            })
+        }
     }
 
     pub fn is_real_rdma(&self) -> bool {
-        matches!(self.inner, RdmaContextImpl::Ucx(_))
+        #[cfg(feature = "real-ucx")]
+        {
+            matches!(self.inner, RdmaContextImpl::Ucx(_))
+        }
+        #[cfg(not(feature = "real-ucx"))]
+        {
+            false
+        }
+    }
+
+    /// Base64-encoded UCX worker address for peer connection (real-ucx only).
+    pub fn worker_address_b64(&self) -> Option<String> {
+        match &self.inner {
+            RdmaContextImpl::Mock(_) => None,
+            #[cfg(feature = "real-ucx")]
+            RdmaContextImpl::Ucx(ctx) => {
+                use base64::{Engine as _, engine::general_purpose::STANDARD};
+                Some(STANDARD.encode(ctx.ucx.worker_address()))
+            }
+        }
     }
 
     pub async fn register_memory(&self, addr: u64, size: usize) -> RdmaResult<MemoryRegion> {

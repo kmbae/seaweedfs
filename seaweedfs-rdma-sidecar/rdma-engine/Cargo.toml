@@ -47,6 +47,8 @@ parking_lot = "0.12"  # Fast mutexes
 # IPC and networking
 nix = { version = "0.27", features = ["mman"] }  # Unix domain sockets and system calls
 async-trait = "0.1"  # Async traits
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+base64 = "0.22"
 
 # Configuration
 clap = { version = "4.0", features = ["derive"] }

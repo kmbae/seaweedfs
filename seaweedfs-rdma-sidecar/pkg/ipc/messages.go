@@ -12,19 +12,21 @@ type IpcMessage struct {
 
 // Request message types
 const (
-	MsgStartRead       = "StartRead"
-	MsgCompleteRead    = "CompleteRead"
-	MsgGetCapabilities = "GetCapabilities"
-	MsgPing            = "Ping"
+	MsgStartRead         = "StartRead"
+	MsgCompleteRead      = "CompleteRead"
+	MsgGetCapabilities   = "GetCapabilities"
+	MsgGetWorkerAddress  = "GetWorkerAddress"
+	MsgPing              = "Ping"
 )
 
 // Response message types
 const (
-	MsgStartReadResponse       = "StartReadResponse"
-	MsgCompleteReadResponse    = "CompleteReadResponse"
-	MsgGetCapabilitiesResponse = "GetCapabilitiesResponse"
-	MsgPong                    = "Pong"
-	MsgError                   = "Error"
+	MsgStartReadResponse        = "StartReadResponse"
+	MsgCompleteReadResponse     = "CompleteReadResponse"
+	MsgGetCapabilitiesResponse  = "GetCapabilitiesResponse"
+	MsgGetWorkerAddressResponse = "GetWorkerAddressResponse"
+	MsgPong                     = "Pong"
+	MsgError                    = "Error"
 )
 
 // StartReadRequest corresponds to Rust StartReadRequest
@@ -101,6 +103,16 @@ type PongResponse struct {
 	ServerRttNs       uint64 `msgpack:"server_rtt_ns"`
 }
 
+// GetWorkerAddressRequest corresponds to Rust GetWorkerAddressRequest
+type GetWorkerAddressRequest struct{}
+
+// GetWorkerAddressResponse corresponds to Rust GetWorkerAddressResponse
+type GetWorkerAddressResponse struct {
+	WorkerAddressB64 string `msgpack:"worker_address_b64"`
+	ListenPort       uint16 `msgpack:"listen_port"`
+	RealRdma         bool   `msgpack:"real_rdma"`
+}
+
 // ErrorResponse corresponds to Rust ErrorResponse
 type ErrorResponse struct {
 	Code    string  `msgpack:"code"`
@@ -145,6 +157,13 @@ func NewPingMessage(clientID *string) *IpcMessage {
 			TimestampNs: uint64(time.Now().UnixNano()),
 			ClientID:    clientID,
 		},
+	}
+}
+
+func NewGetWorkerAddressMessage() *IpcMessage {
+	return &IpcMessage{
+		Type: MsgGetWorkerAddress,
+		Data: &GetWorkerAddressRequest{},
 	}
 }
 
