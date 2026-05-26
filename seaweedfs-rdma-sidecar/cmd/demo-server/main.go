@@ -187,14 +187,9 @@ type DemoServer struct {
 // /{volume_id},{needle_id_hex} (the format rdma-engine's NetworkServer
 // uses to fetch needle bytes), it returns synthetic needle data.
 func (s *DemoServer) homeHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
 	path := strings.TrimPrefix(r.URL.Path, "/")
 
-	// Handle mock /submit endpoint for write persist
+	// Handle mock /submit endpoint for write persist (POST only)
 	if path == "submit" && r.Method == http.MethodPost {
 		s.submitHandler(w, r)
 		return
@@ -203,6 +198,11 @@ func (s *DemoServer) homeHandler(w http.ResponseWriter, r *http.Request) {
 	// Detect volume data requests: path = /{vid},{nid_hex}
 	if path != "" && strings.Contains(path, ",") {
 		s.volumeDataHandler(w, r, path)
+		return
+	}
+
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
