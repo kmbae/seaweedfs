@@ -34,6 +34,7 @@ func (c *commandFsConfigure) Help() string {
 	# trying the changes and see the possible configuration file content
 	fs.configure -locationPrefix=/my/folder -collection=abc
 	fs.configure -locationPrefix=/my/folder -collection=abc -ttl=7d
+	fs.configure -locationPrefix=/home/user -quotaMB=51200
 
 	# example: configure adding only 1 physical volume for each bucket collection
 	fs.configure -locationPrefix=/buckets/ -volumeGrowthCount=1
@@ -65,6 +66,7 @@ func (c *commandFsConfigure) Do(args []string, commandEnv *CommandEnv, writer io
 	wormGracePeriod := fsConfigureCommand.Uint64("wormGracePeriod", 0, "grace period before worm is enforced, in seconds")
 	wormRetentionTime := fsConfigureCommand.Uint64("wormRetentionTime", 0, "retention time for a worm enforced file, in seconds")
 	maxFileNameLength := fsConfigureCommand.Uint("maxFileNameLength", 0, "file name length limits in bytes for compatibility with Unix-based systems")
+	quotaMB := fsConfigureCommand.Uint64("quotaMB", 0, "hard quota in MiB for this locationPrefix")
 	dataCenter := fsConfigureCommand.String("dataCenter", "", "assign writes to this dataCenter")
 	rack := fsConfigureCommand.String("rack", "", "assign writes to this rack")
 	dataNode := fsConfigureCommand.String("dataNode", "", "assign writes to this dataNode")
@@ -98,6 +100,7 @@ func (c *commandFsConfigure) Do(args []string, commandEnv *CommandEnv, writer io
 			Worm:                     *worm,
 			WormGracePeriodSeconds:   *wormGracePeriod,
 			WormRetentionTimeSeconds: *wormRetentionTime,
+			QuotaBytes:               *quotaMB * 1024 * 1024,
 		}
 
 		// check collection

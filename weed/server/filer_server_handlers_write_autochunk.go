@@ -50,6 +50,8 @@ func (fs *FilerServer) autoChunk(ctx context.Context, w http.ResponseWriter, r *
 	if err != nil {
 		errStr := err.Error()
 		switch {
+		case errors.Is(err, filer.ErrPathQuotaExceeded):
+			writeJsonError(w, r, http.StatusInsufficientStorage, err)
 		case errStr == constants.ErrMsgOperationNotPermitted:
 			writeJsonError(w, r, http.StatusForbidden, err)
 		case strings.HasPrefix(errStr, "read input:") || errStr == io.ErrUnexpectedEOF.Error():

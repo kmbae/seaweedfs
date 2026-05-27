@@ -646,6 +646,7 @@ message FilerConf {
         bool worm = 14;
         uint64 worm_grace_period_seconds = 15;
         uint64 worm_retention_time_seconds = 16;
+        uint64 quota_bytes = 17; // hard quota for all files under location_prefix
     }
     repeated PathConf locations = 2;
 }

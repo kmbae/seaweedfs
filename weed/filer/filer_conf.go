@@ -204,6 +204,26 @@ func (fc *FilerConf) MatchStorageRule(path string) (pathConf *filer_pb.FilerConf
 	return pathConf
 }
 
+// MatchQuotaRule returns the most specific prefix rule with quota configured.
+// Callers must treat returned value as read-only.
+func (fc *FilerConf) MatchQuotaRule(path string) (pathConf *filer_pb.FilerConf_PathConf) {
+	pathBytes := []byte(path)
+	longestPrefixLen := -1
+
+	fc.rules.MatchPrefix(pathBytes, func(key []byte, value *filer_pb.FilerConf_PathConf) bool {
+		if value.GetQuotaBytes() == 0 {
+			return true
+		}
+		if len(key) > longestPrefixLen {
+			longestPrefixLen = len(key)
+			pathConf = value
+		}
+		return true
+	})
+
+	return pathConf
+}
+
 // ClonePathConf creates a mutable copy of an existing PathConf.
 // Use this when you need to modify a config (e.g., before calling SetLocationConf).
 //
@@ -230,6 +250,7 @@ func ClonePathConf(src *filer_pb.FilerConf_PathConf) *filer_pb.FilerConf_PathCon
 		Worm:                     src.Worm,
 		WormGracePeriodSeconds:   src.WormGracePeriodSeconds,
 		WormRetentionTimeSeconds: src.WormRetentionTimeSeconds,
+		QuotaBytes:               src.QuotaBytes,
 	}
 }
 
@@ -268,6 +289,9 @@ func mergePathConf(a, b *filer_pb.FilerConf_PathConf) {
 	}
 	if b.WormGracePeriodSeconds > 0 {
 		a.WormGracePeriodSeconds = b.WormGracePeriodSeconds
+	}
+	if b.QuotaBytes > 0 {
+		a.QuotaBytes = b.QuotaBytes
 	}
 }
 

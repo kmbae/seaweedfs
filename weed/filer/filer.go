@@ -235,6 +235,9 @@ func (f *Filer) CreateEntry(ctx context.Context, entry *Entry, existing *Entry, 
 	if oldEntry == nil {
 		oldEntry, _ = f.FindEntry(ctx, entry.FullPath)
 	}
+	if err := f.enforcePathQuota(ctx, entry, oldEntry); err != nil {
+		return err
+	}
 
 	/*
 		if !hasWritePermission(lastDirectoryEntry, entry) {
