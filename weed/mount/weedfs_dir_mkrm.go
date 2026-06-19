@@ -93,6 +93,7 @@ func (wfs *WFS) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out
 		wfs.inodeToPath.TouchDirectory(dirFullPath)
 		wfs.touchDirMtimeCtimeBest(dirFullPath)
 		wfs.inodeToPath.AdjustSubdirCount(dirFullPath, 1)
+		wfs.notifyDirNlinkChanged(dirFullPath)
 	}
 
 	glog.V(3).Infof("mkdir %s: %v", entryFullPath, err)
@@ -179,6 +180,7 @@ func (wfs *WFS) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, name string
 	wfs.inodeToPath.TouchDirectory(dirFullPath)
 	wfs.touchDirMtimeCtimeBest(dirFullPath)
 	wfs.inodeToPath.AdjustSubdirCount(dirFullPath, -1)
+	wfs.notifyDirNlinkChanged(dirFullPath)
 
 	return fuse.OK
 

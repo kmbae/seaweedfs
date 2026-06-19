@@ -15,6 +15,9 @@ type InodeToPath struct {
 	cacheMetaTtlSec time.Duration
 	inode2path      map[uint64]*InodeEntry
 	path2inode      map[util.FullPath]uint64
+	// pathSubdirCount tracks subdirectory counts by path so nlink stays correct
+	// even when the parent inode is not currently cached.
+	pathSubdirCount map[util.FullPath]int32
 }
 type InodeEntry struct {
 	paths             []util.FullPath
@@ -63,6 +66,7 @@ func NewInodeToPath(root util.FullPath, ttlSec int) *InodeToPath {
 	t := &InodeToPath{
 		inode2path:      make(map[uint64]*InodeEntry),
 		path2inode:      make(map[util.FullPath]uint64),
+		pathSubdirCount: make(map[util.FullPath]int32),
 		cacheMetaTtlSec: time.Second * time.Duration(ttlSec),
 	}
 	t.inode2path[1] = &InodeEntry{
@@ -266,11 +270,15 @@ func (i *InodeToPath) InvalidateChildrenCache(fullpath util.FullPath) {
 	entry.resetCacheState()
 }
 
-// AdjustSubdirCount adjusts the subdirectory count for a directory inode.
-// delta is typically +1 (mkdir) or -1 (rmdir).
-func (i *InodeToPath) AdjustSubdirCount(dirPath util.FullPath, delta int32) {
-	i.Lock()
-	defer i.Unlock()
+func (i *InodeToPath) adjustPathSubdirCountLocked(dirPath util.FullPath, delta int32) {
+	count := i.pathSubdirCount[dirPath] + delta
+	if count < 0 {
+		count = 0
+	}
+	i.pathSubdirCount[dirPath] = count
+}
+
+func (i *InodeToPath) syncInodeSubdirCountLocked(dirPath util.FullPath) {
 	inode, found := i.path2inode[dirPath]
 	if !found {
 		return
@@ -279,31 +287,33 @@ func (i *InodeToPath) AdjustSubdirCount(dirPath util.FullPath, delta int32) {
 	if !found || !entry.isDirectory {
 		return
 	}
-	entry.subdirCount += delta
-	if entry.subdirCount < 0 {
-		entry.subdirCount = 0
-	}
+	entry.subdirCount = i.pathSubdirCount[dirPath]
+}
+
+// AdjustSubdirCount adjusts the subdirectory count for a directory inode.
+// delta is typically +1 (mkdir) or -1 (rmdir).
+func (i *InodeToPath) AdjustSubdirCount(dirPath util.FullPath, delta int32) {
+	i.Lock()
+	defer i.Unlock()
+	i.adjustPathSubdirCountLocked(dirPath, delta)
+	i.syncInodeSubdirCountLocked(dirPath)
 }
 
 // GetSubdirCount returns the tracked subdirectory count for a directory.
 func (i *InodeToPath) GetSubdirCount(dirPath util.FullPath) int32 {
 	i.RLock()
 	defer i.RUnlock()
-	inode, found := i.path2inode[dirPath]
-	if !found {
-		return 0
-	}
-	entry, found := i.inode2path[inode]
-	if !found || !entry.isDirectory {
-		return 0
-	}
-	return entry.subdirCount
+	return i.pathSubdirCount[dirPath]
 }
 
 // SetSubdirCount sets the subdirectory count for a directory (used after readdir).
 func (i *InodeToPath) SetSubdirCount(dirPath util.FullPath, count int32) {
 	i.Lock()
 	defer i.Unlock()
+	if count < 0 {
+		count = 0
+	}
+	i.pathSubdirCount[dirPath] = count
 	inode, found := i.path2inode[dirPath]
 	if !found {
 		return

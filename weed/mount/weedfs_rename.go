@@ -335,6 +335,8 @@ func (wfs *WFS) Rename(cancel <-chan struct{}, in *fuse.RenameIn, oldName string
 		if oldEntry != nil && oldEntry.IsDirectory {
 			wfs.inodeToPath.AdjustSubdirCount(oldDir, -1)
 			wfs.inodeToPath.AdjustSubdirCount(newDir, 1)
+			wfs.notifyDirNlinkChanged(oldDir)
+			wfs.notifyDirNlinkChanged(newDir)
 		}
 	}
 

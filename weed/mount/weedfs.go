@@ -260,6 +260,11 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		wfs.entryValidSec = 10
 		wfs.attrValidSec = 10
 	}
+	if option.PosixDirNlink {
+		// Directory nlink is tracked in-memory and changes without touching the
+		// filer entry; disable kernel attr caching so lstat sees fresh values.
+		wfs.attrValidSec = 0
+	}
 
 	if option.EnableDistributedLock && !option.WritebackCache && len(option.FilerAddresses) > 0 {
 		wfs.lockClient = cluster.NewLockClient(option.GrpcDialOption, option.FilerAddresses[0])

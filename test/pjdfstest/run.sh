@@ -97,6 +97,7 @@ sudo "${WEED_BIN}" mount \
   -filer.path=/ \
   -dirAutoCreate \
   -allowOthers=true \
+  -posix.dirNLink=true \
   >"${LOG_DIR}/mount.log" 2>&1 &
 mount_pid=$!
 

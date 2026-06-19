@@ -378,9 +378,25 @@ func (wfs *WFS) applyInMemoryAtime(out *fuse.Attr, inode uint64) {
 // Uses the in-memory subdirectory count tracked by mkdir/rmdir/rename.
 func (wfs *WFS) applyDirNlink(out *fuse.Attr, dirPath util.FullPath) {
 	count := wfs.inodeToPath.GetSubdirCount(dirPath)
-	if count > 0 {
-		out.Nlink = 2 + uint32(count)
+	out.Nlink = 2 + uint32(count)
+}
+
+// notifyDirNlinkChanged invalidates the kernel attr cache for a directory
+// whose POSIX nlink may have changed. The notification is deferred to avoid
+// self-notify deadlocks on the /dev/fuse fd from within FUSE handlers.
+func (wfs *WFS) notifyDirNlinkChanged(dirPath util.FullPath) {
+	if !wfs.option.PosixDirNlink || wfs.fuseServer == nil {
+		return
 	}
+	inode, found := wfs.inodeToPath.GetInode(dirPath)
+	if !found {
+		return
+	}
+	go func() {
+		if status := wfs.fuseServer.InodeNotify(inode, 0, -1); status != fuse.OK {
+			glog.V(4).Infof("notify dir nlink %s: %v", dirPath, status)
+		}
+	}()
 }
 
 func chmod(existing uint32, mode uint32) uint32 {
