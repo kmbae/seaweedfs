@@ -21,8 +21,8 @@ RUN apt-get -o Acquire::Retries=5 -o Acquire::http::Timeout=30 update && \
     && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-ARG PJDFSTEST_REPO=https://github.com/sanwan/pjdfstest.git
-ARG PJDFSTEST_REF=d25636a227606f8960e5179741d8f4ad7030ef41
+ARG PJDFSTEST_REPO=https://github.com/pjd/pjdfstest.git
+ARG PJDFSTEST_REF=ededbeb2b44929972898afb87474b0937f78a877
 
 RUN git clone "${PJDFSTEST_REPO}" /opt/pjdfstest && \
     cd /opt/pjdfstest && \

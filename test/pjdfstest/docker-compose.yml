@@ -39,7 +39,7 @@ services:
     image: kmbae27/seaweedfs:pjdfstest
     build:
       context: .
-    command: "-v=4 mount -filer=filer:8888 -filer.path=/ -dirAutoCreate -dir=/mnt/seaweedfs -allowOthers -posix.dirNLink=true"
+    command: "-v=4 mount -filer=filer:8888 -filer.path=/ -dirAutoCreate -dir=/mnt/seaweedfs -allowOthers -posix.dirNLink=true -dlm=true"
     cap_add:
       - SYS_ADMIN
     devices:

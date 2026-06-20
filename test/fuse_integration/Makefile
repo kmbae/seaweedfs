@@ -86,6 +86,10 @@ test-stress: check-prereqs init-module
 	@echo "🧪 Running stress tests..."
 	go test -v -timeout $(TEST_TIMEOUT) -run TestStressOperations
 
+test-posix: check-prereqs init-module
+	@echo "🧪 Running POSIX extras (locks + rename atomicity)..."
+	go test -v -timeout $(TEST_TIMEOUT) -run 'TestPosixFileLocking|TestRenameAtomicity'
+
 test-large-files: check-prereqs init-module
 	@echo "🧪 Running large file tests..."
 	go test -v -timeout $(TEST_TIMEOUT) -run TestLargeFileOperations

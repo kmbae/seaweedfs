@@ -26,8 +26,8 @@ FILER_ADDR="127.0.0.1:${FILER_PORT}"
 
 # Pin to an immutable upstream commit so CI is reproducible. Override via env
 # if you want to test against a different ref or fork.
-PJDFSTEST_REPO="${PJDFSTEST_REPO:-https://github.com/sanwan/pjdfstest.git}"
-PJDFSTEST_REF="${PJDFSTEST_REF:-d25636a227606f8960e5179741d8f4ad7030ef41}"
+PJDFSTEST_REPO="${PJDFSTEST_REPO:-https://github.com/pjd/pjdfstest.git}"
+PJDFSTEST_REF="${PJDFSTEST_REF:-ededbeb2b44929972898afb87474b0937f78a877}"
 PJDFSTEST_TESTS="${PJDFSTEST_TESTS:-tests/}"
 
 mini_pid=""
@@ -98,6 +98,7 @@ sudo "${WEED_BIN}" mount \
   -dirAutoCreate \
   -allowOthers=true \
   -posix.dirNLink=true \
+  -dlm=true \
   >"${LOG_DIR}/mount.log" 2>&1 &
 mount_pid=$!
 

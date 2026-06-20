@@ -53,7 +53,7 @@ func DefaultTestConfig() *TestConfig {
 		CacheSizeMB:  100,
 		NumVolumes:   3,
 		EnableDebug:  false,
-		MountOptions: []string{},
+		MountOptions: []string{"-posix.dirNLink=true", "-dlm=true"},
 		SkipCleanup:  false,
 	}
 }
@@ -349,12 +349,9 @@ func (f *FuseTestFramework) waitForMount(timeout time.Duration) error {
 
 // findWeedBinary locates the weed binary.
 func findWeedBinary() string {
-	if p, err := exec.LookPath("weed"); err == nil {
-		return p
-	}
-
 	candidates := []string{
 		"../../weed/weed",
+		"../../../weed/weed",
 		"./weed",
 		"../weed",
 	}
@@ -363,6 +360,10 @@ func findWeedBinary() string {
 			abs, _ := filepath.Abs(candidate)
 			return abs
 		}
+	}
+
+	if p, err := exec.LookPath("weed"); err == nil {
+		return p
 	}
 
 	return "weed"
