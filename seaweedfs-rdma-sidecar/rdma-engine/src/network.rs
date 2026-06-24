@@ -4,12 +4,29 @@
 //! request, and receive needle bytes. When built with `real-ucx`, payload is
 //! transferred over a UCX stream after a worker-address handshake.
 
-use crate::{RdmaEngineConfig, RdmaError, RdmaResult};
+use crate::{ipc::MAX_IPC_MESSAGE_SIZE, RdmaEngineConfig, RdmaError, RdmaResult};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
+
+/// Format SeaweedFS file id: `{volume_id},{needle_id+cookie hex}` (matches Go needle.FileId).
+fn format_seaweed_file_id(volume_id: u32, needle_id: u64, cookie: u32) -> String {
+    let mut bytes = [0u8; 12];
+    bytes[0..8].copy_from_slice(&needle_id.to_be_bytes());
+    bytes[8..12].copy_from_slice(&cookie.to_be_bytes());
+    let mut start = 0usize;
+    while start < 8 && bytes[start] == 0 {
+        start += 1;
+    }
+    let mut hex_id = String::with_capacity((12 - start) * 2);
+    for b in &bytes[start..] {
+        use std::fmt::Write;
+        let _ = write!(hex_id, "{:02x}", b);
+    }
+    format!("{},{}", volume_id, hex_id)
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RemoteNeedleReadRequest {
@@ -25,6 +42,10 @@ pub struct RemoteNeedleReadResponse {
     pub success: bool,
     #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
+    #[serde(default = "default_transport")]
+    pub transport: String,
+    #[serde(default)]
+    pub real_rdma: bool,
     pub message: Option<String>,
 }
 
@@ -41,7 +62,15 @@ pub struct RemoteNeedleWriteRequest {
 pub struct RemoteNeedleWriteResponse {
     pub success: bool,
     pub file_id: String,
+    #[serde(default = "default_transport")]
+    pub transport: String,
+    #[serde(default)]
+    pub real_rdma: bool,
     pub message: Option<String>,
+}
+
+fn default_transport() -> String {
+    "tcp".to_string()
 }
 
 /// Untagged enum to distinguish read vs write requests on the wire.
@@ -116,11 +145,15 @@ async fn handle_connection(mut stream: TcpStream, volume_server_url: &str) -> Rd
                 Ok(data) => RemoteNeedleReadResponse {
                     success: true,
                     data,
+                    transport: default_transport(),
+                    real_rdma: false,
                     message: None,
                 },
                 Err(e) => RemoteNeedleReadResponse {
                     success: false,
                     data: Vec::new(),
+                    transport: default_transport(),
+                    real_rdma: false,
                     message: Some(e.to_string()),
                 },
             };
@@ -135,11 +168,15 @@ async fn handle_connection(mut stream: TcpStream, volume_server_url: &str) -> Rd
                 Ok(file_id) => RemoteNeedleWriteResponse {
                     success: true,
                     file_id,
+                    transport: default_transport(),
+                    real_rdma: false,
                     message: None,
                 },
                 Err(e) => RemoteNeedleWriteResponse {
                     success: false,
                     file_id: String::new(),
+                    transport: default_transport(),
+                    real_rdma: false,
                     message: Some(e.to_string()),
                 },
             };
@@ -152,7 +189,7 @@ async fn fetch_needle_http(
     volume_server_url: &str,
     req: &RemoteNeedleReadRequest,
 ) -> RdmaResult<Vec<u8>> {
-    let file_id = format!("{},{:016x}", req.volume_id, req.needle_id);
+    let file_id = format_seaweed_file_id(req.volume_id, req.needle_id, req.cookie);
     let size = if req.size == 0 { 4096 } else { req.size };
     let url = format!(
         "{}/{}?offset={}&size={}",
@@ -191,9 +228,11 @@ async fn submit_needle_http(
     volume_server_url: &str,
     req: &RemoteNeedleWriteRequest,
 ) -> RdmaResult<String> {
+    let file_id = format_seaweed_file_id(req.volume_id, req.needle_id, req.cookie);
     let url = format!(
-        "{}/submit",
-        volume_server_url.trim_end_matches('/')
+        "{}/{}",
+        volume_server_url.trim_end_matches('/'),
+        file_id
     );
 
     let client = reqwest::Client::builder()
@@ -201,29 +240,22 @@ async fn submit_needle_http(
         .build()
         .map_err(|_e| RdmaError::operation_failed("http_client", -1))?;
 
-    let part = reqwest::multipart::Part::bytes(req.data.clone())
-        .file_name("needle.dat");
-    let form = reqwest::multipart::Form::new().part("file", part);
-
     let response = client
         .post(&url)
-        .multipart(form)
+        .header("Content-Type", "application/octet-stream")
+        .body(req.data.clone())
         .send()
         .await
-        .map_err(|_e| RdmaError::operation_failed("http_submit", -1))?;
+        .map_err(|_e| RdmaError::operation_failed("http_upload", -1))?;
 
     if !response.status().is_success() {
         return Err(RdmaError::operation_failed(
-            "http_submit_status",
+            "http_upload_status",
             response.status().as_u16() as i32,
         ));
     }
 
-    response
-        .text()
-        .await
-        .map(|t| t.trim().to_string())
-        .map_err(|_| RdmaError::operation_failed("http_submit_body", -1))
+    Ok(file_id)
 }
 
 async fn read_raw_message(stream: &mut TcpStream) -> RdmaResult<Vec<u8>> {
@@ -233,7 +265,7 @@ async fn read_raw_message(stream: &mut TcpStream) -> RdmaResult<Vec<u8>> {
         .await
         .map_err(|e| RdmaError::ipc_error(format!("read len: {}", e)))?;
     let len = u32::from_le_bytes(len_bytes) as usize;
-    if len > 64 * 1024 * 1024 {
+    if len > MAX_IPC_MESSAGE_SIZE {
         return Err(RdmaError::ipc_error("message too large"));
     }
     let mut buf = vec![0u8; len];
@@ -251,7 +283,7 @@ async fn read_message<T: for<'de> Deserialize<'de>>(stream: &mut TcpStream) -> R
         .await
         .map_err(|e| RdmaError::ipc_error(format!("read len: {}", e)))?;
     let len = u32::from_le_bytes(len_bytes) as usize;
-    if len > 64 * 1024 * 1024 {
+    if len > MAX_IPC_MESSAGE_SIZE {
         return Err(RdmaError::ipc_error("message too large"));
     }
     let mut buf = vec![0u8; len];

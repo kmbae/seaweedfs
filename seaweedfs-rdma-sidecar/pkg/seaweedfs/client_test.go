@@ -12,7 +12,7 @@ func TestFetchNeedleDataRequiresDataSource(t *testing.T) {
 		logger: logrus.New(),
 	}
 
-	_, _, err := client.fetchNeedleData(t.Context(), &NeedleReadRequest{
+	_, _, _, err := client.fetchNeedleData(t.Context(), &NeedleReadRequest{
 		VolumeID:     1,
 		NeedleID:     1,
 		Cookie:       1,
@@ -22,6 +22,15 @@ func TestFetchNeedleDataRequiresDataSource(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("expected error when no data source is configured")
+	}
+}
+
+func TestRemoteSourceDefaultsTCP(t *testing.T) {
+	if got := remoteReadSource(""); got != "remote-tcp" {
+		t.Fatalf("unexpected read source: %s", got)
+	}
+	if got := remoteWriteSource("UCX"); got != "remote-ucx-write" {
+		t.Fatalf("unexpected write source: %s", got)
 	}
 }
 

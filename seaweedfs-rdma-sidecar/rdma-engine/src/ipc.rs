@@ -13,6 +13,10 @@ use tracing::{info, debug, error};
 use uuid::Uuid;
 use std::path::Path;
 
+/// Max serialized MessagePack frame size on the Unix IPC socket.
+/// Must match network.rs remote path and Go ipc/client.go (64 MiB).
+pub const MAX_IPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
+
 /// Atomic counter for generating unique work request IDs
 /// This ensures no hash collisions that could cause incorrect completion handling
 static NEXT_WR_ID: AtomicU64 = AtomicU64::new(1);
@@ -397,7 +401,7 @@ impl IpcServer {
             }
             
             let msg_len = u32::from_le_bytes(len_bytes) as usize;
-            if msg_len > 1024 * 1024 { // 1MB max message size
+            if msg_len > MAX_IPC_MESSAGE_SIZE {
                 return Err(RdmaError::ipc_error("Message too large"));
             }
             

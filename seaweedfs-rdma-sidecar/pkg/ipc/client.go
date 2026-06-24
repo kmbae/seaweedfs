@@ -3,14 +3,21 @@ package ipc
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
+	"io"
 	"net"
+	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/vmihailenco/msgpack/v5"
 )
+
+// MaxMessageSize is the maximum serialized IPC frame size (must match rdma-engine ipc.rs).
+const MaxMessageSize = 64 * 1024 * 1024
 
 // Client provides IPC communication with the Rust RDMA engine
 type Client struct {
@@ -76,7 +83,32 @@ func (c *Client) Disconnect() {
 func (c *Client) IsConnected() bool {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.connected
+	return c.connected && c.conn != nil
+}
+
+// markDisconnected closes the socket and clears connected state after I/O failure.
+func (c *Client) markDisconnected() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.conn != nil {
+		_ = c.conn.Close()
+		c.conn = nil
+	}
+	c.connected = false
+}
+
+// IsBrokenError reports whether an IPC error should invalidate the pooled connection.
+func IsBrokenError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, syscall.EPIPE) || errors.Is(err, syscall.ECONNRESET) {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "broken pipe") ||
+		strings.Contains(msg, "connection reset") ||
+		strings.Contains(msg, "use of closed network connection")
 }
 
 // SendMessage sends an IPC message and waits for response
@@ -105,18 +137,23 @@ func (c *Client) SendMessage(ctx context.Context, msg *IpcMessage) (*IpcMessage,
 		c.logger.WithError(err).Error("❌ Failed to marshal message")
 		return nil, fmt.Errorf("failed to marshal message: %w", err)
 	}
+	if len(data) > MaxMessageSize {
+		return nil, fmt.Errorf("message too large: %d bytes (max %d)", len(data), MaxMessageSize)
+	}
 
 	// Send message length (4 bytes) + message data
 	lengthBytes := make([]byte, 4)
 	binary.LittleEndian.PutUint32(lengthBytes, uint32(len(data)))
 
-	if _, err := conn.Write(lengthBytes); err != nil {
+	if err := writeFull(conn, lengthBytes); err != nil {
 		c.logger.WithError(err).Error("❌ Failed to send message length")
+		c.markDisconnected()
 		return nil, fmt.Errorf("failed to send message length: %w", err)
 	}
 
-	if _, err := conn.Write(data); err != nil {
+	if err := writeFull(conn, data); err != nil {
 		c.logger.WithError(err).Error("❌ Failed to send message data")
+		c.markDisconnected()
 		return nil, fmt.Errorf("failed to send message data: %w", err)
 	}
 
@@ -140,21 +177,24 @@ func (c *Client) readResponse(ctx context.Context, conn net.Conn) (*IpcMessage, 
 
 	// Read message length (4 bytes)
 	lengthBytes := make([]byte, 4)
-	if _, err := conn.Read(lengthBytes); err != nil {
+	if _, err := io.ReadFull(conn, lengthBytes); err != nil {
 		c.logger.WithError(err).Error("❌ Failed to read response length")
+		c.markDisconnected()
 		return nil, fmt.Errorf("failed to read response length: %w", err)
 	}
 
 	length := binary.LittleEndian.Uint32(lengthBytes)
-	if length > 64*1024*1024 { // 64MB sanity check
+	if length > MaxMessageSize {
 		c.logger.WithField("length", length).Error("❌ Response message too large")
+		c.markDisconnected()
 		return nil, fmt.Errorf("response message too large: %d bytes", length)
 	}
 
 	// Read message data
 	data := make([]byte, length)
-	if _, err := conn.Read(data); err != nil {
+	if _, err := io.ReadFull(conn, data); err != nil {
 		c.logger.WithError(err).Error("❌ Failed to read response data")
+		c.markDisconnected()
 		return nil, fmt.Errorf("failed to read response data: %w", err)
 	}
 
@@ -170,6 +210,20 @@ func (c *Client) readResponse(ctx context.Context, conn net.Conn) (*IpcMessage, 
 	c.logger.WithField("type", response.Type).Debug("📥 Response deserialized successfully")
 
 	return &response, nil
+}
+
+func writeFull(conn net.Conn, data []byte) error {
+	for len(data) > 0 {
+		n, err := conn.Write(data)
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
+		}
+		data = data[n:]
+	}
+	return nil
 }
 
 // High-level convenience methods

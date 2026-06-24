@@ -200,13 +200,13 @@ func (c *SeaweedFSRDMAClient) ReadNeedle(ctx context.Context, req *NeedleReadReq
 			c.logger.WithError(err).Warn("⚠️  RDMA read failed, falling back to HTTP")
 			rdmaErr = err
 		} else {
-			data, source, fetchErr := c.fetchNeedleData(ctx, req)
+			data, source, dataRealRDMA, fetchErr := c.fetchNeedleData(ctx, req)
 			if fetchErr != nil {
 				c.logger.WithError(fetchErr).Warn("⚠️  RDMA session ok but data fetch failed, falling back to HTTP")
 				rdmaErr = fetchErr
 			} else {
 				realRDMAEngine := c.rdmaClient.IsRealRdma()
-				isRealRDMA := realRDMAEngine && (source == "ucx" || source == "remote-ucx")
+				isRealRDMA := realRDMAEngine && dataRealRDMA
 				rdmaSource := "session+" + source
 				sessionID := ""
 				if rdmaResp != nil {
@@ -297,7 +297,7 @@ func (c *SeaweedFSRDMAClient) ReadNeedleRange(ctx context.Context, volumeID uint
 }
 
 // fetchNeedleData loads actual needle bytes after an RDMA session completes.
-func (c *SeaweedFSRDMAClient) fetchNeedleData(ctx context.Context, req *NeedleReadRequest) ([]byte, string, error) {
+func (c *SeaweedFSRDMAClient) fetchNeedleData(ctx context.Context, req *NeedleReadRequest) ([]byte, string, bool, error) {
 	volumeServer := req.VolumeServer
 	if volumeServer == "" {
 		volumeServer = c.volumeServerURL
@@ -306,7 +306,7 @@ func (c *SeaweedFSRDMAClient) fetchNeedleData(ctx context.Context, req *NeedleRe
 	if c.localReader != nil && remote.IsLocalHost(volumeServer) {
 		data, err := c.localReader.ReadNeedle(req.VolumeID, req.NeedleID, req.Cookie, req.Offset, req.Size)
 		if err == nil {
-			return data, "local-volume", nil
+			return data, "local-volume", false, nil
 		}
 		c.logger.WithError(err).Debug("local volume read failed, trying remote/HTTP")
 	}
@@ -321,7 +321,7 @@ func (c *SeaweedFSRDMAClient) fetchNeedleData(ctx context.Context, req *NeedleRe
 		if size == 0 {
 			size = 4096
 		}
-		data, err := remote.ReadNeedle(ctx, remoteServer, c.remoteReadPort, &remote.NeedleReadRequest{
+		result, err := remote.ReadNeedleResult(ctx, remoteServer, c.remoteReadPort, &remote.NeedleReadRequest{
 			VolumeID: req.VolumeID,
 			NeedleID: req.NeedleID,
 			Cookie:   req.Cookie,
@@ -329,16 +329,32 @@ func (c *SeaweedFSRDMAClient) fetchNeedleData(ctx context.Context, req *NeedleRe
 			Size:     size,
 		})
 		if err == nil {
-			return data, "remote-tcp", nil
+			return result.Data, remoteReadSource(result.Transport), result.RealRDMA, nil
 		}
 		c.logger.WithError(err).Debug("remote sidecar read failed, trying HTTP fallback")
 	}
 
 	data, err := c.httpFallback(ctx, req)
 	if err != nil {
-		return nil, "", err
+		return nil, "", false, err
 	}
-	return data, "http", nil
+	return data, "http", false, nil
+}
+
+func remoteReadSource(transport string) string {
+	return "remote-" + normalizedRemoteTransport(transport)
+}
+
+func remoteWriteSource(transport string) string {
+	return remoteReadSource(transport) + "-write"
+}
+
+func normalizedRemoteTransport(transport string) string {
+	transport = strings.ToLower(strings.TrimSpace(transport))
+	if transport == "" {
+		return "tcp"
+	}
+	return transport
 }
 
 // httpFallback performs HTTP fallback read from SeaweedFS volume server
@@ -450,13 +466,13 @@ func (c *SeaweedFSRDMAClient) WriteNeedle(ctx context.Context, req *NeedleWriteR
 			c.logger.WithError(err).Warn("⚠️  RDMA write failed, falling back to HTTP")
 			rdmaErr = err
 		} else {
-			fileID, source, persistErr := c.persistNeedleData(ctx, req)
+			fileID, source, dataRealRDMA, persistErr := c.persistNeedleData(ctx, req)
 			if persistErr != nil {
 				c.logger.WithError(persistErr).Warn("⚠️  RDMA session ok but persist failed, falling back to HTTP")
 				rdmaErr = persistErr
 			} else {
 				realRDMAEngine := c.rdmaClient.IsRealRdma()
-				isRealRDMA := realRDMAEngine && (source == "ucx-write" || source == "remote-ucx-write")
+				isRealRDMA := realRDMAEngine && dataRealRDMA
 				rdmaSource := "session+" + source
 				c.logger.WithFields(logrus.Fields{
 					"volume_id":     req.VolumeID,
@@ -514,8 +530,8 @@ func (c *SeaweedFSRDMAClient) WriteNeedle(ctx context.Context, req *NeedleWriteR
 }
 
 // persistNeedleData submits data to the volume server after RDMA buffering.
-// Returns (fileID, source, error).
-func (c *SeaweedFSRDMAClient) persistNeedleData(ctx context.Context, req *NeedleWriteRequest) (string, string, error) {
+// Returns (fileID, source, payloadUsedRDMA, error).
+func (c *SeaweedFSRDMAClient) persistNeedleData(ctx context.Context, req *NeedleWriteRequest) (string, string, bool, error) {
 	volumeServer := req.VolumeServer
 	if volumeServer == "" {
 		volumeServer = c.volumeServerURL
@@ -527,23 +543,23 @@ func (c *SeaweedFSRDMAClient) persistNeedleData(ctx context.Context, req *Needle
 	}
 
 	if !remote.IsLocalHost(remoteServer) {
-		fileID, err := remote.WriteNeedle(ctx, remoteServer, c.remoteReadPort, &remote.NeedleWriteRequest{
+		result, err := remote.WriteNeedleResult(ctx, remoteServer, c.remoteReadPort, &remote.NeedleWriteRequest{
 			VolumeID: req.VolumeID,
 			NeedleID: req.NeedleID,
 			Cookie:   req.Cookie,
 			Data:     req.Data,
 		})
 		if err == nil {
-			return fileID, "remote-tcp-write", nil
+			return result.FileID, remoteWriteSource(result.Transport), result.RealRDMA, nil
 		}
 		c.logger.WithError(err).Debug("remote write failed, trying HTTP volume upload")
 	}
 
 	fileID, err := c.httpVolumeUpload(ctx, volumeServer, req)
 	if err != nil {
-		return "", "", err
+		return "", "", false, err
 	}
-	return fileID, "http-upload", nil
+	return fileID, "http-upload", false, nil
 }
 
 // httpVolumeUpload POSTs needle data to the volume server's file-id URL.
