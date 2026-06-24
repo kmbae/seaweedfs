@@ -88,6 +88,7 @@ func (h *ReadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func parseNeedleReadRequest(r *http.Request) (*seaweedfs.NeedleReadRequest, error) {
 	query := r.URL.Query()
 	volumeServer := query.Get("volume_server")
+	rdmaServer := query.Get("rdma_server")
 	fileID := query.Get("file_id")
 
 	var volumeID, needleID, cookie uint64
@@ -152,6 +153,7 @@ func parseNeedleReadRequest(r *http.Request) (*seaweedfs.NeedleReadRequest, erro
 		Offset:       offset,
 		Size:         size,
 		VolumeServer: volumeServer,
+		RDMAServer:   rdmaServer,
 	}, nil
 }
 

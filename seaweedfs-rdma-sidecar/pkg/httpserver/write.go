@@ -29,6 +29,7 @@ func (h *WriteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	fileID := query.Get("file_id")
 	volumeServer := query.Get("volume_server")
+	rdmaServer := query.Get("rdma_server")
 
 	if fileID == "" {
 		http.Error(w, "file_id parameter is required", http.StatusBadRequest)
@@ -67,6 +68,7 @@ func (h *WriteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		Cookie:       uint32(fid.Cookie),
 		Data:         data,
 		VolumeServer: volumeServer,
+		RDMAServer:   rdmaServer,
 	})
 	if err != nil {
 		h.Logger.WithError(err).Error("needle write failed")

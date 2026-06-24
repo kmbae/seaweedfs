@@ -200,7 +200,7 @@ func (c *RDMAMountClient) ReadNeedle(ctx context.Context, fileID string, offset,
 
 	// Prepare request URL with file_id parameter (simpler than individual components)
 	reqURL := fmt.Sprintf("http://%s/read?file_id=%s&offset=%d&size=%d&volume_server=%s",
-		c.sidecarAddr, fileID, offset, size, volumeServer)
+		c.sidecarAddr, url.QueryEscape(fileID), offset, size, url.QueryEscape(volumeServer))
 
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {

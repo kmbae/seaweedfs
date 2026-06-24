@@ -69,6 +69,7 @@ type NeedleReadRequest struct {
 	Offset       uint64
 	Size         uint64
 	VolumeServer string // Override volume server URL for this request
+	RDMAServer   string // Optional data-plane host/IP for remote RDMA engine
 }
 
 // NeedleReadResponse represents the result of a needle read
@@ -310,12 +311,17 @@ func (c *SeaweedFSRDMAClient) fetchNeedleData(ctx context.Context, req *NeedleRe
 		c.logger.WithError(err).Debug("local volume read failed, trying remote/HTTP")
 	}
 
-	if !remote.IsLocalHost(volumeServer) {
+	remoteServer := req.RDMAServer
+	if remoteServer == "" {
+		remoteServer = volumeServer
+	}
+
+	if !remote.IsLocalHost(remoteServer) {
 		size := req.Size
 		if size == 0 {
 			size = 4096
 		}
-		data, err := remote.ReadNeedle(ctx, volumeServer, c.remoteReadPort, &remote.NeedleReadRequest{
+		data, err := remote.ReadNeedle(ctx, remoteServer, c.remoteReadPort, &remote.NeedleReadRequest{
 			VolumeID: req.VolumeID,
 			NeedleID: req.NeedleID,
 			Cookie:   req.Cookie,
@@ -404,6 +410,7 @@ type NeedleWriteRequest struct {
 	Cookie       uint32
 	Data         []byte
 	VolumeServer string
+	RDMAServer   string
 }
 
 // NeedleWriteResponse represents the result of a needle write
@@ -514,8 +521,13 @@ func (c *SeaweedFSRDMAClient) persistNeedleData(ctx context.Context, req *Needle
 		volumeServer = c.volumeServerURL
 	}
 
-	if !remote.IsLocalHost(volumeServer) {
-		fileID, err := remote.WriteNeedle(ctx, volumeServer, c.remoteReadPort, &remote.NeedleWriteRequest{
+	remoteServer := req.RDMAServer
+	if remoteServer == "" {
+		remoteServer = volumeServer
+	}
+
+	if !remote.IsLocalHost(remoteServer) {
+		fileID, err := remote.WriteNeedle(ctx, remoteServer, c.remoteReadPort, &remote.NeedleWriteRequest{
 			VolumeID: req.VolumeID,
 			NeedleID: req.NeedleID,
 			Cookie:   req.Cookie,
