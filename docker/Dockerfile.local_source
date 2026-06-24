@@ -5,7 +5,7 @@ RUN apk add --no-cache git g++ fuse
 WORKDIR /src
 COPY . .
 
-ARG TAGS=large_disk
+ARG TAGS=5BytesOffset
 RUN cd weed \
   && SWCOMMIT="$(git rev-parse --short HEAD 2>/dev/null || echo local)" \
   && SWLDFLAGS="-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=${SWCOMMIT}" \
