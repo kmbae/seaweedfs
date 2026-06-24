@@ -76,19 +76,25 @@ func (h *WriteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	duration := time.Since(start)
 	h.Logger.WithFields(logrus.Fields{
-		"file_id":  fileID,
-		"source":   resp.Source,
-		"is_rdma":  resp.IsRDMA,
-		"duration": duration,
-		"size":     resp.Size,
+		"file_id":      fileID,
+		"source":       resp.Source,
+		"is_rdma":      resp.IsRDMA,
+		"session_rdma": resp.SessionRDMA,
+		"real_rdma":    resp.RealRDMA,
+		"data_source":  resp.DataSource,
+		"duration":     duration,
+		"size":         resp.Size,
 	}).Info("needle write completed")
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(map[string]interface{}{
-		"success": resp.Success,
-		"is_rdma": resp.IsRDMA,
-		"source":  resp.Source,
-		"file_id": resp.FileID,
-		"size":    resp.Size,
+		"success":      resp.Success,
+		"is_rdma":      resp.IsRDMA,
+		"session_rdma": resp.SessionRDMA,
+		"real_rdma":    resp.RealRDMA,
+		"source":       resp.Source,
+		"data_source":  resp.DataSource,
+		"file_id":      resp.FileID,
+		"size":         resp.Size,
 	})
 }

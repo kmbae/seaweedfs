@@ -36,11 +36,11 @@ type RDMAMountClient struct {
 	totalLatencyNs  atomic.Int64
 
 	// Write statistics
-	totalWriteRequests   atomic.Int64
-	successfulWrites     atomic.Int64
-	failedWrites         atomic.Int64
-	totalBytesWritten    atomic.Int64
-	totalWriteLatencyNs  atomic.Int64
+	totalWriteRequests  atomic.Int64
+	successfulWrites    atomic.Int64
+	failedWrites        atomic.Int64
+	totalBytesWritten   atomic.Int64
+	totalWriteLatencyNs atomic.Int64
 }
 
 // RDMAReadRequest represents a request to read data via RDMA
@@ -227,8 +227,7 @@ func (c *RDMAMountClient) ReadNeedle(ctx context.Context, fileID string, offset,
 
 	// Check if response indicates RDMA was used
 	contentType := resp.Header.Get("Content-Type")
-	isRDMA := strings.Contains(resp.Header.Get("X-Source"), "rdma") ||
-		resp.Header.Get("X-RDMA-Used") == "true"
+	isRDMA := resp.Header.Get("X-RDMA-Used") == "true"
 
 	// Check for zero-copy temp file optimization
 	tempFilePath := resp.Header.Get("X-Temp-File")
@@ -275,8 +274,8 @@ func (c *RDMAMountClient) ReadNeedle(ctx context.Context, fileID string, offset,
 	c.totalBytesRead.Add(int64(len(data)))
 
 	// Log successful operation
-	glog.V(4).Infof("RDMA read completed: fileID=%s, size=%d, duration=%v, rdma=%v, contentType=%s",
-		fileID, size, duration, isRDMA, contentType)
+	glog.V(4).Infof("RDMA read completed: fileID=%s, size=%d, duration=%v, rdma=%v, session=%s, source=%s, dataSource=%s, contentType=%s",
+		fileID, size, duration, isRDMA, resp.Header.Get("X-RDMA-Session-Used"), resp.Header.Get("X-Source"), resp.Header.Get("X-Data-Source"), contentType)
 
 	return data, isRDMA, nil
 }

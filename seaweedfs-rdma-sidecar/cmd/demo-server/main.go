@@ -279,7 +279,7 @@ curl "http://localhost:%d/health"
 </html>`,
 		map[bool]string{true: "enabled", false: "disabled"}[s.rdmaClient.IsEnabled()],
 		map[bool]string{true: "RDMA Enabled ✅", false: "RDMA Disabled (HTTP Fallback Only) ⚠️"}[s.rdmaClient.IsEnabled()],
-		port, port, port, port)
+		port, port, port, port, port)
 }
 
 // volumeDataHandler serves mock needle data for requests that look like

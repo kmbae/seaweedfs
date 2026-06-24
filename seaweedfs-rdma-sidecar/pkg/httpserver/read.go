@@ -47,12 +47,15 @@ func (h *ReadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	duration := time.Since(start)
 	h.Logger.WithFields(logrus.Fields{
-		"volume_id": req.VolumeID,
-		"needle_id": req.NeedleID,
-		"source":    resp.Source,
-		"is_rdma":   resp.IsRDMA,
-		"duration":  duration,
-		"data_size": len(resp.Data),
+		"volume_id":    req.VolumeID,
+		"needle_id":    req.NeedleID,
+		"source":       resp.Source,
+		"is_rdma":      resp.IsRDMA,
+		"session_rdma": resp.SessionRDMA,
+		"real_rdma":    resp.RealRDMA,
+		"data_source":  resp.DataSource,
+		"duration":     duration,
+		"data_size":    len(resp.Data),
 	}).Info("needle read completed")
 
 	if resp.UseTempFile && resp.TempFilePath != "" {
@@ -60,6 +63,9 @@ func (h *ReadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Temp-File", resp.TempFilePath)
 		w.Header().Set("X-Source", resp.Source)
 		w.Header().Set("X-RDMA-Used", fmt.Sprintf("%t", resp.IsRDMA))
+		w.Header().Set("X-RDMA-Session-Used", fmt.Sprintf("%t", resp.SessionRDMA))
+		w.Header().Set("X-Real-RDMA", fmt.Sprintf("%t", resp.RealRDMA))
+		w.Header().Set("X-Data-Source", resp.DataSource)
 		w.Header().Set("Content-Type", "application/octet-stream")
 		w.WriteHeader(http.StatusOK)
 		return
@@ -67,6 +73,9 @@ func (h *ReadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("X-Source", resp.Source)
 	w.Header().Set("X-RDMA-Used", fmt.Sprintf("%t", resp.IsRDMA))
+	w.Header().Set("X-RDMA-Session-Used", fmt.Sprintf("%t", resp.SessionRDMA))
+	w.Header().Set("X-Real-RDMA", fmt.Sprintf("%t", resp.RealRDMA))
+	w.Header().Set("X-Data-Source", resp.DataSource)
 	if resp.SessionID != "" {
 		w.Header().Set("X-RDMA-Session-ID", resp.SessionID)
 	}

@@ -121,9 +121,25 @@ func (p *ConnectionPool) getConnection(ctx context.Context) (*PooledConnection, 
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
+	// Drop stale/broken connections before reuse
+	active := make([]*PooledConnection, 0, len(p.connections))
+	for _, conn := range p.connections {
+		if conn.inUse {
+			active = append(active, conn)
+			continue
+		}
+		if !conn.ipcClient.IsConnected() || time.Since(conn.lastUsed) >= p.maxIdleTime {
+			conn.ipcClient.Disconnect()
+			p.logger.WithField("session_id", conn.sessionID).Debug("🧹 Dropping stale pooled RDMA connection")
+			continue
+		}
+		active = append(active, conn)
+	}
+	p.connections = active
+
 	// Look for an available connection
 	for _, conn := range p.connections {
-		if !conn.inUse && time.Since(conn.lastUsed) < p.maxIdleTime {
+		if !conn.inUse {
 			conn.inUse = true
 			conn.lastUsed = time.Now()
 			p.logger.WithField("session_id", conn.sessionID).Debug("🔌 Reusing pooled RDMA connection")
@@ -159,14 +175,26 @@ func (p *ConnectionPool) getConnection(ctx context.Context) (*PooledConnection, 
 	return nil, fmt.Errorf("connection pool exhausted (max: %d)", p.maxConnections)
 }
 
-// releaseConnection returns a connection to the pool
-func (p *ConnectionPool) releaseConnection(conn *PooledConnection) {
+// releaseConnection returns a connection to the pool, or removes it if broken.
+func (p *ConnectionPool) releaseConnection(conn *PooledConnection, broken bool) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
+	if broken || !conn.ipcClient.IsConnected() {
+		conn.ipcClient.Disconnect()
+		remaining := make([]*PooledConnection, 0, len(p.connections))
+		for _, c := range p.connections {
+			if c != conn {
+				remaining = append(remaining, c)
+			}
+		}
+		p.connections = remaining
+		p.logger.WithField("session_id", conn.sessionID).Warn("🗑️ Removed broken pooled RDMA connection")
+		return
+	}
+
 	conn.inUse = false
 	conn.lastUsed = time.Now()
-
 	p.logger.WithField("session_id", conn.sessionID).Debug("🔄 Released RDMA connection back to pool")
 }
 
@@ -272,9 +300,55 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.logger.Info("🚀 Connecting to RDMA engine")
 
 	if c.pool != nil {
-		// Connection pooling mode - connections are created on-demand
+		clientID := "rdma-client"
+		conn, err := c.pool.getConnection(ctx)
+		if err != nil {
+			return fmt.Errorf("failed to connect pooled IPC: %w", err)
+		}
+		broken := false
+		defer func() { c.pool.releaseConnection(conn, broken) }()
+
+		pong, err := conn.ipcClient.Ping(ctx, &clientID)
+		if err != nil {
+			broken = true
+			return fmt.Errorf("failed to ping RDMA engine: %w", err)
+		}
+		if pong == nil {
+			broken = true
+			return fmt.Errorf("empty pong response from RDMA engine")
+		}
+
+		latency := time.Duration(pong.ServerRttNs)
+		c.logger.WithFields(logrus.Fields{
+			"latency":    latency,
+			"server_rtt": time.Duration(pong.ServerRttNs),
+			"pooled":     true,
+		}).Info("📡 RDMA engine ping successful")
+
+		caps, err := conn.ipcClient.GetCapabilities(ctx, &clientID)
+		if err != nil {
+			broken = true
+			return fmt.Errorf("failed to get engine capabilities: %w", err)
+		}
+		if caps == nil {
+			broken = true
+			return fmt.Errorf("empty capabilities response from RDMA engine")
+		}
+
+		c.capabilities = caps
 		c.connected = true
-		c.logger.Info("✅ RDMA client ready (connection pooling enabled)")
+		c.logger.WithFields(logrus.Fields{
+			"version":           caps.Version,
+			"device_name":       caps.DeviceName,
+			"vendor_id":         caps.VendorId,
+			"max_sessions":      caps.MaxSessions,
+			"max_transfer_size": caps.MaxTransferSize,
+			"active_sessions":   caps.ActiveSessions,
+			"real_rdma":         caps.RealRdma,
+			"port_gid":          caps.PortGid,
+			"port_lid":          caps.PortLid,
+			"pooled":            true,
+		}).Info("✅ RDMA engine connected and ready")
 		return nil
 	}
 
@@ -364,8 +438,13 @@ func (c *Client) GetWorkerAddress(ctx context.Context) (*ipc.GetWorkerAddressRes
 		if err != nil {
 			return nil, err
 		}
-		defer c.pool.releaseConnection(conn)
-		return conn.ipcClient.GetWorkerAddress(ctx)
+		broken := false
+		defer func() { c.pool.releaseConnection(conn, broken) }()
+		resp, err := conn.ipcClient.GetWorkerAddress(ctx)
+		if ipc.IsBrokenError(err) {
+			broken = true
+		}
+		return resp, err
 	}
 	return c.ipcClient.GetWorkerAddress(ctx)
 }
@@ -568,18 +647,25 @@ func (c *Client) Ping(ctx context.Context) (time.Duration, error) {
 	var err error
 
 	if c.pool != nil {
-		conn, connErr := c.pool.getConnection(ctx)
-		if connErr != nil {
-			return 0, fmt.Errorf("failed to get pooled connection for ping: %w", connErr)
+		conn, err := c.pool.getConnection(ctx)
+		if err != nil {
+			return 0, fmt.Errorf("failed to get pooled connection for ping: %w", err)
 		}
-		defer c.pool.releaseConnection(conn)
+		broken := false
+		defer func() { c.pool.releaseConnection(conn, broken) }()
 		pong, err = conn.ipcClient.Ping(ctx, &clientID)
+		if ipc.IsBrokenError(err) {
+			broken = true
+		}
 	} else {
 		pong, err = c.ipcClient.Ping(ctx, &clientID)
 	}
 
 	if err != nil {
 		return 0, err
+	}
+	if pong == nil {
+		return 0, fmt.Errorf("empty pong response from RDMA engine")
 	}
 
 	totalLatency := time.Since(start)
@@ -652,7 +738,8 @@ func (c *Client) writeWithPool(ctx context.Context, req *WriteRequest, startTime
 	if err != nil {
 		return nil, fmt.Errorf("failed to get pooled connection: %w", err)
 	}
-	defer c.pool.releaseConnection(conn)
+	broken := false
+	defer func() { c.pool.releaseConnection(conn, broken) }()
 
 	ipcReq := &ipc.StartWriteRequest{
 		VolumeID:    req.VolumeID,
@@ -665,11 +752,17 @@ func (c *Client) writeWithPool(ctx context.Context, req *WriteRequest, startTime
 
 	startResp, err := conn.ipcClient.StartWrite(ctx, ipcReq)
 	if err != nil {
+		if ipc.IsBrokenError(err) {
+			broken = true
+		}
 		return nil, fmt.Errorf("failed to start RDMA write (pooled): %w", err)
 	}
 
 	completeResp, err := conn.ipcClient.CompleteWrite(ctx, startResp.SessionID, true, startResp.BytesBuffered, nil)
 	if err != nil {
+		if ipc.IsBrokenError(err) {
+			broken = true
+		}
 		return nil, fmt.Errorf("failed to complete RDMA write (pooled): %w", err)
 	}
 
@@ -690,31 +783,32 @@ func (c *Client) writeWithPool(ctx context.Context, req *WriteRequest, startTime
 
 // readWithPool performs RDMA read using connection pooling
 func (c *Client) readWithPool(ctx context.Context, req *ReadRequest, startTime time.Time) (*ReadResponse, error) {
-	// Get connection from pool
 	conn, err := c.pool.getConnection(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("failed to get pooled connection: %w", err)
 	}
-	defer c.pool.releaseConnection(conn)
+	broken := false
+	defer func() { c.pool.releaseConnection(conn, broken) }()
 
 	c.logger.WithField("session_id", conn.sessionID).Debug("🔌 Using pooled RDMA connection")
 
-	// Create IPC request
 	ipcReq := &ipc.StartReadRequest{
 		VolumeID:    req.VolumeID,
 		NeedleID:    req.NeedleID,
 		Cookie:      req.Cookie,
 		Offset:      req.Offset,
 		Size:        req.Size,
-		RemoteAddr:  0, // Will be set by engine (mock for now)
-		RemoteKey:   0, // Will be set by engine (mock for now)
+		RemoteAddr:  0,
+		RemoteKey:   0,
 		TimeoutSecs: uint64(c.defaultTimeout.Seconds()),
 		AuthToken:   req.AuthToken,
 	}
 
-	// Start RDMA read
 	startResp, err := conn.ipcClient.StartRead(ctx, ipcReq)
 	if err != nil {
+		if ipc.IsBrokenError(err) {
+			broken = true
+		}
 		c.logger.WithError(err).Error("❌ Failed to start RDMA read (pooled)")
 		return nil, fmt.Errorf("failed to start RDMA read: %w", err)
 	}
@@ -729,9 +823,11 @@ func (c *Client) readWithPool(ctx context.Context, req *ReadRequest, startTime t
 		"pooled":        true,
 	}).Debug("📖 RDMA read session started (pooled)")
 
-	// Complete the RDMA read
 	completeResp, err := conn.ipcClient.CompleteRead(ctx, startResp.SessionID, true, startResp.TransferSize, &startResp.ExpectedCrc)
 	if err != nil {
+		if ipc.IsBrokenError(err) {
+			broken = true
+		}
 		c.logger.WithError(err).Error("❌ Failed to complete RDMA read (pooled)")
 		return nil, fmt.Errorf("failed to complete RDMA read: %w", err)
 	}
