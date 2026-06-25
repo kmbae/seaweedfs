@@ -21,11 +21,14 @@ const DefaultRemotePort = 18515
 
 // NeedleReadRequest matches the Rust RemoteNeedleReadRequest.
 type NeedleReadRequest struct {
-	VolumeID uint32 `msgpack:"volume_id"`
-	NeedleID uint64 `msgpack:"needle_id"`
-	Cookie   uint32 `msgpack:"cookie"`
-	Offset   uint64 `msgpack:"offset"`
-	Size     uint64 `msgpack:"size"`
+	VolumeID         uint32 `msgpack:"volume_id"`
+	NeedleID         uint64 `msgpack:"needle_id"`
+	Cookie           uint32 `msgpack:"cookie"`
+	Offset           uint64 `msgpack:"offset"`
+	Size             uint64 `msgpack:"size"`
+	WorkerAddressB64 string `msgpack:"worker_address_b64,omitempty"`
+	RemoteAddr       uint64 `msgpack:"remote_addr,omitempty"`
+	RemoteKeyB64     string `msgpack:"remote_key_b64,omitempty"`
 }
 
 // NeedleReadResponse matches the Rust RemoteNeedleReadResponse.
@@ -137,10 +140,14 @@ func ReadNeedle(ctx context.Context, volumeServer string, port uint16, req *Need
 
 // NeedleWriteRequest matches the Rust RemoteNeedleWriteRequest.
 type NeedleWriteRequest struct {
-	VolumeID uint32 `msgpack:"volume_id"`
-	NeedleID uint64 `msgpack:"needle_id"`
-	Cookie   uint32 `msgpack:"cookie"`
-	Data     []byte `msgpack:"data"`
+	VolumeID         uint32 `msgpack:"volume_id"`
+	NeedleID         uint64 `msgpack:"needle_id"`
+	Cookie           uint32 `msgpack:"cookie"`
+	Data             []byte `msgpack:"data"`
+	Size             uint64 `msgpack:"size,omitempty"`
+	WorkerAddressB64 string `msgpack:"worker_address_b64,omitempty"`
+	RemoteAddr       uint64 `msgpack:"remote_addr,omitempty"`
+	RemoteKeyB64     string `msgpack:"remote_key_b64,omitempty"`
 }
 
 // NeedleWriteResponse matches the Rust RemoteNeedleWriteResponse.

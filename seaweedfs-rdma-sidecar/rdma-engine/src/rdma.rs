@@ -85,6 +85,8 @@ pub struct MemoryRegion {
     pub rkey: u32,
     /// Local key for local operations
     pub lkey: u32,
+    /// Packed UCX remote key bytes for peer RMA access
+    pub rkey_buffer: Vec<u8>,
     /// Size of the memory region
     pub size: usize,
     /// Whether the region is registered with RDMA hardware
@@ -170,6 +172,7 @@ impl MockRdmaContext {
             addr,
             rkey: 0x12345678, // Mock remote key
             lkey: 0x87654321, // Mock local key
+            rkey_buffer: Vec::new(),
             size,
             registered: true,
         };
@@ -290,11 +293,12 @@ impl UcxRdmaContext {
     }
 
     pub async fn register_memory(&self, addr: u64, size: usize) -> RdmaResult<MemoryRegion> {
-        self.ucx.map_memory(addr, size)?;
+        let rkey_buffer = self.ucx.map_memory(addr, size)?;
         Ok(MemoryRegion {
             addr,
             rkey: 0,
             lkey: 0,
+            rkey_buffer,
             size,
             registered: true,
         })
@@ -345,6 +349,48 @@ impl UcxRdmaContext {
         if remote_addr != 0 {
             self.ucx.put(local_addr, remote_addr, size)?;
         }
+        self.pending_operations.write().push(WorkCompletion {
+            wr_id,
+            status: CompletionStatus::Success,
+            opcode: RdmaOp::Write,
+            byte_len: size as u32,
+            imm_data: None,
+        });
+        Ok(())
+    }
+
+    pub async fn post_read_peer(
+        &self,
+        peer_key: &str,
+        worker_address: &[u8],
+        local_addr: u64,
+        remote_addr: u64,
+        remote_rkey: &[u8],
+        size: usize,
+        wr_id: u64,
+    ) -> RdmaResult<()> {
+        self.ucx.get_from_peer(peer_key, worker_address, local_addr, remote_addr, remote_rkey, size)?;
+        self.pending_operations.write().push(WorkCompletion {
+            wr_id,
+            status: CompletionStatus::Success,
+            opcode: RdmaOp::Read,
+            byte_len: size as u32,
+            imm_data: None,
+        });
+        Ok(())
+    }
+
+    pub async fn post_write_peer(
+        &self,
+        peer_key: &str,
+        worker_address: &[u8],
+        local_addr: u64,
+        remote_addr: u64,
+        remote_rkey: &[u8],
+        size: usize,
+        wr_id: u64,
+    ) -> RdmaResult<()> {
+        self.ucx.put_to_peer(peer_key, worker_address, local_addr, remote_addr, remote_rkey, size)?;
         self.pending_operations.write().push(WorkCompletion {
             wr_id,
             status: CompletionStatus::Success,
@@ -573,6 +619,44 @@ impl RdmaContext {
             RdmaContextImpl::Mock(ctx) => ctx.post_write(local_addr, remote_addr, rkey, size, wr_id).await,
             #[cfg(feature = "real-ucx")]
             RdmaContextImpl::Ucx(ctx) => ctx.post_write(local_addr, remote_addr, rkey, size, wr_id).await,
+        }
+    }
+
+    pub async fn post_read_peer(
+        &self,
+        peer_key: &str,
+        worker_address: &[u8],
+        local_addr: u64,
+        remote_addr: u64,
+        remote_rkey: &[u8],
+        size: usize,
+        wr_id: u64,
+    ) -> RdmaResult<()> {
+        match &self.inner {
+            RdmaContextImpl::Mock(_) => Err(RdmaError::invalid_request("peer RDMA requires real UCX context")),
+            #[cfg(feature = "real-ucx")]
+            RdmaContextImpl::Ucx(ctx) => ctx
+                .post_read_peer(peer_key, worker_address, local_addr, remote_addr, remote_rkey, size, wr_id)
+                .await,
+        }
+    }
+
+    pub async fn post_write_peer(
+        &self,
+        peer_key: &str,
+        worker_address: &[u8],
+        local_addr: u64,
+        remote_addr: u64,
+        remote_rkey: &[u8],
+        size: usize,
+        wr_id: u64,
+    ) -> RdmaResult<()> {
+        match &self.inner {
+            RdmaContextImpl::Mock(_) => Err(RdmaError::invalid_request("peer RDMA requires real UCX context")),
+            #[cfg(feature = "real-ucx")]
+            RdmaContextImpl::Ucx(ctx) => ctx
+                .post_write_peer(peer_key, worker_address, local_addr, remote_addr, remote_rkey, size, wr_id)
+                .await,
         }
     }
 

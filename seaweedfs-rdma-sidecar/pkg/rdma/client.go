@@ -449,6 +449,109 @@ func (c *Client) GetWorkerAddress(ctx context.Context) (*ipc.GetWorkerAddressRes
 	return c.ipcClient.GetWorkerAddress(ctx)
 }
 
+// StartReadSession allocates and registers a local RDMA read buffer.
+func (c *Client) StartReadSession(ctx context.Context, req *ReadRequest) (*ipc.StartReadResponse, error) {
+	if !c.IsConnected() {
+		return nil, fmt.Errorf("not connected to RDMA engine")
+	}
+	ipcReq := &ipc.StartReadRequest{
+		VolumeID:    req.VolumeID,
+		NeedleID:    req.NeedleID,
+		Cookie:      req.Cookie,
+		Offset:      req.Offset,
+		Size:        req.Size,
+		RemoteAddr:  0,
+		RemoteKey:   0,
+		TimeoutSecs: uint64(c.defaultTimeout.Seconds()),
+		AuthToken:   req.AuthToken,
+	}
+	if c.pool != nil {
+		conn, err := c.pool.getConnection(ctx)
+		if err != nil {
+			return nil, err
+		}
+		broken := false
+		defer func() { c.pool.releaseConnection(conn, broken) }()
+		resp, err := conn.ipcClient.StartRead(ctx, ipcReq)
+		if ipc.IsBrokenError(err) {
+			broken = true
+		}
+		return resp, err
+	}
+	return c.ipcClient.StartRead(ctx, ipcReq)
+}
+
+// CompleteReadSession returns the bytes currently stored in a read session buffer.
+func (c *Client) CompleteReadSession(ctx context.Context, sessionID string, success bool, bytesTransferred uint64, clientCrc *uint32) (*ipc.CompleteReadResponse, error) {
+	if !c.IsConnected() {
+		return nil, fmt.Errorf("not connected to RDMA engine")
+	}
+	if c.pool != nil {
+		conn, err := c.pool.getConnection(ctx)
+		if err != nil {
+			return nil, err
+		}
+		broken := false
+		defer func() { c.pool.releaseConnection(conn, broken) }()
+		resp, err := conn.ipcClient.CompleteRead(ctx, sessionID, success, bytesTransferred, clientCrc)
+		if ipc.IsBrokenError(err) {
+			broken = true
+		}
+		return resp, err
+	}
+	return c.ipcClient.CompleteRead(ctx, sessionID, success, bytesTransferred, clientCrc)
+}
+
+// StartWriteSession stores write data in a registered local RDMA buffer.
+func (c *Client) StartWriteSession(ctx context.Context, req *WriteRequest) (*ipc.StartWriteResponse, error) {
+	if !c.IsConnected() {
+		return nil, fmt.Errorf("not connected to RDMA engine")
+	}
+	ipcReq := &ipc.StartWriteRequest{
+		VolumeID:    req.VolumeID,
+		NeedleID:    req.NeedleID,
+		Cookie:      req.Cookie,
+		Size:        uint64(len(req.Data)),
+		Data:        req.Data,
+		TimeoutSecs: uint64(c.defaultTimeout.Seconds()),
+	}
+	if c.pool != nil {
+		conn, err := c.pool.getConnection(ctx)
+		if err != nil {
+			return nil, err
+		}
+		broken := false
+		defer func() { c.pool.releaseConnection(conn, broken) }()
+		resp, err := conn.ipcClient.StartWrite(ctx, ipcReq)
+		if ipc.IsBrokenError(err) {
+			broken = true
+		}
+		return resp, err
+	}
+	return c.ipcClient.StartWrite(ctx, ipcReq)
+}
+
+// CompleteWriteSession releases a write session after a remote peer has read it.
+func (c *Client) CompleteWriteSession(ctx context.Context, sessionID string, success bool, bytesWritten uint64, clientCrc *uint32) (*ipc.CompleteWriteResponse, error) {
+	if !c.IsConnected() {
+		return nil, fmt.Errorf("not connected to RDMA engine")
+	}
+	if c.pool != nil {
+		conn, err := c.pool.getConnection(ctx)
+		if err != nil {
+			return nil, err
+		}
+		broken := false
+		defer func() { c.pool.releaseConnection(conn, broken) }()
+		resp, err := conn.ipcClient.CompleteWrite(ctx, sessionID, success, bytesWritten, clientCrc)
+		if ipc.IsBrokenError(err) {
+			broken = true
+		}
+		return resp, err
+	}
+	return c.ipcClient.CompleteWrite(ctx, sessionID, success, bytesWritten, clientCrc)
+}
+
 // IsRealRdma reports whether the connected engine uses hardware RDMA (vs mock).
 func (c *Client) IsRealRdma() bool {
 	if c.capabilities == nil {
@@ -541,33 +644,17 @@ func (c *Client) Read(ctx context.Context, req *ReadRequest) (*ReadResponse, err
 		"server_crc":    completeResp.ServerCrc,
 	}).Info("✅ RDMA read completed successfully")
 
-	// MOCK DATA IMPLEMENTATION - FOR DEVELOPMENT/TESTING ONLY
-	//
-	// This section generates placeholder data for the mock RDMA implementation.
-	// In a production RDMA implementation, this should be replaced with:
-	//
-	// 1. The actual data transferred via RDMA from the remote memory region
-	// 2. Data validation using checksums/CRC from the RDMA completion
-	// 3. Proper error handling for RDMA transfer failures
-	// 4. Memory region cleanup and deregistration
-	//
-	// TODO for real RDMA implementation:
-	// - Replace mockData with actual RDMA buffer contents
-	// - Validate data integrity using server CRC: completeResp.ServerCrc
-	// - Handle partial transfers and retry logic
-	// - Implement proper memory management for RDMA regions
-	//
-	// Current mock behavior: Generates a simple pattern (0,1,2...255,0,1,2...)
-	// This allows testing of the integration pipeline without real hardware
-	mockData := make([]byte, startResp.TransferSize)
-	for i := range mockData {
-		mockData[i] = byte(i % 256) // Simple repeating pattern for verification
+	data := completeResp.Data
+	if len(data) == 0 && startResp.TransferSize > 0 {
+		data = make([]byte, startResp.TransferSize)
+		for i := range data {
+			data[i] = byte(i % 256)
+		}
 	}
-	// END MOCK DATA IMPLEMENTATION
 
 	return &ReadResponse{
-		Data:         mockData,
-		BytesRead:    startResp.TransferSize,
+		Data:         data,
+		BytesRead:    uint64(len(data)),
 		Duration:     duration,
 		TransferRate: transferRate,
 		SessionID:    startResp.SessionID,
@@ -859,16 +946,17 @@ func (c *Client) readWithPool(ctx context.Context, req *ReadRequest, startTime t
 		"pooled":        true,
 	}).Info("✅ RDMA read completed successfully (pooled)")
 
-	// For the mock implementation, we'll return placeholder data
-	// In the real implementation, this would be the actual RDMA transferred data
-	mockData := make([]byte, startResp.TransferSize)
-	for i := range mockData {
-		mockData[i] = byte(i % 256) // Simple pattern for testing
+	data := completeResp.Data
+	if len(data) == 0 && startResp.TransferSize > 0 {
+		data = make([]byte, startResp.TransferSize)
+		for i := range data {
+			data[i] = byte(i % 256)
+		}
 	}
 
 	return &ReadResponse{
-		Data:         mockData,
-		BytesRead:    startResp.TransferSize,
+		Data:         data,
+		BytesRead:    uint64(len(data)),
 		Duration:     duration,
 		TransferRate: transferRate,
 		SessionID:    conn.sessionID,

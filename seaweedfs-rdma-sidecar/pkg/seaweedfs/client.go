@@ -200,6 +200,33 @@ func (c *SeaweedFSRDMAClient) ReadNeedle(ctx context.Context, req *NeedleReadReq
 			Size:     req.Size,
 		}
 
+		if data, source, sessionID, ok, err := c.readNeedleViaRemoteRDMA(ctx, req, rdmaReq); err == nil && ok {
+			realRDMAEngine := c.rdmaClient.IsRealRdma()
+			c.logger.WithFields(logrus.Fields{
+				"volume_id":    req.VolumeID,
+				"needle_id":    req.NeedleID,
+				"source":       "session+" + source,
+				"session_rdma": true,
+				"real_rdma":    realRDMAEngine,
+				"data_rdma":    true,
+				"data_source":  source,
+				"latency":      time.Since(start),
+				"bytes_read":   len(data),
+			}).Info("🚀 RDMA payload read path completed")
+			return &NeedleReadResponse{
+				Data:        data,
+				IsRDMA:      true,
+				Latency:     time.Since(start),
+				Source:      "session+" + source,
+				SessionID:   sessionID,
+				SessionRDMA: true,
+				RealRDMA:    realRDMAEngine,
+				DataSource:  source,
+			}, nil
+		} else if err != nil {
+			c.logger.WithError(err).Debug("RDMA payload read path unavailable, trying session/TCP path")
+		}
+
 		rdmaResp, err := c.rdmaClient.Read(ctx, rdmaReq)
 		if err != nil {
 			c.logger.WithError(err).Warn("⚠️  RDMA read failed, falling back to HTTP")
@@ -299,6 +326,79 @@ func (c *SeaweedFSRDMAClient) ReadNeedleRange(ctx context.Context, volumeID uint
 		Size:     size,
 	}
 	return c.ReadNeedle(ctx, req)
+}
+
+func (c *SeaweedFSRDMAClient) readNeedleViaRemoteRDMA(ctx context.Context, req *NeedleReadRequest, rdmaReq *rdma.ReadRequest) ([]byte, string, string, bool, error) {
+	if c.rdmaClient == nil || !c.rdmaClient.IsRealRdma() {
+		return nil, "", "", false, nil
+	}
+
+	volumeServer := req.VolumeServer
+	if volumeServer == "" {
+		volumeServer = c.volumeServerURL
+	}
+	remoteServer := req.RDMAServer
+	if remoteServer == "" {
+		remoteServer = volumeServer
+	}
+	if remote.IsLocalHost(remoteServer) {
+		return nil, "", "", false, nil
+	}
+
+	worker, err := c.rdmaClient.GetWorkerAddress(ctx)
+	if err != nil {
+		return nil, "", "", false, err
+	}
+	if !worker.RealRdma || worker.WorkerAddressB64 == "" {
+		return nil, "", "", false, fmt.Errorf("worker RDMA address unavailable")
+	}
+
+	startResp, err := c.rdmaClient.StartReadSession(ctx, rdmaReq)
+	if err != nil {
+		return nil, "", "", false, err
+	}
+	completed := false
+	defer func() {
+		if !completed {
+			_, _ = c.rdmaClient.CompleteReadSession(context.Background(), startResp.SessionID, false, 0, nil)
+		}
+	}()
+
+	size := req.Size
+	if size == 0 {
+		size = 4096
+	}
+	result, err := remote.ReadNeedleResult(ctx, remoteServer, c.remoteReadPort, &remote.NeedleReadRequest{
+		VolumeID:         req.VolumeID,
+		NeedleID:         req.NeedleID,
+		Cookie:           req.Cookie,
+		Offset:           req.Offset,
+		Size:             size,
+		WorkerAddressB64: worker.WorkerAddressB64,
+		RemoteAddr:       startResp.LocalAddr,
+		RemoteKeyB64:     startResp.RemoteKeyB64,
+	})
+	if err != nil {
+		return nil, "", "", false, err
+	}
+	if normalizedRemoteTransport(result.Transport) != "rdma" || !result.RealRDMA {
+		completed = true
+		_, _ = c.rdmaClient.CompleteReadSession(ctx, startResp.SessionID, false, 0, nil)
+		return result.Data, remoteReadSource(result.Transport), startResp.SessionID, false, nil
+	}
+
+	completeResp, err := c.rdmaClient.CompleteReadSession(ctx, startResp.SessionID, true, startResp.TransferSize, &startResp.ExpectedCrc)
+	if err != nil {
+		return nil, "", "", false, err
+	}
+	completed = true
+	if !completeResp.Success {
+		return nil, "", "", false, fmt.Errorf("RDMA read completion failed")
+	}
+	if len(completeResp.Data) == 0 && startResp.TransferSize > 0 {
+		return nil, "", "", false, fmt.Errorf("RDMA read returned empty buffer")
+	}
+	return completeResp.Data, "remote-rdma", startResp.SessionID, true, nil
 }
 
 // fetchNeedleData loads actual needle bytes after an RDMA session completes.
@@ -466,6 +566,35 @@ func (c *SeaweedFSRDMAClient) WriteNeedle(ctx context.Context, req *NeedleWriteR
 			Data:     req.Data,
 		}
 
+		if fileID, source, ok, err := c.writeNeedleViaRemoteRDMA(ctx, req, writeReq); err == nil && ok {
+			realRDMAEngine := c.rdmaClient.IsRealRdma()
+			c.logger.WithFields(logrus.Fields{
+				"volume_id":     req.VolumeID,
+				"needle_id":     req.NeedleID,
+				"source":        "session+" + source,
+				"session_rdma":  true,
+				"real_rdma":     realRDMAEngine,
+				"data_rdma":     true,
+				"data_source":   source,
+				"bytes_written": len(req.Data),
+				"latency":       time.Since(start),
+				"file_id":       fileID,
+			}).Info("📝 RDMA payload write path completed")
+			return &NeedleWriteResponse{
+				Success:     true,
+				IsRDMA:      true,
+				Source:      "session+" + source,
+				Latency:     time.Since(start),
+				FileID:      fileID,
+				Size:        len(req.Data),
+				SessionRDMA: true,
+				RealRDMA:    realRDMAEngine,
+				DataSource:  source,
+			}, nil
+		} else if err != nil {
+			c.logger.WithError(err).Debug("RDMA payload write path unavailable, trying session/TCP path")
+		}
+
 		writeResp, err := c.rdmaClient.Write(ctx, writeReq)
 		if err != nil {
 			c.logger.WithError(err).Warn("⚠️  RDMA write failed, falling back to HTTP")
@@ -532,6 +661,66 @@ func (c *SeaweedFSRDMAClient) WriteNeedle(ctx context.Context, req *NeedleWriteR
 		RealRDMA:    false,
 		DataSource:  "http",
 	}, nil
+}
+
+func (c *SeaweedFSRDMAClient) writeNeedleViaRemoteRDMA(ctx context.Context, req *NeedleWriteRequest, writeReq *rdma.WriteRequest) (string, string, bool, error) {
+	if c.rdmaClient == nil || !c.rdmaClient.IsRealRdma() {
+		return "", "", false, nil
+	}
+
+	volumeServer := req.VolumeServer
+	if volumeServer == "" {
+		volumeServer = c.volumeServerURL
+	}
+	remoteServer := req.RDMAServer
+	if remoteServer == "" {
+		remoteServer = volumeServer
+	}
+	if remote.IsLocalHost(remoteServer) {
+		return "", "", false, nil
+	}
+
+	worker, err := c.rdmaClient.GetWorkerAddress(ctx)
+	if err != nil {
+		return "", "", false, err
+	}
+	if !worker.RealRdma || worker.WorkerAddressB64 == "" {
+		return "", "", false, fmt.Errorf("worker RDMA address unavailable")
+	}
+
+	startResp, err := c.rdmaClient.StartWriteSession(ctx, writeReq)
+	if err != nil {
+		return "", "", false, err
+	}
+	completed := false
+	defer func() {
+		if !completed {
+			_, _ = c.rdmaClient.CompleteWriteSession(context.Background(), startResp.SessionID, false, 0, nil)
+		}
+	}()
+
+	result, err := remote.WriteNeedleResult(ctx, remoteServer, c.remoteReadPort, &remote.NeedleWriteRequest{
+		VolumeID:         req.VolumeID,
+		NeedleID:         req.NeedleID,
+		Cookie:           req.Cookie,
+		Data:             []byte{},
+		Size:             uint64(len(req.Data)),
+		WorkerAddressB64: worker.WorkerAddressB64,
+		RemoteAddr:       startResp.LocalAddr,
+		RemoteKeyB64:     startResp.RemoteKeyB64,
+	})
+	if err != nil {
+		return "", "", false, err
+	}
+	if normalizedRemoteTransport(result.Transport) != "rdma" || !result.RealRDMA {
+		return "", "", false, fmt.Errorf("remote write did not use RDMA payload transport: %s", result.Transport)
+	}
+
+	if _, err := c.rdmaClient.CompleteWriteSession(ctx, startResp.SessionID, true, startResp.BytesBuffered, nil); err != nil {
+		c.logger.WithError(err).Warn("RDMA write payload persisted but session cleanup failed")
+	}
+	completed = true
+	return result.FileID, "remote-rdma-write", true, nil
 }
 
 // persistNeedleData submits data to the volume server after RDMA buffering.

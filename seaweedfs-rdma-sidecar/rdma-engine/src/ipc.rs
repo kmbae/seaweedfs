@@ -95,6 +95,8 @@ pub struct StartReadResponse {
     pub local_addr: u64,
     /// Local key for RDMA operations
     pub local_key: u32,
+    /// Packed local UCX rkey for remote peers, base64 encoded
+    pub remote_key_b64: String,
     /// Actual size that will be transferred
     pub transfer_size: u64,
     /// Expected CRC checksum
@@ -125,6 +127,9 @@ pub struct CompleteReadResponse {
     pub success: bool,
     /// Server-computed CRC for verification
     pub server_crc: Option<u32>,
+    /// Data copied into the local RDMA buffer during the read
+    #[serde(with = "serde_bytes")]
+    pub data: Vec<u8>,
     /// Any cleanup messages
     pub message: Option<String>,
 }
@@ -161,6 +166,9 @@ impl std::fmt::Debug for StartWriteRequest {
 pub struct StartWriteResponse {
     pub session_id: String,
     pub bytes_buffered: u64,
+    pub local_addr: u64,
+    pub local_key: u32,
+    pub remote_key_b64: String,
     pub success: bool,
 }
 
@@ -592,6 +600,10 @@ impl IpcServer {
             session_id,
             local_addr,
             local_key: memory_region.lkey,
+            remote_key_b64: {
+                use base64::{engine::general_purpose::STANDARD, Engine as _};
+                STANDARD.encode(&memory_region.rkey_buffer)
+            },
             transfer_size,
             expected_crc: 0x12345678, // Mock CRC
             expires_at_ns: expires_at.timestamp_nanos_opt().unwrap_or(0) as u64,
@@ -604,13 +616,23 @@ impl IpcServer {
         session_manager: &Arc<SessionManager>,
     ) -> RdmaResult<CompleteReadResponse> {
         info!("🏁 Completing RDMA read session: {}", req.session_id);
-        
+
+        let data = if req.success {
+            let session = session_manager.get_session(&req.session_id).await?;
+            let session_data = session.read();
+            let bytes = req.bytes_transferred.min(session_data.buffer.len() as u64) as usize;
+            session_data.buffer[..bytes].to_vec()
+        } else {
+            Vec::new()
+        };
+
         // Clean up session
         session_manager.remove_session(&req.session_id).await?;
         
         Ok(CompleteReadResponse {
             success: req.success,
             server_crc: Some(0x12345678), // Mock CRC
+            data,
             message: Some("Session completed successfully".to_string()),
         })
     }
@@ -670,6 +692,12 @@ impl IpcServer {
         Ok(StartWriteResponse {
             session_id,
             bytes_buffered: data_len as u64,
+            local_addr,
+            local_key: memory_region.lkey,
+            remote_key_b64: {
+                use base64::{engine::general_purpose::STANDARD, Engine as _};
+                STANDARD.encode(&memory_region.rkey_buffer)
+            },
             success: true,
         })
     }

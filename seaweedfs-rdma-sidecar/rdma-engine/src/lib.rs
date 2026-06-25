@@ -118,7 +118,7 @@ impl RdmaEngine {
         });
 
         // Remote read listener (TCP over IB/RoCE CNI IP, port from config)
-        let network_server = network::NetworkServer::new(&self.config);
+        let network_server = network::NetworkServer::new(&self.config, self.rdma_context.clone());
         tokio::spawn(async move {
             if let Err(e) = network_server.run().await {
                 tracing::error!("Network server error: {}", e);

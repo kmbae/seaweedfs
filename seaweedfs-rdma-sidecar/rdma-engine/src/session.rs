@@ -455,6 +455,7 @@ mod tests {
             addr: 0x1000,
             rkey: 0x12345678,
             lkey: 0x87654321,
+            rkey_buffer: Vec::new(),
             size: 4096,
             registered: true,
         };
@@ -487,6 +488,7 @@ mod tests {
             addr: 0x1000,
             rkey: 0x12345678,
             lkey: 0x87654321,
+            rkey_buffer: Vec::new(),
             size: 4096,
             registered: true,
         };
@@ -518,6 +520,7 @@ mod tests {
             addr: 0x1000,
             rkey: 0x12345678,
             lkey: 0x87654321,
+            rkey_buffer: Vec::new(),
             size: 4096,
             registered: true,
         };
@@ -560,6 +563,7 @@ mod tests {
             addr: 0x1000,
             rkey: 0x12345678,
             lkey: 0x87654321,
+            rkey_buffer: Vec::new(),
             size: 4096,
             registered: true,
         };

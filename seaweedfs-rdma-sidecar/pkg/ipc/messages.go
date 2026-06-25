@@ -12,13 +12,13 @@ type IpcMessage struct {
 
 // Request message types
 const (
-	MsgStartRead         = "StartRead"
-	MsgCompleteRead      = "CompleteRead"
-	MsgStartWrite        = "StartWrite"
-	MsgCompleteWrite     = "CompleteWrite"
-	MsgGetCapabilities   = "GetCapabilities"
-	MsgGetWorkerAddress  = "GetWorkerAddress"
-	MsgPing              = "Ping"
+	MsgStartRead        = "StartRead"
+	MsgCompleteRead     = "CompleteRead"
+	MsgStartWrite       = "StartWrite"
+	MsgCompleteWrite    = "CompleteWrite"
+	MsgGetCapabilities  = "GetCapabilities"
+	MsgGetWorkerAddress = "GetWorkerAddress"
+	MsgPing             = "Ping"
 )
 
 // Response message types
@@ -51,6 +51,7 @@ type StartReadResponse struct {
 	SessionID    string `msgpack:"session_id"`
 	LocalAddr    uint64 `msgpack:"local_addr"`
 	LocalKey     uint32 `msgpack:"local_key"`
+	RemoteKeyB64 string `msgpack:"remote_key_b64"`
 	TransferSize uint64 `msgpack:"transfer_size"`
 	ExpectedCrc  uint32 `msgpack:"expected_crc"`
 	ExpiresAtNs  uint64 `msgpack:"expires_at_ns"`
@@ -69,6 +70,7 @@ type CompleteReadRequest struct {
 type CompleteReadResponse struct {
 	Success   bool    `msgpack:"success"`
 	ServerCrc *uint32 `msgpack:"server_crc,omitempty"`
+	Data      []byte  `msgpack:"data"`
 	Message   *string `msgpack:"message,omitempty"`
 }
 
@@ -85,9 +87,12 @@ type StartWriteRequest struct {
 
 // StartWriteResponse corresponds to Rust StartWriteResponse
 type StartWriteResponse struct {
-	SessionID    string `msgpack:"session_id"`
+	SessionID     string `msgpack:"session_id"`
 	BytesBuffered uint64 `msgpack:"bytes_buffered"`
-	Success      bool   `msgpack:"success"`
+	LocalAddr     uint64 `msgpack:"local_addr"`
+	LocalKey      uint32 `msgpack:"local_key"`
+	RemoteKeyB64  string `msgpack:"remote_key_b64"`
+	Success       bool   `msgpack:"success"`
 }
 
 // CompleteWriteRequest corresponds to Rust CompleteWriteRequest

@@ -26,6 +26,8 @@ pub type UcpWorker = *mut c_void;
 pub type UcpEp = *mut c_void;
 /// UCX memory handle
 pub type UcpMem = *mut c_void;
+/// UCX remote key handle
+pub type UcpRkey = *mut c_void;
 /// UCX request handle
 pub type UcpRequest = *mut c_void;
 
@@ -159,8 +161,12 @@ pub struct UcxApi {
     pub ucp_ep_destroy: Symbol<'static, unsafe extern "C" fn(UcpEp)>,
     pub ucp_mem_map: Symbol<'static, unsafe extern "C" fn(UcpContext, *const UcpMemMapParams, *mut UcpMem) -> c_int>,
     pub ucp_mem_unmap: Symbol<'static, unsafe extern "C" fn(UcpContext, UcpMem) -> c_int>,
-    pub ucp_put_nb: Symbol<'static, unsafe extern "C" fn(UcpEp, *const c_void, size_t, u64, u64, UcpSendCallback) -> UcpRequest>,
-    pub ucp_get_nb: Symbol<'static, unsafe extern "C" fn(UcpEp, *mut c_void, size_t, u64, u64, UcpSendCallback) -> UcpRequest>,
+    pub ucp_rkey_pack: Symbol<'static, unsafe extern "C" fn(UcpContext, UcpMem, *mut *mut c_void, *mut size_t) -> c_int>,
+    pub ucp_rkey_buffer_release: Symbol<'static, unsafe extern "C" fn(*mut c_void)>,
+    pub ucp_ep_rkey_unpack: Symbol<'static, unsafe extern "C" fn(UcpEp, *const c_void, *mut UcpRkey) -> c_int>,
+    pub ucp_rkey_destroy: Symbol<'static, unsafe extern "C" fn(UcpRkey)>,
+    pub ucp_put_nb: Symbol<'static, unsafe extern "C" fn(UcpEp, *const c_void, size_t, u64, UcpRkey, UcpSendCallback) -> UcpRequest>,
+    pub ucp_get_nb: Symbol<'static, unsafe extern "C" fn(UcpEp, *mut c_void, size_t, u64, UcpRkey, UcpSendCallback) -> UcpRequest>,
     pub ucp_worker_progress: Symbol<'static, unsafe extern "C" fn(UcpWorker) -> c_int>,
     pub ucp_request_check_status: Symbol<'static, unsafe extern "C" fn(UcpRequest) -> c_int>,
     pub ucp_request_free: Symbol<'static, unsafe extern "C" fn(UcpRequest)>,
@@ -249,6 +255,14 @@ impl UcxApi {
                     .map_err(|e| RdmaError::context_init_failed(format!("ucp_mem_map symbol: {}", e)))?,
                 ucp_mem_unmap: ucp_lib.get(b"ucp_mem_unmap")
                     .map_err(|e| RdmaError::context_init_failed(format!("ucp_mem_unmap symbol: {}", e)))?,
+                ucp_rkey_pack: ucp_lib.get(b"ucp_rkey_pack")
+                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_rkey_pack symbol: {}", e)))?,
+                ucp_rkey_buffer_release: ucp_lib.get(b"ucp_rkey_buffer_release")
+                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_rkey_buffer_release symbol: {}", e)))?,
+                ucp_ep_rkey_unpack: ucp_lib.get(b"ucp_ep_rkey_unpack")
+                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_ep_rkey_unpack symbol: {}", e)))?,
+                ucp_rkey_destroy: ucp_lib.get(b"ucp_rkey_destroy")
+                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_rkey_destroy symbol: {}", e)))?,
                 ucp_put_nb: ucp_lib.get(b"ucp_put_nb")
                     .map_err(|e| RdmaError::context_init_failed(format!("ucp_put_nb symbol: {}", e)))?,
                 ucp_get_nb: ucp_lib.get(b"ucp_get_nb")
@@ -382,7 +396,7 @@ impl UcxContext {
     }
     
     /// Map memory for RDMA operations
-    pub fn map_memory(&self, addr: u64, size: usize) -> RdmaResult<u64> {
+    pub fn map_memory(&self, addr: u64, size: usize) -> RdmaResult<Vec<u8>> {
         debug!("📍 Mapping memory for RDMA: addr=0x{:x}, size={}", addr, size);
         
         let params = UcpMemMapParams {
@@ -402,6 +416,24 @@ impl UcxContext {
                 self.api.status_string(status), status
             )));
         }
+
+        let mut rkey_buffer = ptr::null_mut();
+        let mut rkey_size: size_t = 0;
+        let status = unsafe {
+            (self.api.ucp_rkey_pack)(self.context, mem_handle, &mut rkey_buffer, &mut rkey_size)
+        };
+        if status != UCS_OK {
+            unsafe { (self.api.ucp_mem_unmap)(self.context, mem_handle) };
+            return Err(RdmaError::memory_reg_failed(format!(
+                "ucp_rkey_pack failed: {} ({})",
+                self.api.status_string(status), status
+            )));
+        }
+
+        let packed_rkey = unsafe {
+            std::slice::from_raw_parts(rkey_buffer as *const u8, rkey_size).to_vec()
+        };
+        unsafe { (self.api.ucp_rkey_buffer_release)(rkey_buffer) };
         
         // Store memory handle for cleanup
         {
@@ -409,8 +441,13 @@ impl UcxContext {
             regions.insert(addr, mem_handle);
         }
         
-        info!("✅ Memory mapped successfully: addr=0x{:x}, size={}", addr, size);
-        Ok(addr) // Return the same address as remote key equivalent
+        info!(
+            "✅ Memory mapped successfully: addr=0x{:x}, size={}, rkey_bytes={}",
+            addr,
+            size,
+            packed_rkey.len()
+        );
+        Ok(packed_rkey)
     }
     
     /// Unmap memory
@@ -450,7 +487,7 @@ impl UcxContext {
                 local_addr as *mut c_void,
                 size,
                 remote_addr,
-                0, // No remote key needed with UCX
+                ptr::null_mut(),
                 get_completion_cb,
             )
         };
@@ -493,7 +530,7 @@ impl UcxContext {
                 local_addr as *const c_void,
                 size,
                 remote_addr,
-                0, // No remote key needed with UCX
+                ptr::null_mut(),
                 put_completion_cb,
             )
         };
@@ -520,6 +557,113 @@ impl UcxContext {
         
         info!("✅ RDMA PUT completed successfully");
         Ok(())
+    }
+
+    /// Perform RDMA GET from a named UCX peer using its worker address and packed rkey.
+    pub fn get_from_peer(
+        &self,
+        peer_key: &str,
+        worker_address: &[u8],
+        local_addr: u64,
+        remote_addr: u64,
+        remote_rkey: &[u8],
+        size: usize,
+    ) -> RdmaResult<()> {
+        debug!(
+            "📥 RDMA GET peer={} local=0x{:x}, remote=0x{:x}, size={}",
+            peer_key, local_addr, remote_addr, size
+        );
+
+        let ep = self.connect_peer(peer_key, worker_address)?;
+        let rkey = self.unpack_rkey(ep, remote_rkey)?;
+        let request = unsafe {
+            (self.api.ucp_get_nb)(
+                ep,
+                local_addr as *mut c_void,
+                size,
+                remote_addr,
+                rkey,
+                get_completion_cb,
+            )
+        };
+        let result = self.wait_request(request, "RDMA GET peer");
+        unsafe { (self.api.ucp_rkey_destroy)(rkey) };
+        result?;
+        info!("✅ RDMA GET from peer completed successfully");
+        Ok(())
+    }
+
+    /// Perform RDMA PUT to a named UCX peer using its worker address and packed rkey.
+    pub fn put_to_peer(
+        &self,
+        peer_key: &str,
+        worker_address: &[u8],
+        local_addr: u64,
+        remote_addr: u64,
+        remote_rkey: &[u8],
+        size: usize,
+    ) -> RdmaResult<()> {
+        debug!(
+            "📤 RDMA PUT peer={} local=0x{:x}, remote=0x{:x}, size={}",
+            peer_key, local_addr, remote_addr, size
+        );
+
+        let ep = self.connect_peer(peer_key, worker_address)?;
+        let rkey = self.unpack_rkey(ep, remote_rkey)?;
+        let request = unsafe {
+            (self.api.ucp_put_nb)(
+                ep,
+                local_addr as *const c_void,
+                size,
+                remote_addr,
+                rkey,
+                put_completion_cb,
+            )
+        };
+        let result = self.wait_request(request, "RDMA PUT peer");
+        unsafe { (self.api.ucp_rkey_destroy)(rkey) };
+        result?;
+        info!("✅ RDMA PUT to peer completed successfully");
+        Ok(())
+    }
+
+    fn unpack_rkey(&self, ep: UcpEp, remote_rkey: &[u8]) -> RdmaResult<UcpRkey> {
+        if remote_rkey.is_empty() {
+            return Err(RdmaError::invalid_request("empty remote rkey"));
+        }
+
+        let mut rkey = ptr::null_mut();
+        let status = unsafe {
+            (self.api.ucp_ep_rkey_unpack)(
+                ep,
+                remote_rkey.as_ptr() as *const c_void,
+                &mut rkey,
+            )
+        };
+        if status != UCS_OK {
+            return Err(RdmaError::operation_failed("ucp_ep_rkey_unpack", status));
+        }
+        Ok(rkey)
+    }
+
+    fn wait_request(&self, request: UcpRequest, operation: &str) -> RdmaResult<()> {
+        if request.is_null() {
+            return Ok(());
+        }
+
+        loop {
+            let status = unsafe { (self.api.ucp_request_check_status)(request) };
+            if status != UCS_INPROGRESS {
+                unsafe { (self.api.ucp_request_free)(request) };
+                if status == UCS_OK {
+                    return Ok(());
+                }
+                return Err(RdmaError::operation_failed(operation, status));
+            }
+
+            unsafe { (self.api.ucp_worker_progress)(self.worker) };
+            std::thread::yield_now();
+        }
     }
     
     /// Get worker address for connection establishment
@@ -560,7 +704,7 @@ impl UcxContext {
 
     /// Create endpoint for communication (legacy default key — local only)
     fn get_or_create_endpoint(&self, key: &str) -> RdmaResult<UcpEp> {
-        let mut endpoints = self.endpoints.lock();
+        let endpoints = self.endpoints.lock();
         
         if let Some(&ep) = endpoints.get(key) {
             return Ok(ep);
