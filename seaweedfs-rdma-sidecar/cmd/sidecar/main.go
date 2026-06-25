@@ -99,9 +99,9 @@ func runSidecar(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("create seaweedfs client: %w", err)
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := sfClient.Start(ctx); err != nil {
+	startCtx, startCancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer startCancel()
+	if err := startClientWithRetry(startCtx, sfClient, logger); err != nil {
 		return fmt.Errorf("start seaweedfs client: %w", err)
 	}
 	defer sfClient.Stop()
@@ -137,6 +137,26 @@ func runSidecar(cmd *cobra.Command, args []string) error {
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 	return server.Shutdown(shutdownCtx)
+}
+
+func startClientWithRetry(ctx context.Context, sfClient *seaweedfs.SeaweedFSRDMAClient, logger *logrus.Logger) error {
+	var lastErr error
+	for {
+		attemptCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		err := sfClient.Start(attemptCtx)
+		cancel()
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+
+		select {
+		case <-ctx.Done():
+			return lastErr
+		case <-time.After(time.Second):
+			logger.WithError(err).Warn("RDMA engine is not ready yet; retrying")
+		}
+	}
 }
 
 func healthHandler(logger *logrus.Logger, rdmaClient *rdma.Client) http.HandlerFunc {
