@@ -16,11 +16,12 @@ help: ## Show this help message
 # Local Build Targets
 build: build-go build-rust ## Build all components locally
 
-build-go: ## Build Go components (sidecar, demo-server, test-rdma)
+build-go: ## Build Go components (sidecar, demo-server, test-rdma, swvfs-rdma-daemon)
 	@echo "🔨 Building Go components..."
 	go build -o bin/sidecar ./cmd/sidecar
 	go build -o bin/demo-server ./cmd/demo-server  
 	go build -o bin/test-rdma ./cmd/test-rdma
+	go build -o bin/swvfs-rdma-daemon ./cmd/swvfs-rdma-daemon
 	@echo "✅ Go build complete"
 
 build-rust: ## Build Rust RDMA engine

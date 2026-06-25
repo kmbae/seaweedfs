@@ -20,6 +20,7 @@ COPY seaweedfs-rdma-sidecar/pkg/ ./pkg/
 
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o sidecar ./cmd/sidecar
 RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o demo-server ./cmd/demo-server
+RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o swvfs-rdma-daemon ./cmd/swvfs-rdma-daemon
 
 FROM alpine:3.18
 
@@ -29,6 +30,7 @@ RUN addgroup -g 1001 appgroup && adduser -D -s /bin/sh -u 1001 -G appgroup appus
 WORKDIR /app
 COPY --from=builder /src/seaweedfs-rdma-sidecar/sidecar .
 COPY --from=builder /src/seaweedfs-rdma-sidecar/demo-server .
+COPY --from=builder /src/seaweedfs-rdma-sidecar/swvfs-rdma-daemon .
 
 RUN chown -R appuser:appgroup /app
 USER appuser
