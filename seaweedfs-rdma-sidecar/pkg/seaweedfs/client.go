@@ -173,6 +173,11 @@ func (c *SeaweedFSRDMAClient) IsEnabled() bool {
 	return c.enabled && c.rdmaClient != nil && c.rdmaClient.IsConnected()
 }
 
+// RDMAClient returns the underlying RDMA client for sidecar health endpoints.
+func (c *SeaweedFSRDMAClient) RDMAClient() *rdma.Client {
+	return c.rdmaClient
+}
+
 // ReadNeedle reads a needle using RDMA fast path or HTTP fallback
 func (c *SeaweedFSRDMAClient) ReadNeedle(ctx context.Context, req *NeedleReadRequest) (*NeedleReadResponse, error) {
 	start := time.Now()

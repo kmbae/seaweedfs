@@ -21,17 +21,17 @@ import (
 )
 
 var (
-	port              int
-	engineSocket      string
-	volumeServerURL   string
-	volumeDataDir     string
-	volumeIdxDir      string
-	volumeCollection  string
-	enableRDMA        bool
-	enableZeroCopy    bool
-	tempDir           string
-	debug             bool
-	timeout           time.Duration
+	port             int
+	engineSocket     string
+	volumeServerURL  string
+	volumeDataDir    string
+	volumeIdxDir     string
+	volumeCollection string
+	enableRDMA       bool
+	enableZeroCopy   bool
+	tempDir          string
+	debug            bool
+	timeout          time.Duration
 )
 
 func main() {
@@ -90,6 +90,7 @@ func runSidecar(cmd *cobra.Command, args []string) error {
 		UseZeroCopy:      enableZeroCopy,
 		TempDir:          tempDir,
 		EnablePooling:    true,
+		MaxConnections:   1,
 		VolumeDataDir:    volumeDataDir,
 		VolumeIdxDir:     volumeIdxDir,
 		VolumeCollection: volumeCollection,
@@ -105,22 +106,7 @@ func runSidecar(cmd *cobra.Command, args []string) error {
 	}
 	defer sfClient.Stop()
 
-	rdmaClient := sfClient // health/capabilities use underlying rdma via separate client for ping
-	_ = rdmaClient
-
-	// Separate rdma client reference for health endpoints
-	healthRdma := rdma.NewClient(&rdma.Config{
-		EngineSocketPath: engineSocket,
-		DefaultTimeout:   timeout,
-		Logger:           logger,
-	})
-	if enableRDMA {
-		if err := healthRdma.Connect(ctx); err != nil {
-			logger.WithError(err).Warn("RDMA engine health client connect failed")
-		} else {
-			defer healthRdma.Disconnect()
-		}
-	}
+	healthRdma := sfClient.RDMAClient()
 
 	mux := http.NewServeMux()
 	mux.Handle("/read", &httpserver.ReadHandler{Client: sfClient, Logger: logger})
@@ -162,7 +148,8 @@ func healthHandler(logger *logrus.Logger, rdmaClient *rdma.Client) http.HandlerF
 
 		status := "healthy"
 		latency := ""
-		if rdmaClient.IsConnected() {
+		connected := rdmaClient != nil && rdmaClient.IsConnected()
+		if connected {
 			ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 			defer cancel()
 			d, err := rdmaClient.Ping(ctx)
@@ -176,9 +163,9 @@ func healthHandler(logger *logrus.Logger, rdmaClient *rdma.Client) http.HandlerF
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status":                status,
-			"rdma_engine_connected": rdmaClient.IsConnected(),
+			"rdma_engine_connected": connected,
 			"rdma_engine_latency":   latency,
-			"real_rdma":             rdmaClient.IsRealRdma(),
+			"real_rdma":             connected && rdmaClient.IsRealRdma(),
 			"timestamp":             time.Now().Format(time.RFC3339),
 		})
 	}
@@ -188,6 +175,10 @@ func capabilitiesHandler(rdmaClient *rdma.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if rdmaClient == nil {
+			http.Error(w, "RDMA client not available", http.StatusServiceUnavailable)
 			return
 		}
 		caps := rdmaClient.GetCapabilities()
@@ -204,6 +195,10 @@ func workerAddressHandler(rdmaClient *rdma.Client) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if rdmaClient == nil {
+			http.Error(w, "RDMA client not available", http.StatusServiceUnavailable)
 			return
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -230,6 +225,10 @@ func pingHandler(logger *logrus.Logger, rdmaClient *rdma.Client) http.HandlerFun
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if rdmaClient == nil || !rdmaClient.IsConnected() {
+			http.Error(w, "RDMA client not connected", http.StatusServiceUnavailable)
 			return
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
