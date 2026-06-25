@@ -27,6 +27,7 @@ var (
 	enableReadRDMA    bool
 	enableWriteRDMA   bool
 	enablePayloadRDMA bool
+	forceRDMA         bool
 	fallbackOnError   bool
 	maxConnections    int
 	timeout           time.Duration
@@ -53,6 +54,7 @@ carries RDMA preference hints.`,
 	root.Flags().BoolVar(&enableReadRDMA, "enable-read-rdma", true, "prefer RDMA for READ requests carrying the kernel RDMA hint")
 	root.Flags().BoolVar(&enableWriteRDMA, "enable-write-rdma", true, "prefer RDMA for WRITE requests carrying the kernel RDMA hint")
 	root.Flags().BoolVar(&enablePayloadRDMA, "enable-payload-rdma", true, "enable real payload RDMA in the SeaweedFS data plane")
+	root.Flags().BoolVar(&forceRDMA, "force-rdma", false, "prefer RDMA for READ and WRITE even when the kernel request has no RDMA hint")
 	root.Flags().BoolVar(&fallbackOnError, "fallback-on-error", true, "fall back to TCP/HTTP when RDMA is unavailable")
 	root.Flags().IntVar(&maxConnections, "max-connections", 8, "maximum RDMA engine IPC connections")
 	root.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "SeaweedFS/RDMA operation timeout")
@@ -128,10 +130,13 @@ func run(cmd *cobra.Command, args []string) error {
 		"read_rdma":         enableReadRDMA,
 		"write_rdma":        enableWriteRDMA,
 		"payload_rdma":      enablePayloadRDMA,
+		"force_rdma":        forceRDMA,
 		"fallback_on_error": fallbackOnError,
 	}).Info("starting swvfs RDMA daemon")
 
 	handler := &swvfsdaemon.Handler{
+		ForceReadRDMA:  forceRDMA,
+		ForceWriteRDMA: forceRDMA,
 		Backend: &swvfsfiler.Backend{
 			Store:  store,
 			Router: router,

@@ -44,7 +44,9 @@ type MetadataBackend interface {
 }
 
 type Handler struct {
-	Backend FileBackend
+	Backend        FileBackend
+	ForceReadRDMA  bool
+	ForceWriteRDMA bool
 }
 
 func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfsproto.Reply, error) {
@@ -120,7 +122,8 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 		}
 		return reply, nil
 	case swvfsproto.OpRead:
-		data, attr, err := h.Backend.ReadFile(ctx, req.Path1, req.Header.Offset, req.Header.Size, req.ReadRDMAPreferred())
+		preferRDMA := h.ForceReadRDMA || req.ReadRDMAPreferred()
+		data, attr, err := h.Backend.ReadFile(ctx, req.Path1, req.Header.Offset, req.Header.Size, preferRDMA)
 		if err != nil {
 			return nil, err
 		}
@@ -130,7 +133,8 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 		}
 		return reply, nil
 	case swvfsproto.OpWrite:
-		attr, err := h.Backend.WriteFile(ctx, req.Path1, req.Header.Offset, req.Data, req.Header.Mode, req.Header.UID, req.Header.GID, req.WriteRDMAPreferred())
+		preferRDMA := h.ForceWriteRDMA || req.WriteRDMAPreferred()
+		attr, err := h.Backend.WriteFile(ctx, req.Path1, req.Header.Offset, req.Data, req.Header.Mode, req.Header.UID, req.Header.GID, preferRDMA)
 		if err != nil {
 			return nil, err
 		}

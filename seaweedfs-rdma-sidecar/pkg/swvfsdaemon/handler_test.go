@@ -59,6 +59,25 @@ func TestHandlerPassesWriteHint(t *testing.T) {
 	}
 }
 
+func TestHandlerForceRDMA(t *testing.T) {
+	backend := &fakeFileBackend{}
+	h := &Handler{Backend: backend, ForceReadRDMA: true, ForceWriteRDMA: true}
+
+	if _, err := h.Handle(context.Background(), &swvfsproto.Request{Header: swvfsproto.RequestHeader{Tag: 1, Op: swvfsproto.OpRead}, Path1: "/x"}); err != nil {
+		t.Fatalf("forced read Handle: %v", err)
+	}
+	if !backend.readPreferRDMA {
+		t.Fatal("forced read did not prefer RDMA")
+	}
+
+	if _, err := h.Handle(context.Background(), &swvfsproto.Request{Header: swvfsproto.RequestHeader{Tag: 2, Op: swvfsproto.OpWrite}, Path1: "/x", Data: []byte("abc")}); err != nil {
+		t.Fatalf("forced write Handle: %v", err)
+	}
+	if !backend.writePreferRDMA {
+		t.Fatal("forced write did not prefer RDMA")
+	}
+}
+
 func TestHandlerStatFS(t *testing.T) {
 	h := &Handler{Backend: &fakeFileBackend{}}
 	req := &swvfsproto.Request{Header: swvfsproto.RequestHeader{Tag: 1, Op: swvfsproto.OpStatFS}, Path1: "/"}
