@@ -13,6 +13,7 @@ const (
 	ErrnoNoEnt    int32 = -2
 	ErrnoNoSys    int32 = -38
 	ErrnoInval    int32 = -22
+	ErrnoNoData   int32 = -61
 	ErrnoTooLarge int32 = -7
 )
 
@@ -166,6 +167,12 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 			return nil, ErrnoError{Errno: ErrnoIO, Msg: "empty statfs response"}
 		}
 		return &swvfsproto.Reply{Tag: req.Header.Tag, Data: swvfsproto.EncodeStatFS(*stat)}, nil
+	case swvfsproto.OpListXAttr:
+		return &swvfsproto.Reply{Tag: req.Header.Tag}, nil
+	case swvfsproto.OpGetXAttr:
+		return nil, ErrnoError{Errno: ErrnoNoData, Msg: "xattr not found"}
+	case swvfsproto.OpSetXAttr:
+		return &swvfsproto.Reply{Tag: req.Header.Tag}, nil
 	default:
 		return nil, ErrnoError{Errno: ErrnoNoSys, Msg: fmt.Sprintf("swvfs op %d not implemented by RDMA daemon", req.Header.Op)}
 	}

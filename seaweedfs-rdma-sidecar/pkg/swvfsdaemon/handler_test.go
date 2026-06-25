@@ -2,6 +2,7 @@ package swvfsdaemon
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	"seaweedfs-rdma-sidecar/pkg/swvfsproto"
@@ -71,5 +72,24 @@ func TestHandlerStatFS(t *testing.T) {
 	}
 	if stat.Blocks != 100 || stat.Bsize != 4096 {
 		t.Fatalf("statfs = %+v", stat)
+	}
+}
+
+func TestHandlerXAttrDefaults(t *testing.T) {
+	h := &Handler{Backend: &fakeFileBackend{}}
+	listReq := &swvfsproto.Request{Header: swvfsproto.RequestHeader{Tag: 1, Op: swvfsproto.OpListXAttr}, Path1: "/"}
+	reply, err := h.Handle(context.Background(), listReq)
+	if err != nil {
+		t.Fatalf("LISTXATTR Handle: %v", err)
+	}
+	if len(reply.Data) != 0 {
+		t.Fatalf("LISTXATTR data = %q", reply.Data)
+	}
+
+	getReq := &swvfsproto.Request{Header: swvfsproto.RequestHeader{Tag: 2, Op: swvfsproto.OpGetXAttr}, Path1: "/", Path2: "user.missing"}
+	_, err = h.Handle(context.Background(), getReq)
+	var errno ErrnoError
+	if !errors.As(err, &errno) || errno.Errno != ErrnoNoData {
+		t.Fatalf("expected ENODATA, got %v", err)
 	}
 }
