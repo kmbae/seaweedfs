@@ -18,8 +18,9 @@ import (
 
 // ReadHandler serves mount-compatible GET /read requests with binary payloads.
 type ReadHandler struct {
-	Client *seaweedfs.SeaweedFSRDMAClient
-	Logger *logrus.Logger
+	Client  *seaweedfs.SeaweedFSRDMAClient
+	Logger  *logrus.Logger
+	Timeout time.Duration
 }
 
 func (h *ReadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -34,7 +35,7 @@ func (h *ReadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), operationTimeout(h.Timeout))
 	defer cancel()
 
 	start := time.Now()

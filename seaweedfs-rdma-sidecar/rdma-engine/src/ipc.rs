@@ -346,24 +346,13 @@ impl IpcServer {
                         let session_manager = self.session_manager.clone();
                         let shutdown_flag = self.shutdown_flag.clone();
 
-                        #[cfg(feature = "real-ucx")]
-                        {
+                        tokio::spawn(async move {
                             if let Err(e) = Self::handle_connection(
                                 stream, rdma_context, session_manager, shutdown_flag,
                             ).await {
                                 error!("IPC connection error: {}", e);
                             }
-                        }
-                        #[cfg(not(feature = "real-ucx"))]
-                        {
-                            tokio::spawn(async move {
-                                if let Err(e) = Self::handle_connection(
-                                    stream, rdma_context, session_manager, shutdown_flag,
-                                ).await {
-                                    error!("IPC connection error: {}", e);
-                                }
-                            });
-                        }
+                        });
                     }
                     Ok(Err(e)) => {
                         error!("Failed to accept IPC connection: {}", e);

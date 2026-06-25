@@ -3,6 +3,7 @@ package rdma
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -12,6 +13,8 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/sirupsen/logrus"
 )
+
+var errConnectionPoolExhausted = errors.New("connection pool exhausted")
 
 // PooledConnection represents a pooled RDMA connection
 type PooledConnection struct {
@@ -118,6 +121,30 @@ func NewConnectionPool(enginePath string, maxConnections int, maxIdleTime time.D
 
 // getConnection gets an available connection from the pool or creates a new one
 func (p *ConnectionPool) getConnection(ctx context.Context) (*PooledConnection, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	for {
+		conn, err := p.tryGetConnection(ctx)
+		if err == nil {
+			return conn, nil
+		}
+		if !errors.Is(err, errConnectionPoolExhausted) {
+			return nil, err
+		}
+
+		timer := time.NewTimer(10 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, fmt.Errorf("timeout waiting for RDMA connection: %w", ctx.Err())
+		case <-timer.C:
+		}
+	}
+}
+
+func (p *ConnectionPool) tryGetConnection(ctx context.Context) (*PooledConnection, error) {
 	p.mutex.Lock()
 	defer p.mutex.Unlock()
 
@@ -172,7 +199,7 @@ func (p *ConnectionPool) getConnection(ctx context.Context) (*PooledConnection, 
 	}
 
 	// Pool is full, wait for an available connection
-	return nil, fmt.Errorf("connection pool exhausted (max: %d)", p.maxConnections)
+	return nil, fmt.Errorf("%w (max: %d)", errConnectionPoolExhausted, p.maxConnections)
 }
 
 // releaseConnection returns a connection to the pool, or removes it if broken.

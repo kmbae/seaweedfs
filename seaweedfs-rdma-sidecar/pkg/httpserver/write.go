@@ -16,8 +16,9 @@ import (
 
 // WriteHandler serves mount-compatible POST /write requests.
 type WriteHandler struct {
-	Client *seaweedfs.SeaweedFSRDMAClient
-	Logger *logrus.Logger
+	Client  *seaweedfs.SeaweedFSRDMAClient
+	Logger  *logrus.Logger
+	Timeout time.Duration
 }
 
 func (h *WriteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -58,7 +59,7 @@ func (h *WriteHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(r.Context(), operationTimeout(h.Timeout))
 	defer cancel()
 
 	start := time.Now()
