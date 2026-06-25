@@ -11,6 +11,8 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tracing::{info, debug, error};
 use uuid::Uuid;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 /// Max serialized MessagePack frame size on the Unix IPC socket.
@@ -314,6 +316,10 @@ impl IpcServer {
     pub async fn run(&mut self) -> RdmaResult<()> {
         let listener = UnixListener::bind(&self.socket_path)
             .map_err(|e| RdmaError::ipc_error(format!("Failed to bind Unix socket: {}", e)))?;
+
+        #[cfg(unix)]
+        std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o777))
+            .map_err(|e| RdmaError::ipc_error(format!("Failed to set Unix socket permissions: {}", e)))?;
         
         info!("🎯 IPC server listening on: {}", self.socket_path);
         self.listener = Some(listener);
