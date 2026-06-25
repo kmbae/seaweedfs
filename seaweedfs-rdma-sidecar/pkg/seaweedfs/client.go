@@ -387,7 +387,15 @@ func (c *SeaweedFSRDMAClient) readNeedleViaRemoteRDMA(ctx context.Context, req *
 		return result.Data, remoteReadSource(result.Transport), startResp.SessionID, false, nil
 	}
 
-	completeResp, err := c.rdmaClient.CompleteReadSession(ctx, startResp.SessionID, true, startResp.TransferSize, &startResp.ExpectedCrc)
+	bytesTransferred := result.Size
+	if bytesTransferred == 0 {
+		bytesTransferred = uint64(len(result.Data))
+	}
+	if bytesTransferred > startResp.TransferSize {
+		return nil, "", "", false, fmt.Errorf("remote RDMA read returned %d bytes for %d byte buffer", bytesTransferred, startResp.TransferSize)
+	}
+
+	completeResp, err := c.rdmaClient.CompleteReadSession(ctx, startResp.SessionID, true, bytesTransferred, &startResp.ExpectedCrc)
 	if err != nil {
 		return nil, "", "", false, err
 	}
@@ -395,7 +403,7 @@ func (c *SeaweedFSRDMAClient) readNeedleViaRemoteRDMA(ctx context.Context, req *
 	if !completeResp.Success {
 		return nil, "", "", false, fmt.Errorf("RDMA read completion failed")
 	}
-	if len(completeResp.Data) == 0 && startResp.TransferSize > 0 {
+	if len(completeResp.Data) == 0 && bytesTransferred > 0 {
 		return nil, "", "", false, fmt.Errorf("RDMA read returned empty buffer")
 	}
 	return completeResp.Data, "remote-rdma", startResp.SessionID, true, nil

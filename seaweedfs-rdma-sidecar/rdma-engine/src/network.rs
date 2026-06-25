@@ -53,6 +53,8 @@ pub struct RemoteNeedleReadResponse {
     pub success: bool,
     #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
+    #[serde(default)]
+    pub size: u64,
     #[serde(default = "default_transport")]
     pub transport: String,
     #[serde(default)]
@@ -172,12 +174,14 @@ async fn handle_connection(
                     Ok(true) => RemoteNeedleReadResponse {
                         success: true,
                         data: Vec::new(),
+                        size: data.len() as u64,
                         transport: "rdma".to_string(),
                         real_rdma: true,
                         message: None,
                     },
                     Ok(false) => RemoteNeedleReadResponse {
                         success: true,
+                        size: data.len() as u64,
                         data,
                         transport: default_transport(),
                         real_rdma: false,
@@ -187,6 +191,7 @@ async fn handle_connection(
                         warn!("RDMA read payload PUT failed, falling back to TCP payload: {}", e);
                         RemoteNeedleReadResponse {
                             success: true,
+                            size: data.len() as u64,
                             data,
                             transport: default_transport(),
                             real_rdma: false,
@@ -197,6 +202,7 @@ async fn handle_connection(
                 Err(e) => RemoteNeedleReadResponse {
                     success: false,
                     data: Vec::new(),
+                    size: 0,
                     transport: default_transport(),
                     real_rdma: false,
                     message: Some(e.to_string()),

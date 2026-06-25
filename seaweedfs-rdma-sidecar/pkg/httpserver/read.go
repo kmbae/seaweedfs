@@ -67,6 +67,7 @@ func (h *ReadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Real-RDMA", fmt.Sprintf("%t", resp.RealRDMA))
 		w.Header().Set("X-Data-Source", resp.DataSource)
 		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", "0")
 		w.WriteHeader(http.StatusOK)
 		return
 	}
@@ -80,6 +81,7 @@ func (h *ReadHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-RDMA-Session-ID", resp.SessionID)
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Length", strconv.Itoa(len(resp.Data)))
 	if _, err := w.Write(resp.Data); err != nil {
 		h.Logger.WithError(err).Warn("failed to write read response")
 	}

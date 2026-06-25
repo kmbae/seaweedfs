@@ -35,6 +35,7 @@ type NeedleReadRequest struct {
 type NeedleReadResponse struct {
 	Success   bool   `msgpack:"success"`
 	Data      []byte `msgpack:"data"`
+	Size      uint64 `msgpack:"size,omitempty"`
 	Transport string `msgpack:"transport,omitempty"`
 	RealRDMA  bool   `msgpack:"real_rdma,omitempty"`
 	Message   string `msgpack:"message,omitempty"`
@@ -43,6 +44,7 @@ type NeedleReadResponse struct {
 // ReadResult includes the bytes and the transport used by the remote engine.
 type ReadResult struct {
 	Data      []byte
+	Size      uint64
 	Transport string
 	RealRDMA  bool
 }
@@ -124,6 +126,7 @@ func ReadNeedleResult(ctx context.Context, volumeServer string, port uint16, req
 	}
 	return &ReadResult{
 		Data:      resp.Data,
+		Size:      resp.Size,
 		Transport: normalizeTransport(resp.Transport),
 		RealRDMA:  resp.RealRDMA,
 	}, nil

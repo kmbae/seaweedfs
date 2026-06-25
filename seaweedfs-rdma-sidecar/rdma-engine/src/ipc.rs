@@ -576,30 +576,6 @@ impl IpcServer {
             chrono::Duration::seconds(req.timeout_secs as i64),
         ).await?;
         
-        // Perform RDMA read with unique work request ID
-        // Use atomic counter to avoid hash collisions that could cause incorrect completion handling
-        let wr_id = NEXT_WR_ID.fetch_add(1, Ordering::Relaxed);
-        rdma_context.post_read(
-            local_addr,
-            req.remote_addr,
-            req.remote_key,
-            transfer_size as usize,
-            wr_id,
-        ).await?;
-        
-        // Poll for completion
-        let completions = rdma_context.poll_completion(1).await?;
-        if completions.is_empty() {
-            return Err(RdmaError::operation_failed("RDMA read", -1));
-        }
-        
-        let completion = &completions[0];
-        if completion.status != crate::rdma::CompletionStatus::Success {
-            return Err(RdmaError::operation_failed("RDMA read", completion.status as i32));
-        }
-        
-        info!("✅ RDMA read completed: {} bytes", completion.byte_len);
-        
         let expires_at = chrono::Utc::now() + chrono::Duration::seconds(req.timeout_secs as i64);
         
         Ok(StartReadResponse {
