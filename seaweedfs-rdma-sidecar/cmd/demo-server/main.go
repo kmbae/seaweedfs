@@ -96,19 +96,20 @@ func runServer(cmd *cobra.Command, args []string) error {
 
 	// Create SeaweedFS RDMA client
 	config := &seaweedfs.Config{
-		RDMASocketPath:   rdmaSocket,
-		VolumeServerURL:  volumeServerURL,
-		Enabled:          enableRDMA,
-		DefaultTimeout:   30 * time.Second,
-		Logger:           logger,
-		TempDir:          tempDir,
-		UseZeroCopy:      enableZeroCopy,
-		EnablePooling:    enablePooling,
-		MaxConnections:   maxConnections,
-		MaxIdleTime:      maxIdleTime,
-		VolumeDataDir:    volumeDataDir,
-		VolumeIdxDir:     volumeIdxDir,
-		VolumeCollection: volumeCollection,
+		RDMASocketPath:    rdmaSocket,
+		VolumeServerURL:   volumeServerURL,
+		Enabled:           enableRDMA,
+		EnablePayloadRDMA: true,
+		DefaultTimeout:    30 * time.Second,
+		Logger:            logger,
+		TempDir:           tempDir,
+		UseZeroCopy:       enableZeroCopy,
+		EnablePooling:     enablePooling,
+		MaxConnections:    maxConnections,
+		MaxIdleTime:       maxIdleTime,
+		VolumeDataDir:     volumeDataDir,
+		VolumeIdxDir:      volumeIdxDir,
+		VolumeCollection:  volumeCollection,
 	}
 
 	rdmaClient, err := seaweedfs.NewSeaweedFSRDMAClient(config)

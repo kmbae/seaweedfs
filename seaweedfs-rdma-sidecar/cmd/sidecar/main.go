@@ -21,18 +21,19 @@ import (
 )
 
 var (
-	port             int
-	engineSocket     string
-	volumeServerURL  string
-	volumeDataDir    string
-	volumeIdxDir     string
-	volumeCollection string
-	enableRDMA       bool
-	enableZeroCopy   bool
-	tempDir          string
-	maxConnections   int
-	debug            bool
-	timeout          time.Duration
+	port              int
+	engineSocket      string
+	volumeServerURL   string
+	volumeDataDir     string
+	volumeIdxDir      string
+	volumeCollection  string
+	enableRDMA        bool
+	enablePayloadRDMA bool
+	enableZeroCopy    bool
+	tempDir           string
+	maxConnections    int
+	debug             bool
+	timeout           time.Duration
 )
 
 func main() {
@@ -55,6 +56,7 @@ When the engine runs in mock mode, needle data is loaded from the local volume d
 	rootCmd.Flags().StringVar(&volumeIdxDir, "volume-idx-dir", "", "Local volume index directory (defaults to volume-data-dir)")
 	rootCmd.Flags().StringVar(&volumeCollection, "volume-collection", "", "Volume collection name when using local reads")
 	rootCmd.Flags().BoolVar(&enableRDMA, "enable-rdma", true, "Enable RDMA engine session coordination")
+	rootCmd.Flags().BoolVar(&enablePayloadRDMA, "enable-payload-rdma", false, "Enable experimental RDMA payload transfer")
 	rootCmd.Flags().BoolVar(&enableZeroCopy, "enable-zerocopy", true, "Enable zero-copy temp file optimization")
 	rootCmd.Flags().StringVar(&tempDir, "temp-dir", "/tmp/rdma-cache", "Temp directory for zero-copy files")
 	rootCmd.Flags().IntVar(&maxConnections, "max-connections", 8, "Maximum RDMA engine IPC connections")
@@ -76,27 +78,29 @@ func runSidecar(cmd *cobra.Command, args []string) error {
 	}
 
 	logger.WithFields(logrus.Fields{
-		"port":              port,
-		"engine_socket":     engineSocket,
-		"volume_server_url": volumeServerURL,
-		"volume_data_dir":   volumeDataDir,
-		"enable_rdma":       enableRDMA,
-		"max_connections":   maxConnections,
+		"port":                port,
+		"engine_socket":       engineSocket,
+		"volume_server_url":   volumeServerURL,
+		"volume_data_dir":     volumeDataDir,
+		"enable_rdma":         enableRDMA,
+		"enable_payload_rdma": enablePayloadRDMA,
+		"max_connections":     maxConnections,
 	}).Info("Starting SeaweedFS RDMA sidecar")
 
 	sfClient, err := seaweedfs.NewSeaweedFSRDMAClient(&seaweedfs.Config{
-		RDMASocketPath:   engineSocket,
-		VolumeServerURL:  volumeServerURL,
-		Enabled:          enableRDMA,
-		DefaultTimeout:   timeout,
-		Logger:           logger,
-		UseZeroCopy:      enableZeroCopy,
-		TempDir:          tempDir,
-		EnablePooling:    true,
-		MaxConnections:   maxConnections,
-		VolumeDataDir:    volumeDataDir,
-		VolumeIdxDir:     volumeIdxDir,
-		VolumeCollection: volumeCollection,
+		RDMASocketPath:    engineSocket,
+		VolumeServerURL:   volumeServerURL,
+		Enabled:           enableRDMA,
+		EnablePayloadRDMA: enablePayloadRDMA,
+		DefaultTimeout:    timeout,
+		Logger:            logger,
+		UseZeroCopy:       enableZeroCopy,
+		TempDir:           tempDir,
+		EnablePooling:     true,
+		MaxConnections:    maxConnections,
+		VolumeDataDir:     volumeDataDir,
+		VolumeIdxDir:      volumeIdxDir,
+		VolumeCollection:  volumeCollection,
 	})
 	if err != nil {
 		return fmt.Errorf("create seaweedfs client: %w", err)

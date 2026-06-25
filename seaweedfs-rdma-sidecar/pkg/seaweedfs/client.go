@@ -28,6 +28,7 @@ type SeaweedFSRDMAClient struct {
 	logger          *logrus.Logger
 	volumeServerURL string
 	enabled         bool
+	payloadRDMA     bool
 	remoteReadPort  uint16
 
 	// Zero-copy optimization
@@ -37,11 +38,12 @@ type SeaweedFSRDMAClient struct {
 
 // Config holds configuration for the SeaweedFS RDMA client
 type Config struct {
-	RDMASocketPath  string
-	VolumeServerURL string
-	Enabled         bool
-	DefaultTimeout  time.Duration
-	Logger          *logrus.Logger
+	RDMASocketPath    string
+	VolumeServerURL   string
+	Enabled           bool
+	EnablePayloadRDMA bool
+	DefaultTimeout    time.Duration
+	Logger            *logrus.Logger
 
 	// Zero-copy optimization
 	TempDir     string // Directory for temp files (default: /tmp/rdma-cache)
@@ -126,6 +128,7 @@ func NewSeaweedFSRDMAClient(config *Config) (*SeaweedFSRDMAClient, error) {
 		logger:          config.Logger,
 		volumeServerURL: config.VolumeServerURL,
 		enabled:         config.Enabled,
+		payloadRDMA:     config.EnablePayloadRDMA,
 		tempDir:         tempDir,
 		useZeroCopy:     config.UseZeroCopy,
 		remoteReadPort:  config.RemoteReadPort,
@@ -200,31 +203,35 @@ func (c *SeaweedFSRDMAClient) ReadNeedle(ctx context.Context, req *NeedleReadReq
 			Size:     req.Size,
 		}
 
-		if data, source, sessionID, ok, err := c.readNeedleViaRemoteRDMA(ctx, req, rdmaReq); err == nil && ok {
-			realRDMAEngine := c.rdmaClient.IsRealRdma()
-			c.logger.WithFields(logrus.Fields{
-				"volume_id":    req.VolumeID,
-				"needle_id":    req.NeedleID,
-				"source":       "session+" + source,
-				"session_rdma": true,
-				"real_rdma":    realRDMAEngine,
-				"data_rdma":    true,
-				"data_source":  source,
-				"latency":      time.Since(start),
-				"bytes_read":   len(data),
-			}).Info("🚀 RDMA payload read path completed")
-			return &NeedleReadResponse{
-				Data:        data,
-				IsRDMA:      true,
-				Latency:     time.Since(start),
-				Source:      "session+" + source,
-				SessionID:   sessionID,
-				SessionRDMA: true,
-				RealRDMA:    realRDMAEngine,
-				DataSource:  source,
-			}, nil
-		} else if err != nil {
-			c.logger.WithError(err).Debug("RDMA payload read path unavailable, trying session/TCP path")
+		if c.payloadRDMA {
+			if data, source, sessionID, ok, err := c.readNeedleViaRemoteRDMA(ctx, req, rdmaReq); err == nil && ok {
+				realRDMAEngine := c.rdmaClient.IsRealRdma()
+				c.logger.WithFields(logrus.Fields{
+					"volume_id":    req.VolumeID,
+					"needle_id":    req.NeedleID,
+					"source":       "session+" + source,
+					"session_rdma": true,
+					"real_rdma":    realRDMAEngine,
+					"data_rdma":    true,
+					"data_source":  source,
+					"latency":      time.Since(start),
+					"bytes_read":   len(data),
+				}).Info("🚀 RDMA payload read path completed")
+				return &NeedleReadResponse{
+					Data:        data,
+					IsRDMA:      true,
+					Latency:     time.Since(start),
+					Source:      "session+" + source,
+					SessionID:   sessionID,
+					SessionRDMA: true,
+					RealRDMA:    realRDMAEngine,
+					DataSource:  source,
+				}, nil
+			} else if err != nil {
+				c.logger.WithError(err).Debug("RDMA payload read path unavailable, trying session/TCP path")
+			}
+		} else {
+			c.logger.Debug("RDMA payload read path disabled, using session/TCP path")
 		}
 
 		rdmaResp, err := c.rdmaClient.Read(ctx, rdmaReq)
@@ -574,33 +581,37 @@ func (c *SeaweedFSRDMAClient) WriteNeedle(ctx context.Context, req *NeedleWriteR
 			Data:     req.Data,
 		}
 
-		if fileID, source, ok, err := c.writeNeedleViaRemoteRDMA(ctx, req, writeReq); err == nil && ok {
-			realRDMAEngine := c.rdmaClient.IsRealRdma()
-			c.logger.WithFields(logrus.Fields{
-				"volume_id":     req.VolumeID,
-				"needle_id":     req.NeedleID,
-				"source":        "session+" + source,
-				"session_rdma":  true,
-				"real_rdma":     realRDMAEngine,
-				"data_rdma":     true,
-				"data_source":   source,
-				"bytes_written": len(req.Data),
-				"latency":       time.Since(start),
-				"file_id":       fileID,
-			}).Info("📝 RDMA payload write path completed")
-			return &NeedleWriteResponse{
-				Success:     true,
-				IsRDMA:      true,
-				Source:      "session+" + source,
-				Latency:     time.Since(start),
-				FileID:      fileID,
-				Size:        len(req.Data),
-				SessionRDMA: true,
-				RealRDMA:    realRDMAEngine,
-				DataSource:  source,
-			}, nil
-		} else if err != nil {
-			c.logger.WithError(err).Debug("RDMA payload write path unavailable, trying session/TCP path")
+		if c.payloadRDMA {
+			if fileID, source, ok, err := c.writeNeedleViaRemoteRDMA(ctx, req, writeReq); err == nil && ok {
+				realRDMAEngine := c.rdmaClient.IsRealRdma()
+				c.logger.WithFields(logrus.Fields{
+					"volume_id":     req.VolumeID,
+					"needle_id":     req.NeedleID,
+					"source":        "session+" + source,
+					"session_rdma":  true,
+					"real_rdma":     realRDMAEngine,
+					"data_rdma":     true,
+					"data_source":   source,
+					"bytes_written": len(req.Data),
+					"latency":       time.Since(start),
+					"file_id":       fileID,
+				}).Info("📝 RDMA payload write path completed")
+				return &NeedleWriteResponse{
+					Success:     true,
+					IsRDMA:      true,
+					Source:      "session+" + source,
+					Latency:     time.Since(start),
+					FileID:      fileID,
+					Size:        len(req.Data),
+					SessionRDMA: true,
+					RealRDMA:    realRDMAEngine,
+					DataSource:  source,
+				}, nil
+			} else if err != nil {
+				c.logger.WithError(err).Debug("RDMA payload write path unavailable, trying session/TCP path")
+			}
+		} else {
+			c.logger.Debug("RDMA payload write path disabled, using session/TCP path")
 		}
 
 		writeResp, err := c.rdmaClient.Write(ctx, writeReq)
