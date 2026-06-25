@@ -304,6 +304,7 @@ pub struct UcxContext {
     worker_address: Vec<u8>,
     endpoints: Mutex<HashMap<String, UcpEp>>,
     memory_regions: Mutex<HashMap<u64, UcpMem>>,
+    worker_ops: Mutex<()>,
 }
 
 // Safety: UCX handles are created once and never moved. Endpoints and memory regions
@@ -392,6 +393,7 @@ impl UcxContext {
             worker_address,
             endpoints: Mutex::new(HashMap::new()),
             memory_regions: Mutex::new(HashMap::new()),
+            worker_ops: Mutex::new(()),
         })
     }
     
@@ -474,12 +476,13 @@ impl UcxContext {
     pub fn get(&self, local_addr: u64, remote_addr: u64, size: usize) -> RdmaResult<()> {
         debug!("📥 RDMA GET: local=0x{:x}, remote=0x{:x}, size={}", 
                local_addr, remote_addr, size);
-        
+        let _worker_guard = self.worker_ops.lock();
+
         // For now, use a simple synchronous approach
         // In production, this would be properly async with completion callbacks
         
         // Find or create endpoint (simplified - would need proper address resolution)
-        let ep = self.get_or_create_endpoint("default")?;
+        let ep = self.get_or_create_endpoint_unlocked("default")?;
         
         let request = unsafe {
             (self.api.ucp_get_nb)(
@@ -521,8 +524,9 @@ impl UcxContext {
     pub fn put(&self, local_addr: u64, remote_addr: u64, size: usize) -> RdmaResult<()> {
         debug!("📤 RDMA PUT: local=0x{:x}, remote=0x{:x}, size={}", 
                local_addr, remote_addr, size);
-        
-        let ep = self.get_or_create_endpoint("default")?;
+        let _worker_guard = self.worker_ops.lock();
+
+        let ep = self.get_or_create_endpoint_unlocked("default")?;
         
         let request = unsafe {
             (self.api.ucp_put_nb)(
@@ -574,7 +578,8 @@ impl UcxContext {
             peer_key, local_addr, remote_addr, size
         );
 
-        let ep = self.connect_peer(peer_key, worker_address)?;
+        let _worker_guard = self.worker_ops.lock();
+        let ep = self.connect_peer_unlocked(peer_key, worker_address)?;
         let rkey = self.unpack_rkey(ep, remote_rkey)?;
         let request = unsafe {
             (self.api.ucp_get_nb)(
@@ -586,7 +591,7 @@ impl UcxContext {
                 get_completion_cb,
             )
         };
-        let result = self.wait_request(request, "RDMA GET peer");
+        let result = self.wait_request_unlocked(request, "RDMA GET peer");
         unsafe { (self.api.ucp_rkey_destroy)(rkey) };
         result?;
         info!("✅ RDMA GET from peer completed successfully");
@@ -608,7 +613,8 @@ impl UcxContext {
             peer_key, local_addr, remote_addr, size
         );
 
-        let ep = self.connect_peer(peer_key, worker_address)?;
+        let _worker_guard = self.worker_ops.lock();
+        let ep = self.connect_peer_unlocked(peer_key, worker_address)?;
         let rkey = self.unpack_rkey(ep, remote_rkey)?;
         let request = unsafe {
             (self.api.ucp_put_nb)(
@@ -620,7 +626,7 @@ impl UcxContext {
                 put_completion_cb,
             )
         };
-        let result = self.wait_request(request, "RDMA PUT peer");
+        let result = self.wait_request_unlocked(request, "RDMA PUT peer");
         unsafe { (self.api.ucp_rkey_destroy)(rkey) };
         result?;
         info!("✅ RDMA PUT to peer completed successfully");
@@ -646,7 +652,7 @@ impl UcxContext {
         Ok(rkey)
     }
 
-    fn wait_request(&self, request: UcpRequest, operation: &str) -> RdmaResult<()> {
+    fn wait_request_unlocked(&self, request: UcpRequest, operation: &str) -> RdmaResult<()> {
         if request.is_null() {
             return Ok(());
         }
@@ -673,6 +679,11 @@ impl UcxContext {
     
     /// Create endpoint to a remote UCX peer using its worker address bytes.
     pub fn connect_peer(&self, key: &str, worker_address: &[u8]) -> RdmaResult<UcpEp> {
+        let _worker_guard = self.worker_ops.lock();
+        self.connect_peer_unlocked(key, worker_address)
+    }
+
+    fn connect_peer_unlocked(&self, key: &str, worker_address: &[u8]) -> RdmaResult<UcpEp> {
         let mut endpoints = self.endpoints.lock();
         if let Some(&ep) = endpoints.get(key) {
             return Ok(ep);
@@ -703,7 +714,7 @@ impl UcxContext {
     }
 
     /// Create endpoint for communication (legacy default key — local only)
-    fn get_or_create_endpoint(&self, key: &str) -> RdmaResult<UcpEp> {
+    fn get_or_create_endpoint_unlocked(&self, key: &str) -> RdmaResult<UcpEp> {
         let endpoints = self.endpoints.lock();
         
         if let Some(&ep) = endpoints.get(key) {

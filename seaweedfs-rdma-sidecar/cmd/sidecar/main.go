@@ -30,6 +30,7 @@ var (
 	enableRDMA       bool
 	enableZeroCopy   bool
 	tempDir          string
+	maxConnections   int
 	debug            bool
 	timeout          time.Duration
 )
@@ -56,6 +57,7 @@ When the engine runs in mock mode, needle data is loaded from the local volume d
 	rootCmd.Flags().BoolVar(&enableRDMA, "enable-rdma", true, "Enable RDMA engine session coordination")
 	rootCmd.Flags().BoolVar(&enableZeroCopy, "enable-zerocopy", true, "Enable zero-copy temp file optimization")
 	rootCmd.Flags().StringVar(&tempDir, "temp-dir", "/tmp/rdma-cache", "Temp directory for zero-copy files")
+	rootCmd.Flags().IntVar(&maxConnections, "max-connections", 8, "Maximum RDMA engine IPC connections")
 	rootCmd.Flags().BoolVarP(&debug, "debug", "d", false, "Enable debug logging")
 	rootCmd.Flags().DurationVarP(&timeout, "timeout", "t", 30*time.Second, "RDMA operation timeout")
 
@@ -79,6 +81,7 @@ func runSidecar(cmd *cobra.Command, args []string) error {
 		"volume_server_url": volumeServerURL,
 		"volume_data_dir":   volumeDataDir,
 		"enable_rdma":       enableRDMA,
+		"max_connections":   maxConnections,
 	}).Info("Starting SeaweedFS RDMA sidecar")
 
 	sfClient, err := seaweedfs.NewSeaweedFSRDMAClient(&seaweedfs.Config{
@@ -90,7 +93,7 @@ func runSidecar(cmd *cobra.Command, args []string) error {
 		UseZeroCopy:      enableZeroCopy,
 		TempDir:          tempDir,
 		EnablePooling:    true,
-		MaxConnections:   1,
+		MaxConnections:   maxConnections,
 		VolumeDataDir:    volumeDataDir,
 		VolumeIdxDir:     volumeIdxDir,
 		VolumeCollection: volumeCollection,

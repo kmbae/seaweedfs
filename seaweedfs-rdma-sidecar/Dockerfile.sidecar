@@ -1,6 +1,9 @@
 # Multi-stage build for Go Sidecar (build context: seaweedfs repo root)
 FROM golang:1.25-alpine AS builder
 
+ARG GOPROXY=https://proxy.golang.org,direct
+ENV GOPROXY=${GOPROXY}
+
 RUN apk add --no-cache git ca-certificates tzdata
 
 WORKDIR /src
