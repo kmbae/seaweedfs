@@ -3,6 +3,7 @@ package swvfsfiler
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb"
@@ -38,6 +39,37 @@ func (s *GRPCStore) LookupEntry(ctx context.Context, fullPath string) (*filer_pb
 	return entry, err
 }
 
+func (s *GRPCStore) ListEntries(ctx context.Context, dir string, start string, limit uint32) ([]*filer_pb.Entry, bool, error) {
+	var entries []*filer_pb.Entry
+	eof := false
+	err := s.withFiler(ctx, func(client filer_pb.SeaweedFilerClient) error {
+		stream, err := client.ListEntries(ctx, &filer_pb.ListEntriesRequest{
+			Directory:          cleanFullPath(dir),
+			StartFromFileName:  start,
+			InclusiveStartFrom: false,
+			Limit:              limit,
+		})
+		if err != nil {
+			return err
+		}
+		for {
+			resp, err := stream.Recv()
+			if errorsIsEOF(err) {
+				eof = true
+				return nil
+			}
+			if err != nil {
+				return err
+			}
+			if resp.Entry != nil {
+				filer_pb.AfterEntryDeserialization(resp.Entry.GetChunks())
+				entries = append(entries, resp.Entry)
+			}
+		}
+	})
+	return entries, eof, err
+}
+
 func (s *GRPCStore) SaveEntry(ctx context.Context, fullPath string, entry *filer_pb.Entry) error {
 	dir, name := splitFullPath(fullPath)
 	entry.Name = name
@@ -47,6 +79,27 @@ func (s *GRPCStore) SaveEntry(ctx context.Context, fullPath string, entry *filer
 			Entry:                    entry,
 			SkipCheckParentDirectory: true,
 		})
+	})
+}
+
+func (s *GRPCStore) DeleteEntry(ctx context.Context, fullPath string, recursive bool) error {
+	dir, name := splitFullPath(fullPath)
+	return s.withFiler(ctx, func(client filer_pb.SeaweedFilerClient) error {
+		resp, err := client.DeleteEntry(ctx, &filer_pb.DeleteEntryRequest{
+			Directory:          dir,
+			Name:               name,
+			IsDeleteData:       true,
+			IsRecursive:        recursive,
+			Signatures:         nil,
+			IsFromOtherCluster: false,
+		})
+		if err != nil {
+			return err
+		}
+		if resp.Error != "" {
+			return fmt.Errorf("DeleteEntry %s: %s", fullPath, resp.Error)
+		}
+		return nil
 	})
 }
 
@@ -117,4 +170,8 @@ func (s *GRPCStore) withFiler(ctx context.Context, fn func(filer_pb.SeaweedFiler
 		lastErr = err
 	}
 	return lastErr
+}
+
+func errorsIsEOF(err error) bool {
+	return err == io.EOF
 }

@@ -24,9 +24,25 @@ func (s *fakeStore) LookupEntry(ctx context.Context, fullPath string) (*filer_pb
 	return entry, nil
 }
 
+func (s *fakeStore) ListEntries(ctx context.Context, dir string, start string, limit uint32) ([]*filer_pb.Entry, bool, error) {
+	var entries []*filer_pb.Entry
+	for _, entry := range s.entries {
+		entries = append(entries, entry)
+	}
+	if len(entries) > int(limit) {
+		return entries[:limit], false, nil
+	}
+	return entries, true, nil
+}
+
 func (s *fakeStore) SaveEntry(ctx context.Context, fullPath string, entry *filer_pb.Entry) error {
 	s.savedPath = fullPath
 	s.entries[fullPath] = entry
+	return nil
+}
+
+func (s *fakeStore) DeleteEntry(ctx context.Context, fullPath string, recursive bool) error {
+	delete(s.entries, fullPath)
 	return nil
 }
 

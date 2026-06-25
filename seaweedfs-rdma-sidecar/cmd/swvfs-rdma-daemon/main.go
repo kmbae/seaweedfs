@@ -42,10 +42,9 @@ func main() {
 		Use:   "swvfs-rdma-daemon",
 		Short: "Experimental RDMA-aware userspace daemon for seaweedvfs",
 		Long: `Experimental replacement daemon for seaweedvfs. It speaks the
-/dev/seaweedvfs ABI, serves READ and WRITE requests through the SeaweedFS filer,
-and chooses the RDMA data plane when the kernel request carries RDMA preference
-hints. Metadata operations outside READ/WRITE are intentionally still a work in
-progress.`,
+/dev/seaweedvfs ABI, serves basic metadata plus READ and WRITE requests through
+the SeaweedFS filer, and chooses the RDMA data plane when the kernel request
+carries RDMA preference hints.`,
 		RunE: run,
 	}
 	root.Flags().StringVar(&devPath, "dev", "/dev/seaweedvfs", "seaweedvfs character device")

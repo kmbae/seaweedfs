@@ -24,7 +24,9 @@ import (
 
 type MetadataStore interface {
 	LookupEntry(ctx context.Context, fullPath string) (*filer_pb.Entry, error)
+	ListEntries(ctx context.Context, dir string, start string, limit uint32) ([]*filer_pb.Entry, bool, error)
 	SaveEntry(ctx context.Context, fullPath string, entry *filer_pb.Entry) error
+	DeleteEntry(ctx context.Context, fullPath string, recursive bool) error
 	AssignVolume(ctx context.Context, fullPath string, size uint64) (fileID, volumeServer string, err error)
 	LookupFileID(ctx context.Context, fileID string) ([]string, error)
 }
@@ -32,6 +34,80 @@ type MetadataStore interface {
 type Backend struct {
 	Store  MetadataStore
 	Router *swvfsdaemon.Router
+}
+
+const (
+	direntTypeDir = 4
+	direntTypeReg = 8
+	direntTypeLnk = 10
+)
+
+func (b *Backend) LookupFile(ctx context.Context, fullPath string) (*swvfsproto.Attr, error) {
+	fullPath = cleanFullPath(fullPath)
+	if fullPath == "/" {
+		return rootAttr(), nil
+	}
+	entry, err := b.Store.LookupEntry(ctx, fullPath)
+	if err != nil {
+		return nil, mapLookupErr(err)
+	}
+	return AttrFromEntry(fullPath, entry), nil
+}
+
+func (b *Backend) ReadDir(ctx context.Context, fullPath string, offset uint64, limit uint32) ([]swvfsproto.Dirent, bool, error) {
+	fullPath = cleanFullPath(fullPath)
+	if limit == 0 || limit > swvfsproto.MaxDirents {
+		limit = swvfsproto.MaxDirents
+	}
+	fetchLimit := uint32(offset) + limit
+	if fetchLimit < limit {
+		fetchLimit = limit
+	}
+	entries, eof, err := b.Store.ListEntries(ctx, fullPath, "", fetchLimit)
+	if err != nil {
+		return nil, false, err
+	}
+	if offset >= uint64(len(entries)) {
+		return nil, eof, nil
+	}
+	entries = entries[int(offset):]
+	if len(entries) > int(limit) {
+		entries = entries[:limit]
+		eof = false
+	}
+	dirents := make([]swvfsproto.Dirent, 0, len(entries))
+	for _, entry := range entries {
+		if entry == nil {
+			continue
+		}
+		entryPath := path.Join(fullPath, entry.Name)
+		dirents = append(dirents, swvfsproto.Dirent{
+			Attr: *AttrFromEntry(entryPath, entry),
+			Type: direntType(entry),
+			Name: entry.Name,
+		})
+	}
+	return dirents, eof && len(entries) < int(limit), nil
+}
+
+func (b *Backend) CreateFile(ctx context.Context, fullPath string, mode, uid, gid uint32) (*swvfsproto.Attr, error) {
+	entry := newEntry(fullPath, false, mode, uid, gid)
+	if err := b.Store.SaveEntry(ctx, cleanFullPath(fullPath), entry); err != nil {
+		return nil, err
+	}
+	return AttrFromEntry(fullPath, entry), nil
+}
+
+func (b *Backend) Mkdir(ctx context.Context, fullPath string, mode, uid, gid uint32) (*swvfsproto.Attr, error) {
+	entry := newEntry(fullPath, true, mode, uid, gid)
+	if err := b.Store.SaveEntry(ctx, cleanFullPath(fullPath), entry); err != nil {
+		return nil, err
+	}
+	return AttrFromEntry(fullPath, entry), nil
+}
+
+func (b *Backend) DeleteFile(ctx context.Context, fullPath string, recursive bool) error {
+	return b.Store.DeleteEntry(ctx, cleanFullPath(fullPath), recursive)
 }
 
 func (b *Backend) ReadFile(ctx context.Context, fullPath string, offset, size uint64, preferRDMA bool) ([]byte, *swvfsproto.Attr, error) {
@@ -154,21 +230,7 @@ func (b *Backend) lookupOrCreateEntry(ctx context.Context, fullPath string, mode
 	if !errors.Is(err, filer_pb.ErrNotFound) {
 		return nil, mapLookupErr(err)
 	}
-	now := time.Now()
-	return &filer_pb.Entry{
-		Name: path.Base(fullPath),
-		Attributes: &filer_pb.FuseAttributes{
-			FileMode: mode & 07777,
-			Uid:      uid,
-			Gid:      gid,
-			Mtime:    now.Unix(),
-			MtimeNs:  int32(now.Nanosecond()),
-			Ctime:    now.Unix(),
-			CtimeNs:  int32(now.Nanosecond()),
-			Crtime:   now.Unix(),
-			CrtimeNs: int32(now.Nanosecond()),
-		},
-	}, nil
+	return newEntry(fullPath, false, mode, uid, gid), nil
 }
 
 func (b *Backend) lookupFileID(ctx context.Context, fileID string) ([]string, error) {
@@ -237,6 +299,53 @@ func AttrFromEntry(fullPath string, entry *filer_pb.Entry) *swvfsproto.Attr {
 		attr.AtimeSec = now.Unix()
 	}
 	return attr
+}
+
+func rootAttr() *swvfsproto.Attr {
+	now := time.Now()
+	return &swvfsproto.Attr{
+		Ino:       1,
+		Mode:      uint32(syscall.S_IFDIR | 0755),
+		Nlink:     2,
+		MtimeSec:  now.Unix(),
+		CtimeSec:  now.Unix(),
+		AtimeSec:  now.Unix(),
+		MtimeNsec: uint32(now.Nanosecond()),
+		CtimeNsec: uint32(now.Nanosecond()),
+		AtimeNsec: uint32(now.Nanosecond()),
+	}
+}
+
+func newEntry(fullPath string, isDir bool, mode, uid, gid uint32) *filer_pb.Entry {
+	now := time.Now()
+	return &filer_pb.Entry{
+		Name:        path.Base(cleanFullPath(fullPath)),
+		IsDirectory: isDir,
+		Attributes: &filer_pb.FuseAttributes{
+			FileMode: mode & 07777,
+			Uid:      uid,
+			Gid:      gid,
+			Mtime:    now.Unix(),
+			MtimeNs:  int32(now.Nanosecond()),
+			Ctime:    now.Unix(),
+			CtimeNs:  int32(now.Nanosecond()),
+			Crtime:   now.Unix(),
+			CrtimeNs: int32(now.Nanosecond()),
+		},
+	}
+}
+
+func direntType(entry *filer_pb.Entry) uint32 {
+	if entry == nil {
+		return direntTypeReg
+	}
+	if entry.IsDirectory {
+		return direntTypeDir
+	}
+	if entry.Attributes != nil && entry.Attributes.SymlinkTarget != "" {
+		return direntTypeLnk
+	}
+	return direntTypeReg
 }
 
 type chunkView struct {
