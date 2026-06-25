@@ -14,6 +14,9 @@ type fakeStore struct {
 	entries      map[string]*filer_pb.Entry
 	savedPath    string
 	assignedPath string
+	totalSize    uint64
+	usedSize     uint64
+	fileCount    uint64
 }
 
 func (s *fakeStore) LookupEntry(ctx context.Context, fullPath string) (*filer_pb.Entry, error) {
@@ -53,6 +56,10 @@ func (s *fakeStore) AssignVolume(ctx context.Context, fullPath string, size uint
 
 func (s *fakeStore) LookupFileID(ctx context.Context, fileID string) ([]string, error) {
 	return []string{"http://vol:8080/" + fileID}, nil
+}
+
+func (s *fakeStore) Statistics(ctx context.Context) (uint64, uint64, uint64, error) {
+	return s.totalSize, s.usedSize, s.fileCount, nil
 }
 
 type capturePlane struct {
@@ -153,5 +160,21 @@ func TestBackendReadMapsNotFound(t *testing.T) {
 	var errno swvfsdaemon.ErrnoError
 	if !errors.As(err, &errno) || errno.Errno != swvfsdaemon.ErrnoNoEnt {
 		t.Fatalf("expected ENOENT, got %v", err)
+	}
+}
+
+func TestBackendStatFSUsesStoreStatistics(t *testing.T) {
+	backend := &Backend{Store: &fakeStore{
+		entries:   map[string]*filer_pb.Entry{},
+		totalSize: 4096 * 100,
+		usedSize:  4096 * 20,
+		fileCount: 12,
+	}}
+	stat, err := backend.StatFS(context.Background(), "/")
+	if err != nil {
+		t.Fatalf("StatFS: %v", err)
+	}
+	if stat.Blocks != 100 || stat.Bfree != 80 || stat.Bavail != 80 || stat.Bsize != 4096 || stat.Namelen != 255 {
+		t.Fatalf("statfs = %+v", stat)
 	}
 }

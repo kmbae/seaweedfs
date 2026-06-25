@@ -39,6 +39,7 @@ type MetadataBackend interface {
 	CreateFile(ctx context.Context, path string, mode, uid, gid uint32) (*swvfsproto.Attr, error)
 	Mkdir(ctx context.Context, path string, mode, uid, gid uint32) (*swvfsproto.Attr, error)
 	DeleteFile(ctx context.Context, path string, recursive bool) error
+	StatFS(ctx context.Context, path string) (*swvfsproto.StatFS, error)
 }
 
 type Handler struct {
@@ -150,6 +151,21 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 		return &swvfsproto.Reply{Tag: req.Header.Tag}, nil
 	case swvfsproto.OpFlush, swvfsproto.OpRelease:
 		return &swvfsproto.Reply{Tag: req.Header.Tag}, nil
+	case swvfsproto.OpStatFS:
+		backend, ok := h.Backend.(interface {
+			StatFS(context.Context, string) (*swvfsproto.StatFS, error)
+		})
+		if !ok {
+			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "statfs is not implemented"}
+		}
+		stat, err := backend.StatFS(ctx, req.Path1)
+		if err != nil {
+			return nil, err
+		}
+		if stat == nil {
+			return nil, ErrnoError{Errno: ErrnoIO, Msg: "empty statfs response"}
+		}
+		return &swvfsproto.Reply{Tag: req.Header.Tag, Data: swvfsproto.EncodeStatFS(*stat)}, nil
 	default:
 		return nil, ErrnoError{Errno: ErrnoNoSys, Msg: fmt.Sprintf("swvfs op %d not implemented by RDMA daemon", req.Header.Op)}
 	}

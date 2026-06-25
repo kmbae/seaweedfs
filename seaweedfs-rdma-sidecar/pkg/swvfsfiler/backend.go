@@ -40,6 +40,10 @@ const (
 	direntTypeDir = 4
 	direntTypeReg = 8
 	direntTypeLnk = 10
+
+	statBlockSize    = 4096
+	defaultTotalSize = uint64(1) << 50
+	defaultFileCount = uint64(1) << 32
 )
 
 func (b *Backend) LookupFile(ctx context.Context, fullPath string) (*swvfsproto.Attr, error) {
@@ -108,6 +112,45 @@ func (b *Backend) Mkdir(ctx context.Context, fullPath string, mode, uid, gid uin
 
 func (b *Backend) DeleteFile(ctx context.Context, fullPath string, recursive bool) error {
 	return b.Store.DeleteEntry(ctx, cleanFullPath(fullPath), recursive)
+}
+
+func (b *Backend) StatFS(ctx context.Context, fullPath string) (*swvfsproto.StatFS, error) {
+	total := defaultTotalSize
+	used := uint64(0)
+	files := defaultFileCount
+
+	if b != nil && b.Store != nil {
+		if provider, ok := b.Store.(interface {
+			Statistics(context.Context) (totalSize, usedSize, fileCount uint64, err error)
+		}); ok {
+			totalSize, usedSize, fileCount, err := provider.Statistics(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if totalSize > 0 {
+				total = totalSize
+			}
+			if usedSize > 0 {
+				used = usedSize
+			}
+			if fileCount > 0 {
+				files = maxUint64(fileCount, defaultFileCount)
+			}
+		}
+	}
+	if used > total {
+		total = used
+	}
+	free := total - used
+	return &swvfsproto.StatFS{
+		Blocks:  bytesToBlocks(total),
+		Bfree:   bytesToBlocks(free),
+		Bavail:  bytesToBlocks(free),
+		Files:   files,
+		Ffree:   files,
+		Bsize:   statBlockSize,
+		Namelen: swvfsproto.NameMax,
+	}, nil
 }
 
 func (b *Backend) ReadFile(ctx context.Context, fullPath string, offset, size uint64, preferRDMA bool) ([]byte, *swvfsproto.Attr, error) {
@@ -540,6 +583,10 @@ func maxUint64(a, b uint64) uint64 {
 		return a
 	}
 	return b
+}
+
+func bytesToBlocks(size uint64) uint64 {
+	return (size + statBlockSize - 1) / statBlockSize
 }
 
 func minInt64(a, b int64) int64 {

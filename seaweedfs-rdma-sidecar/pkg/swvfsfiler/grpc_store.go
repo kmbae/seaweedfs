@@ -157,6 +157,24 @@ func (s *GRPCStore) LookupFileID(ctx context.Context, fileID string) ([]string, 
 	return urls, err
 }
 
+func (s *GRPCStore) Statistics(ctx context.Context) (totalSize, usedSize, fileCount uint64, err error) {
+	err = s.withFiler(ctx, func(client filer_pb.SeaweedFilerClient) error {
+		resp, err := client.Statistics(ctx, &filer_pb.StatisticsRequest{
+			Collection:  s.Collection,
+			Replication: s.Replication,
+			DiskType:    s.DiskType,
+		})
+		if err != nil {
+			return err
+		}
+		totalSize = resp.GetTotalSize()
+		usedSize = resp.GetUsedSize()
+		fileCount = resp.GetFileCount()
+		return nil
+	})
+	return totalSize, usedSize, fileCount, err
+}
+
 func (s *GRPCStore) withFiler(ctx context.Context, fn func(filer_pb.SeaweedFilerClient) error) error {
 	if s == nil || len(s.Filers) == 0 {
 		return fmt.Errorf("no filer configured")

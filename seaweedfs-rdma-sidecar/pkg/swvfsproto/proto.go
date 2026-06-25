@@ -155,6 +155,16 @@ type Dirent struct {
 	Name string
 }
 
+type StatFS struct {
+	Blocks  uint64
+	Bfree   uint64
+	Bavail  uint64
+	Files   uint64
+	Ffree   uint64
+	Bsize   uint32
+	Namelen uint32
+}
+
 type Reply struct {
 	Tag      uint64
 	Attr     Attr
@@ -196,6 +206,33 @@ func (r *Reply) Encode() ([]byte, error) {
 	}
 	copy(out[pos:], r.Data)
 	return out, nil
+}
+
+func EncodeStatFS(st StatFS) []byte {
+	out := make([]byte, StatFSSize)
+	binary.LittleEndian.PutUint64(out[0:8], st.Blocks)
+	binary.LittleEndian.PutUint64(out[8:16], st.Bfree)
+	binary.LittleEndian.PutUint64(out[16:24], st.Bavail)
+	binary.LittleEndian.PutUint64(out[24:32], st.Files)
+	binary.LittleEndian.PutUint64(out[32:40], st.Ffree)
+	binary.LittleEndian.PutUint32(out[40:44], st.Bsize)
+	binary.LittleEndian.PutUint32(out[44:48], st.Namelen)
+	return out
+}
+
+func DecodeStatFS(buf []byte) (StatFS, error) {
+	if len(buf) < StatFSSize {
+		return StatFS{}, fmt.Errorf("%w: statfs got %d need %d", ErrShortReply, len(buf), StatFSSize)
+	}
+	return StatFS{
+		Blocks:  binary.LittleEndian.Uint64(buf[0:8]),
+		Bfree:   binary.LittleEndian.Uint64(buf[8:16]),
+		Bavail:  binary.LittleEndian.Uint64(buf[16:24]),
+		Files:   binary.LittleEndian.Uint64(buf[24:32]),
+		Ffree:   binary.LittleEndian.Uint64(buf[32:40]),
+		Bsize:   binary.LittleEndian.Uint32(buf[40:44]),
+		Namelen: binary.LittleEndian.Uint32(buf[44:48]),
+	}, nil
 }
 
 func DecodeReplyHeader(buf []byte) (*Reply, error) {

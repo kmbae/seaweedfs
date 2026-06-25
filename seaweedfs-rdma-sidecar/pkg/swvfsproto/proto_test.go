@@ -78,3 +78,25 @@ func TestReplyEncode(t *testing.T) {
 		t.Fatalf("datalen = %d", got)
 	}
 }
+
+func TestStatFSEncodeDecode(t *testing.T) {
+	encoded := EncodeStatFS(StatFS{
+		Blocks:  100,
+		Bfree:   80,
+		Bavail:  70,
+		Files:   1000,
+		Ffree:   900,
+		Bsize:   4096,
+		Namelen: 255,
+	})
+	if len(encoded) != StatFSSize {
+		t.Fatalf("encoded length = %d", len(encoded))
+	}
+	got, err := DecodeStatFS(encoded)
+	if err != nil {
+		t.Fatalf("DecodeStatFS: %v", err)
+	}
+	if got.Blocks != 100 || got.Bfree != 80 || got.Bavail != 70 || got.Files != 1000 || got.Ffree != 900 || got.Bsize != 4096 || got.Namelen != 255 {
+		t.Fatalf("statfs mismatch: %+v", got)
+	}
+}
