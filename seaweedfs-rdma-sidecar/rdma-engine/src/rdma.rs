@@ -4,9 +4,11 @@
 //! - Mock implementation for development and testing
 //! - Real implementation using libibverbs for production
 
-use crate::{RdmaResult, RdmaEngineConfig};
-use tracing::{debug, warn, info};
+use crate::{RdmaEngineConfig, RdmaError, RdmaResult};
 use parking_lot::RwLock;
+#[cfg(feature = "real-ucx")]
+use std::{fs, path::Path};
+use tracing::{debug, info, warn};
 
 /// RDMA completion status
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -273,18 +275,13 @@ pub struct UcxRdmaContext {
 impl UcxRdmaContext {
     pub async fn new(config: &RdmaEngineConfig) -> RdmaResult<Self> {
         let ucx = std::sync::Arc::new(crate::ucx::UcxContext::new()?);
-        let device_info = RdmaDeviceInfo {
-            name: config.device_name.clone(),
-            vendor_id: 0x02c9,
-            vendor_part_id: 0x1017,
-            hw_ver: 0,
-            max_mr: 131072,
-            max_qp: 262144,
-            max_cq: 65536,
-            max_mr_size: 1024 * 1024 * 1024 * 1024,
-            port_gid: "ucx-auto".to_string(),
-            port_lid: 0,
-        };
+        let device_info = detect_active_rdma_device(&config.device_name)?;
+        info!(
+            "✅ Active RDMA device selected: {} gid={} lid={}",
+            device_info.name,
+            device_info.port_gid,
+            device_info.port_lid
+        );
         Ok(Self {
             ucx,
             device_info,
@@ -367,6 +364,94 @@ impl UcxRdmaContext {
     pub fn device_info(&self) -> &RdmaDeviceInfo {
         &self.device_info
     }
+}
+
+#[cfg(feature = "real-ucx")]
+fn detect_active_rdma_device(preferred_device: &str) -> RdmaResult<RdmaDeviceInfo> {
+    let sysfs = Path::new("/sys/class/infiniband");
+    let entries = fs::read_dir(sysfs).map_err(|err| {
+        RdmaError::context_init_failed(format!(
+            "cannot read {}: {}",
+            sysfs.display(),
+            err
+        ))
+    })?;
+
+    let prefer_auto = preferred_device.is_empty() || preferred_device == "auto";
+    let mut first_active: Option<RdmaDeviceInfo> = None;
+    let mut seen = Vec::new();
+
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        seen.push(name.clone());
+        let path = entry.path();
+
+        match read_active_device_info(&name, &path) {
+            Ok(Some(info)) if !prefer_auto && info.name == preferred_device => return Ok(info),
+            Ok(Some(info)) if prefer_auto && first_active.is_none() => first_active = Some(info),
+            Ok(Some(_)) | Ok(None) => {}
+            Err(err) => warn!("Skipping RDMA device {}: {}", name, err),
+        }
+    }
+
+    if let Some(info) = first_active {
+        return Ok(info);
+    }
+
+    Err(RdmaError::context_init_failed(format!(
+        "no ACTIVE RDMA device with a valid LID found for preference '{}'; seen devices: {}",
+        preferred_device,
+        if seen.is_empty() { "<none>".to_string() } else { seen.join(",") }
+    )))
+}
+
+#[cfg(feature = "real-ucx")]
+fn read_active_device_info(name: &str, path: &Path) -> RdmaResult<Option<RdmaDeviceInfo>> {
+    let state = read_trimmed(path.join("ports/1/state"))?;
+    let lid = parse_lid(&read_trimmed(path.join("ports/1/lid"))?)?;
+    if !state.contains("ACTIVE") || lid == 0 || lid == u16::MAX {
+        return Ok(None);
+    }
+
+    Ok(Some(RdmaDeviceInfo {
+        name: name.to_string(),
+        vendor_id: parse_hex_u32(path.join("device/vendor")).unwrap_or(0x02c9),
+        vendor_part_id: parse_hex_u32(path.join("device/device")).unwrap_or(0),
+        hw_ver: 0,
+        max_mr: 131072,
+        max_qp: 262144,
+        max_cq: 65536,
+        max_mr_size: 1024 * 1024 * 1024 * 1024,
+        port_gid: read_trimmed(path.join("ports/1/gids/0"))
+            .or_else(|_| read_trimmed(path.join("node_guid")))
+            .unwrap_or_else(|_| "unknown".to_string()),
+        port_lid: lid,
+    }))
+}
+
+#[cfg(feature = "real-ucx")]
+fn read_trimmed(path: impl AsRef<Path>) -> RdmaResult<String> {
+    Ok(fs::read_to_string(path.as_ref())?.trim().to_string())
+}
+
+#[cfg(feature = "real-ucx")]
+fn parse_lid(raw: &str) -> RdmaResult<u16> {
+    let trimmed = raw.trim();
+    if let Some(hex) = trimmed.strip_prefix("0x") {
+        return u16::from_str_radix(hex, 16).map_err(|err| {
+            RdmaError::context_init_failed(format!("invalid RDMA lid '{}': {}", raw, err))
+        });
+    }
+    trimmed.parse::<u16>().map_err(|err| {
+        RdmaError::context_init_failed(format!("invalid RDMA lid '{}': {}", raw, err))
+    })
+}
+
+#[cfg(feature = "real-ucx")]
+fn parse_hex_u32(path: impl AsRef<Path>) -> Option<u32> {
+    let raw = fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim().trim_start_matches("0x");
+    u32::from_str_radix(trimmed, 16).ok()
 }
 
 #[cfg(feature = "real-ucx")]
