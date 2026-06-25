@@ -72,6 +72,9 @@ func (fh *FileHandle) readFromChunksWithContext(ctx context.Context, buff []byte
 			glog.V(4).Infof("RDMA read successful for %s [%d,%d] %d", fileFullPath, offset, offset+int64(totalRead), totalRead)
 			return int64(totalRead), ts, nil
 		}
+		if !fh.wfs.option.RdmaFallback {
+			return 0, 0, fmt.Errorf("RDMA read failed (no fallback): %w", err)
+		}
 		glog.V(4).Infof("RDMA read failed for %s, falling back to HTTP: %v", fileFullPath, err)
 	}
 

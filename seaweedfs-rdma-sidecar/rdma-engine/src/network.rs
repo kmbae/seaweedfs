@@ -6,6 +6,7 @@
 
 use crate::{ipc::MAX_IPC_MESSAGE_SIZE, rdma::RdmaContext, RdmaEngineConfig, RdmaError, RdmaResult};
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use reqwest::header::{CONTENT_RANGE, RANGE};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -354,13 +355,10 @@ async fn fetch_needle_http(
     req: &RemoteNeedleReadRequest,
 ) -> RdmaResult<Vec<u8>> {
     let file_id = format_seaweed_file_id(req.volume_id, req.needle_id, req.cookie);
-    let size = if req.size == 0 { 4096 } else { req.size };
     let url = format!(
-        "{}/{}?offset={}&size={}",
+        "{}/{}",
         volume_server_url.trim_end_matches('/'),
-        file_id,
-        req.offset,
-        size
+        file_id
     );
 
     let client = reqwest::Client::builder()
@@ -368,8 +366,13 @@ async fn fetch_needle_http(
         .build()
         .map_err(|_e| RdmaError::operation_failed("http_client", -1))?;
 
-    let response = client
-        .get(&url)
+    let mut http_req = client.get(&url);
+    if req.size > 0 {
+        let end = req.offset.saturating_add(req.size).saturating_sub(1);
+        http_req = http_req.header(RANGE, format!("bytes={}-{}", req.offset, end));
+    }
+
+    let response = http_req
         .send()
         .await
         .map_err(|_e| RdmaError::operation_failed("http_get", -1))?;
@@ -381,11 +384,42 @@ async fn fetch_needle_http(
         ));
     }
 
+    let range_applied = response.status() == reqwest::StatusCode::PARTIAL_CONTENT
+        || response.headers().contains_key(CONTENT_RANGE);
+
     response
         .bytes()
         .await
-        .map(|b| b.to_vec())
+        .map(|b| normalize_http_read_data(b.to_vec(), req, range_applied))
         .map_err(|_| RdmaError::operation_failed("http_body", -1))
+}
+
+fn normalize_http_read_data(
+    mut data: Vec<u8>,
+    req: &RemoteNeedleReadRequest,
+    range_applied: bool,
+) -> Vec<u8> {
+    if req.size == 0 {
+        return data;
+    }
+
+    let requested = req.size as usize;
+    if data.len() <= requested {
+        return data;
+    }
+
+    if range_applied {
+        data.truncate(requested);
+        return data;
+    }
+
+    let start = req.offset as usize;
+    if start >= data.len() {
+        data.clear();
+        return data;
+    }
+    let end = start.saturating_add(requested).min(data.len());
+    data[start..end].to_vec()
 }
 
 async fn submit_needle_http(
@@ -500,5 +534,44 @@ pub async fn remote_needle_read(
             "remote_read",
             -1,
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn read_req(offset: u64, size: u64) -> RemoteNeedleReadRequest {
+        RemoteNeedleReadRequest {
+            volume_id: 1,
+            needle_id: 2,
+            cookie: 3,
+            offset,
+            size,
+            worker_address_b64: String::new(),
+            remote_addr: 0,
+            remote_key_b64: String::new(),
+        }
+    }
+
+    #[test]
+    fn normalize_keeps_range_response_to_requested_size() {
+        let data = b"abcdef".to_vec();
+        let out = normalize_http_read_data(data, &read_req(2, 3), true);
+        assert_eq!(out, b"abc");
+    }
+
+    #[test]
+    fn normalize_slices_full_needle_when_range_was_not_applied() {
+        let data = b"0123456789".to_vec();
+        let out = normalize_http_read_data(data, &read_req(3, 4), false);
+        assert_eq!(out, b"3456");
+    }
+
+    #[test]
+    fn normalize_keeps_full_read_when_size_is_zero() {
+        let data = b"0123456789".to_vec();
+        let out = normalize_http_read_data(data.clone(), &read_req(3, 0), false);
+        assert_eq!(out, data);
     }
 }
