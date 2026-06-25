@@ -528,14 +528,33 @@ impl RdmaContext {
     pub async fn new(config: &RdmaEngineConfig) -> RdmaResult<Self> {
         #[cfg(feature = "real-ucx")]
         {
-            let inner = match UcxRdmaContext::new(config).await {
-                Ok(ctx) => {
-                    info!("✅ Using UCX-backed RDMA context");
-                    RdmaContextImpl::Ucx(ctx)
-                }
-                Err(err) => {
-                    warn!("⚠️  UCX init failed ({}), falling back to mock RDMA", err);
-                    RdmaContextImpl::Mock(MockRdmaContext::new(config).await?)
+            let mut attempt: u32 = 0;
+            let inner = loop {
+                match UcxRdmaContext::new(config).await {
+                    Ok(ctx) => {
+                        info!("✅ Using UCX-backed RDMA context");
+                        break RdmaContextImpl::Ucx(ctx);
+                    }
+                    Err(err) if attempt < config.real_init_retries => {
+                        attempt += 1;
+                        warn!(
+                            "⚠️  UCX init failed ({}); retrying real RDMA init {}/{} in {}ms",
+                            err,
+                            attempt,
+                            config.real_init_retries,
+                            config.real_init_retry_interval_ms
+                        );
+                        if config.real_init_retry_interval_ms > 0 {
+                            tokio::time::sleep(std::time::Duration::from_millis(
+                                config.real_init_retry_interval_ms,
+                            ))
+                            .await;
+                        }
+                    }
+                    Err(err) => {
+                        warn!("⚠️  UCX init failed ({}), falling back to mock RDMA", err);
+                        break RdmaContextImpl::Mock(MockRdmaContext::new(config).await?);
+                    }
                 }
             };
             return Ok(Self {

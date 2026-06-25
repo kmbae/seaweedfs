@@ -52,6 +52,10 @@ pub struct RdmaEngineConfig {
     pub ipc_socket_path: String,
     /// Enable debug logging
     pub debug: bool,
+    /// Number of times to retry real RDMA initialization before mock fallback
+    pub real_init_retries: u32,
+    /// Delay between real RDMA initialization retries in milliseconds
+    pub real_init_retry_interval_ms: u64,
 }
 
 impl Default for RdmaEngineConfig {
@@ -64,6 +68,8 @@ impl Default for RdmaEngineConfig {
             buffer_size: 1024 * 1024 * 1024, // 1GB
             ipc_socket_path: "/tmp/rdma-engine.sock".to_string(),
             debug: false,
+            real_init_retries: 0,
+            real_init_retry_interval_ms: 1000,
         }
     }
 }

@@ -48,6 +48,14 @@ struct Args {
     /// Enable debug logging
     #[arg(long)]
     debug: bool,
+
+    /// Retry real RDMA initialization before falling back to mock mode
+    #[arg(long, default_value_t = 0)]
+    real_init_retries: u32,
+
+    /// Delay between real RDMA initialization retries in milliseconds
+    #[arg(long, default_value_t = 1000)]
+    real_init_retry_interval_ms: u64,
     
     /// Configuration file path
     #[arg(short, long)]
@@ -84,6 +92,8 @@ async fn main() -> anyhow::Result<()> {
     info!("   Buffer Size: {} bytes", args.buffer_size);
     info!("   IPC Socket: {}", args.ipc_socket.display());
     info!("   Debug Mode: {}", args.debug);
+    info!("   Real RDMA Init Retries: {}", args.real_init_retries);
+    info!("   Real RDMA Init Retry Interval: {}ms", args.real_init_retry_interval_ms);
     
     // Load configuration
     let config = RdmaEngineConfig {
@@ -94,6 +104,8 @@ async fn main() -> anyhow::Result<()> {
         buffer_size: args.buffer_size,
         ipc_socket_path: args.ipc_socket.to_string_lossy().to_string(),
         debug: args.debug,
+        real_init_retries: args.real_init_retries,
+        real_init_retry_interval_ms: args.real_init_retry_interval_ms,
     };
     
     // Override with config file if provided
