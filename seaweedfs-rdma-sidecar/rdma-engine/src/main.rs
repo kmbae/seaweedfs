@@ -11,7 +11,7 @@
 use clap::Parser;
 use rdma_engine::{RdmaEngine, RdmaEngineConfig};
 use std::path::PathBuf;
-use tracing::{info, error};
+use tracing::{error, info, warn};
 use tracing_subscriber::{EnvFilter, fmt::layer, prelude::*};
 
 #[derive(Parser)]
@@ -73,6 +73,8 @@ async fn main() -> anyhow::Result<()> {
         .with(layer().with_target(false))
         .with(filter)
         .init();
+
+    raise_memlock_limit();
     
     info!("🚀 Starting SeaweedFS UCX RDMA Engine Server");
     info!("   Version: {}", env!("CARGO_PKG_VERSION"));
@@ -153,6 +155,26 @@ async fn main() -> anyhow::Result<()> {
     
     info!("🛑 RDMA engine server shut down complete");
     Ok(())
+}
+
+fn raise_memlock_limit() {
+    #[cfg(target_os = "linux")]
+    {
+        let limit = libc::rlimit {
+            rlim_cur: libc::RLIM_INFINITY,
+            rlim_max: libc::RLIM_INFINITY,
+        };
+
+        let rc = unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &limit) };
+        if rc == 0 {
+            info!("Raised RLIMIT_MEMLOCK to unlimited for UCX memory registration");
+        } else {
+            warn!(
+                "Unable to raise RLIMIT_MEMLOCK; UCX RDMA memory registration may fail: {}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
 }
 
 #[cfg(test)]
