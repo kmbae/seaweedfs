@@ -40,6 +40,7 @@ type MetadataBackend interface {
 	CreateFile(ctx context.Context, path string, mode, uid, gid uint32) (*swvfsproto.Attr, error)
 	Mkdir(ctx context.Context, path string, mode, uid, gid uint32) (*swvfsproto.Attr, error)
 	DeleteFile(ctx context.Context, path string, recursive bool) error
+	SetAttr(ctx context.Context, path string, header swvfsproto.RequestHeader) (*swvfsproto.Attr, error)
 	StatFS(ctx context.Context, path string) (*swvfsproto.StatFS, error)
 }
 
@@ -113,6 +114,22 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "mkdir is not implemented"}
 		}
 		attr, err := backend.Mkdir(ctx, req.Path1, req.Header.Mode, req.Header.UID, req.Header.GID)
+		if err != nil {
+			return nil, err
+		}
+		reply := &swvfsproto.Reply{Tag: req.Header.Tag}
+		if attr != nil {
+			reply.Attr = *attr
+		}
+		return reply, nil
+	case swvfsproto.OpSetAttr:
+		backend, ok := h.Backend.(interface {
+			SetAttr(context.Context, string, swvfsproto.RequestHeader) (*swvfsproto.Attr, error)
+		})
+		if !ok {
+			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "setattr is not implemented"}
+		}
+		attr, err := backend.SetAttr(ctx, req.Path1, req.Header)
 		if err != nil {
 			return nil, err
 		}

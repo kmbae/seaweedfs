@@ -38,6 +38,15 @@ const (
 )
 
 const (
+	SetMode  uint32 = 1 << 0
+	SetUID   uint32 = 1 << 1
+	SetGID   uint32 = 1 << 2
+	SetSize  uint32 = 1 << 3
+	SetMTime uint32 = 1 << 4
+	SetATime uint32 = 1 << 5
+)
+
+const (
 	PathMax    = 8192
 	NameMax    = 255
 	NameBuf    = 256

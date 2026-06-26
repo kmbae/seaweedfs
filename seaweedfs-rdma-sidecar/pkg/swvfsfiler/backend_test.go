@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"seaweedfs-rdma-sidecar/pkg/swvfsdaemon"
+	"seaweedfs-rdma-sidecar/pkg/swvfsproto"
 
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
@@ -175,6 +176,44 @@ func TestBackendMkdirStoresDirectoryMode(t *testing.T) {
 	}
 	if attr.Mode&uint32(syscall.S_IFMT) != uint32(syscall.S_IFDIR) {
 		t.Fatalf("attr mode is not a directory: %#o", attr.Mode)
+	}
+}
+
+func TestBackendSetAttrUpdatesTimesAndSize(t *testing.T) {
+	store := &fakeStore{entries: map[string]*filer_pb.Entry{
+		"/file": {
+			Name: "file",
+			Attributes: &filer_pb.FuseAttributes{
+				FileMode: 0644,
+				FileSize: 20,
+			},
+			Chunks: []*filer_pb.FileChunk{{
+				FileId: "3,01637037d6",
+				Size:   20,
+			}},
+		},
+	}}
+	backend := &Backend{Store: store}
+	attr, err := backend.SetAttr(context.Background(), "/file", swvfsproto.RequestHeader{
+		Valid:     swvfsproto.SetSize | swvfsproto.SetMTime | swvfsproto.SetATime,
+		Size:      0,
+		MtimeSec:  123,
+		MtimeNsec: 456,
+		AtimeSec:  789,
+		AtimeNsec: 987,
+	})
+	if err != nil {
+		t.Fatalf("SetAttr: %v", err)
+	}
+	entry := store.entries["/file"]
+	if entry.Attributes.GetFileSize() != 0 || len(entry.Chunks) != 0 {
+		t.Fatalf("truncate not saved: size=%d chunks=%d", entry.Attributes.GetFileSize(), len(entry.Chunks))
+	}
+	if entry.Attributes.GetMtime() != 123 || entry.Attributes.GetMtimeNs() != 456 || entry.Attributes.GetAtime() != 789 || entry.Attributes.GetAtimeNs() != 987 {
+		t.Fatalf("timestamps not saved: %+v", entry.Attributes)
+	}
+	if attr.Size != 0 || attr.MtimeSec != 123 || attr.AtimeSec != 789 {
+		t.Fatalf("attr mismatch: %+v", attr)
 	}
 }
 

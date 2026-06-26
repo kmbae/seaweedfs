@@ -115,6 +115,50 @@ func (b *Backend) DeleteFile(ctx context.Context, fullPath string, recursive boo
 	return b.Store.DeleteEntry(ctx, cleanFullPath(fullPath), recursive)
 }
 
+func (b *Backend) SetAttr(ctx context.Context, fullPath string, header swvfsproto.RequestHeader) (*swvfsproto.Attr, error) {
+	fullPath = cleanFullPath(fullPath)
+	entry, err := b.Store.LookupEntry(ctx, fullPath)
+	if err != nil {
+		return nil, mapLookupErr(err)
+	}
+	entry = proto.Clone(entry).(*filer_pb.Entry)
+	if entry.Attributes == nil {
+		entry.Attributes = &filer_pb.FuseAttributes{}
+	}
+	a := entry.Attributes
+	if header.Valid&swvfsproto.SetMode != 0 {
+		a.FileMode = normalizeFileMode(entry.IsDirectory, header.Mode)
+	}
+	if header.Valid&swvfsproto.SetUID != 0 {
+		a.Uid = header.UID
+	}
+	if header.Valid&swvfsproto.SetGID != 0 {
+		a.Gid = header.GID
+	}
+	if header.Valid&swvfsproto.SetSize != 0 {
+		a.FileSize = header.Size
+		if header.Size == 0 {
+			entry.Chunks = nil
+			entry.Content = nil
+		}
+	}
+	if header.Valid&swvfsproto.SetMTime != 0 {
+		a.Mtime = header.MtimeSec
+		a.MtimeNs = int32(header.MtimeNsec)
+	}
+	if header.Valid&swvfsproto.SetATime != 0 {
+		a.Atime = header.AtimeSec
+		a.AtimeNs = int32(header.AtimeNsec)
+	}
+	now := time.Now()
+	a.Ctime = now.Unix()
+	a.CtimeNs = int32(now.Nanosecond())
+	if err := b.Store.SaveEntry(ctx, fullPath, entry); err != nil {
+		return nil, err
+	}
+	return AttrFromEntry(fullPath, entry), nil
+}
+
 func (b *Backend) StatFS(ctx context.Context, fullPath string) (*swvfsproto.StatFS, error) {
 	total := defaultTotalSize
 	used := uint64(0)
