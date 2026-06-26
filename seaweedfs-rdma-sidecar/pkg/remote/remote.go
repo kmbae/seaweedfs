@@ -10,14 +10,20 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vmihailenco/msgpack/v5"
 )
 
 const DefaultRemotePort = 18515
+
+const defaultRemotePoolMaxPerAddr = 8
+
+var pooledRemoteConns = newRemoteConnectionPool(defaultRemotePoolSize())
 
 // NeedleReadRequest matches the Rust RemoteNeedleReadRequest.
 type NeedleReadRequest struct {
@@ -101,24 +107,10 @@ func ReadNeedleResult(ctx context.Context, volumeServer string, port uint16, req
 		port = DefaultRemotePort
 	}
 
-	dialer := &net.Dialer{Timeout: 30 * time.Second}
-	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
-	if err != nil {
-		return nil, fmt.Errorf("remote rdma connect %s:%d: %w", host, port, err)
-	}
-	defer conn.Close()
-
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	}
-
-	if err := writeMsgpack(conn, req); err != nil {
-		return nil, fmt.Errorf("remote rdma write request: %w", err)
-	}
-
 	var resp NeedleReadResponse
-	if err := readMsgpack(conn, &resp); err != nil {
-		return nil, fmt.Errorf("remote rdma read response: %w", err)
+	addr := net.JoinHostPort(host, strconv.Itoa(int(port)))
+	if err := pooledRemoteConns.roundTrip(ctx, addr, req, &resp); err != nil {
+		return nil, fmt.Errorf("remote rdma request %s:%d: %w", host, port, err)
 	}
 	if !resp.Success {
 		if resp.Message != "" {
@@ -184,24 +176,10 @@ func WriteNeedleResult(ctx context.Context, volumeServer string, port uint16, re
 		port = DefaultRemotePort
 	}
 
-	dialer := &net.Dialer{Timeout: 30 * time.Second}
-	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(host, strconv.Itoa(int(port))))
-	if err != nil {
-		return nil, fmt.Errorf("remote rdma write connect %s:%d: %w", host, port, err)
-	}
-	defer conn.Close()
-
-	if deadline, ok := ctx.Deadline(); ok {
-		_ = conn.SetDeadline(deadline)
-	}
-
-	if err := writeMsgpack(conn, req); err != nil {
-		return nil, fmt.Errorf("remote rdma write request: %w", err)
-	}
-
 	var resp NeedleWriteResponse
-	if err := readMsgpack(conn, &resp); err != nil {
-		return nil, fmt.Errorf("remote rdma write response: %w", err)
+	addr := net.JoinHostPort(host, strconv.Itoa(int(port)))
+	if err := pooledRemoteConns.roundTrip(ctx, addr, req, &resp); err != nil {
+		return nil, fmt.Errorf("remote rdma write request %s:%d: %w", host, port, err)
 	}
 	if !resp.Success {
 		if resp.Message != "" {
@@ -224,6 +202,134 @@ func WriteNeedle(ctx context.Context, volumeServer string, port uint16, req *Nee
 		return "", err
 	}
 	return result.FileID, nil
+}
+
+type remoteConnectionPool struct {
+	mu         sync.Mutex
+	maxPerAddr int
+	conns      map[string]chan net.Conn
+}
+
+func defaultRemotePoolSize() int {
+	raw := strings.TrimSpace(os.Getenv("SEAWEEDFS_RDMA_REMOTE_POOL_SIZE"))
+	if raw == "" {
+		return defaultRemotePoolMaxPerAddr
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return defaultRemotePoolMaxPerAddr
+	}
+	return value
+}
+
+func newRemoteConnectionPool(maxPerAddr int) *remoteConnectionPool {
+	return &remoteConnectionPool{
+		maxPerAddr: maxPerAddr,
+		conns:      make(map[string]chan net.Conn),
+	}
+}
+
+func (p *remoteConnectionPool) roundTrip(ctx context.Context, addr string, req interface{}, resp interface{}) error {
+	for attempt := 0; attempt < 2; attempt++ {
+		conn, fromPool, err := p.acquire(ctx, addr)
+		if err != nil {
+			return err
+		}
+
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = conn.SetDeadline(deadline)
+		} else {
+			_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+		}
+
+		if err := writeMsgpack(conn, req); err != nil {
+			_ = conn.Close()
+			if fromPool && attempt == 0 {
+				continue
+			}
+			return fmt.Errorf("write request: %w", err)
+		}
+		if err := readMsgpack(conn, resp); err != nil {
+			_ = conn.Close()
+			return fmt.Errorf("read response: %w", err)
+		}
+
+		_ = conn.SetDeadline(time.Time{})
+		p.release(addr, conn)
+		return nil
+	}
+
+	return fmt.Errorf("remote rdma request failed after stale connection retry")
+}
+
+func (p *remoteConnectionPool) acquire(ctx context.Context, addr string) (net.Conn, bool, error) {
+	if p == nil || p.maxPerAddr <= 0 {
+		conn, err := dialRemote(ctx, addr)
+		return conn, false, err
+	}
+
+	ch := p.pool(addr)
+	select {
+	case conn := <-ch:
+		return conn, true, nil
+	default:
+		conn, err := dialRemote(ctx, addr)
+		return conn, false, err
+	}
+}
+
+func (p *remoteConnectionPool) release(addr string, conn net.Conn) {
+	if p == nil || p.maxPerAddr <= 0 {
+		_ = conn.Close()
+		return
+	}
+
+	ch := p.pool(addr)
+	select {
+	case ch <- conn:
+	default:
+		_ = conn.Close()
+	}
+}
+
+func (p *remoteConnectionPool) pool(addr string) chan net.Conn {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if ch, ok := p.conns[addr]; ok {
+		return ch
+	}
+	ch := make(chan net.Conn, p.maxPerAddr)
+	p.conns[addr] = ch
+	return ch
+}
+
+func (p *remoteConnectionPool) closeIdle() {
+	if p == nil {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	for addr, ch := range p.conns {
+	drain:
+		for {
+			select {
+			case conn := <-ch:
+				_ = conn.Close()
+			default:
+				break drain
+			}
+		}
+		delete(p.conns, addr)
+	}
+}
+
+func dialRemote(ctx context.Context, addr string) (net.Conn, error) {
+	dialer := &net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
+	conn, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("connect %s: %w", addr, err)
+	}
+	return conn, nil
 }
 
 // FetchWorkerAddress queries a remote sidecar for its UCX worker address.

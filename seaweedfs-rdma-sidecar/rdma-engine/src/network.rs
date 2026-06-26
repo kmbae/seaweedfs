@@ -207,158 +207,176 @@ async fn handle_connection(
     rdma_context: Arc<RdmaContext>,
     registered_buffers: Arc<RegisteredBufferPool>,
 ) -> RdmaResult<()> {
-    let raw = read_raw_message(&mut stream).await?;
-    let request: RemoteRequest =
-        rmp_serde::from_slice(&raw).map_err(|e| RdmaError::SerializationError {
-            reason: e.to_string(),
-        })?;
+    loop {
+        let raw = match read_raw_message(&mut stream).await {
+            Ok(raw) => raw,
+            Err(e) if is_clean_connection_close(&e) => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let request: RemoteRequest =
+            rmp_serde::from_slice(&raw).map_err(|e| RdmaError::SerializationError {
+                reason: e.to_string(),
+            })?;
 
-    match request {
-        RemoteRequest::Read(req) => {
-            debug!(
-                "Remote read: volume={} needle={} offset={} size={}",
-                req.volume_id, req.needle_id, req.offset, req.size
-            );
-            let resp =
-                match fetch_needle_data(volume_server_url, local_reader.as_deref(), &req).await {
-                    Ok((data, source)) => {
-                        match put_read_payload_rdma(&rdma_context, &registered_buffers, &req, &data)
-                            .await
-                        {
-                            Ok(true) => RemoteNeedleReadResponse {
-                                success: true,
-                                data: Vec::new(),
-                                size: data.len() as u64,
-                                transport: "rdma".to_string(),
-                                real_rdma: true,
-                                source,
-                                message: None,
-                            },
-                            Ok(false) => RemoteNeedleReadResponse {
-                                success: true,
-                                size: data.len() as u64,
-                                data,
-                                transport: default_transport(),
-                                real_rdma: false,
-                                source,
-                                message: None,
-                            },
-                            Err(e) => {
-                                warn!(
-                                    "RDMA read payload PUT failed, falling back to TCP payload: {}",
-                                    e
-                                );
-                                RemoteNeedleReadResponse {
+        match request {
+            RemoteRequest::Read(req) => {
+                debug!(
+                    "Remote read: volume={} needle={} offset={} size={}",
+                    req.volume_id, req.needle_id, req.offset, req.size
+                );
+                let resp =
+                    match fetch_needle_data(volume_server_url, local_reader.as_deref(), &req).await {
+                        Ok((data, source)) => {
+                            match put_read_payload_rdma(&rdma_context, &registered_buffers, &req, &data)
+                                .await
+                            {
+                                Ok(true) => RemoteNeedleReadResponse {
+                                    success: true,
+                                    data: Vec::new(),
+                                    size: data.len() as u64,
+                                    transport: "rdma".to_string(),
+                                    real_rdma: true,
+                                    source,
+                                    message: None,
+                                },
+                                Ok(false) => RemoteNeedleReadResponse {
                                     success: true,
                                     size: data.len() as u64,
                                     data,
                                     transport: default_transport(),
                                     real_rdma: false,
                                     source,
-                                    message: Some(e.to_string()),
+                                    message: None,
+                                },
+                                Err(e) => {
+                                    warn!(
+                                        "RDMA read payload PUT failed, falling back to TCP payload: {}",
+                                        e
+                                    );
+                                    RemoteNeedleReadResponse {
+                                        success: true,
+                                        size: data.len() as u64,
+                                        data,
+                                        transport: default_transport(),
+                                        real_rdma: false,
+                                        source,
+                                        message: Some(e.to_string()),
+                                    }
                                 }
                             }
                         }
+                        Err(e) => RemoteNeedleReadResponse {
+                            success: false,
+                            data: Vec::new(),
+                            size: 0,
+                            transport: default_transport(),
+                            real_rdma: false,
+                            source: String::new(),
+                            message: Some(e.to_string()),
+                        },
+                    };
+                write_message(&mut stream, &resp).await?;
+            }
+            RemoteRequest::Write(req) => {
+                debug!(
+                    "Remote write: volume={} needle={} data_len={}",
+                    req.volume_id,
+                    req.needle_id,
+                    req.data.len()
+                );
+                let resp = match resolve_write_payload(&rdma_context, &registered_buffers, &req).await {
+                    Ok((data, used_rdma)) => {
+                        match submit_needle(
+                            volume_server_url,
+                            volume_write_url,
+                            local_reader.as_deref(),
+                            &req,
+                            data,
+                        )
+                        .await
+                        {
+                            Ok((file_id, source)) => RemoteNeedleWriteResponse {
+                                success: true,
+                                file_id,
+                                transport: if used_rdma {
+                                    "rdma".to_string()
+                                } else {
+                                    default_transport()
+                                },
+                                real_rdma: used_rdma,
+                                source,
+                                message: None,
+                            },
+                            Err(e) => RemoteNeedleWriteResponse {
+                                success: false,
+                                file_id: String::new(),
+                                transport: if used_rdma {
+                                    "rdma".to_string()
+                                } else {
+                                    default_transport()
+                                },
+                                real_rdma: used_rdma,
+                                source: "volume-grpc".to_string(),
+                                message: Some(e.to_string()),
+                            },
+                        }
                     }
-                    Err(e) => RemoteNeedleReadResponse {
+                    Err(e) if !req.data.is_empty() => {
+                        warn!(
+                            "RDMA write payload GET failed, falling back to TCP payload: {}",
+                            e
+                        );
+                        match submit_needle(
+                            volume_server_url,
+                            volume_write_url,
+                            local_reader.as_deref(),
+                            &req,
+                            req.data.clone(),
+                        )
+                        .await
+                        {
+                            Ok((file_id, source)) => RemoteNeedleWriteResponse {
+                                success: true,
+                                file_id,
+                                transport: default_transport(),
+                                real_rdma: false,
+                                source,
+                                message: Some(e.to_string()),
+                            },
+                            Err(upload_err) => RemoteNeedleWriteResponse {
+                                success: false,
+                                file_id: String::new(),
+                                transport: default_transport(),
+                                real_rdma: false,
+                                source: "local-volume-http".to_string(),
+                                message: Some(upload_err.to_string()),
+                            },
+                        }
+                    }
+                    Err(e) => RemoteNeedleWriteResponse {
                         success: false,
-                        data: Vec::new(),
-                        size: 0,
+                        file_id: String::new(),
                         transport: default_transport(),
                         real_rdma: false,
                         source: String::new(),
                         message: Some(e.to_string()),
                     },
                 };
-            write_message(&mut stream, &resp).await
+                write_message(&mut stream, &resp).await?;
+            }
         }
-        RemoteRequest::Write(req) => {
-            debug!(
-                "Remote write: volume={} needle={} data_len={}",
-                req.volume_id,
-                req.needle_id,
-                req.data.len()
-            );
-            let resp = match resolve_write_payload(&rdma_context, &registered_buffers, &req).await {
-                Ok((data, used_rdma)) => {
-                    match submit_needle(
-                        volume_server_url,
-                        volume_write_url,
-                        local_reader.as_deref(),
-                        &req,
-                        data,
-                    )
-                    .await
-                    {
-                        Ok((file_id, source)) => RemoteNeedleWriteResponse {
-                            success: true,
-                            file_id,
-                            transport: if used_rdma {
-                                "rdma".to_string()
-                            } else {
-                                default_transport()
-                            },
-                            real_rdma: used_rdma,
-                            source,
-                            message: None,
-                        },
-                        Err(e) => RemoteNeedleWriteResponse {
-                            success: false,
-                            file_id: String::new(),
-                            transport: if used_rdma {
-                                "rdma".to_string()
-                            } else {
-                                default_transport()
-                            },
-                            real_rdma: used_rdma,
-                            source: "volume-grpc".to_string(),
-                            message: Some(e.to_string()),
-                        },
-                    }
-                }
-                Err(e) if !req.data.is_empty() => {
-                    warn!(
-                        "RDMA write payload GET failed, falling back to TCP payload: {}",
-                        e
-                    );
-                    match submit_needle(
-                        volume_server_url,
-                        volume_write_url,
-                        local_reader.as_deref(),
-                        &req,
-                        req.data.clone(),
-                    )
-                    .await
-                    {
-                        Ok((file_id, source)) => RemoteNeedleWriteResponse {
-                            success: true,
-                            file_id,
-                            transport: default_transport(),
-                            real_rdma: false,
-                            source,
-                            message: Some(e.to_string()),
-                        },
-                        Err(upload_err) => RemoteNeedleWriteResponse {
-                            success: false,
-                            file_id: String::new(),
-                            transport: default_transport(),
-                            real_rdma: false,
-                            source: "local-volume-http".to_string(),
-                            message: Some(upload_err.to_string()),
-                        },
-                    }
-                }
-                Err(e) => RemoteNeedleWriteResponse {
-                    success: false,
-                    file_id: String::new(),
-                    transport: default_transport(),
-                    real_rdma: false,
-                    source: String::new(),
-                    message: Some(e.to_string()),
-                },
-            };
-            write_message(&mut stream, &resp).await
+    }
+}
+
+fn is_clean_connection_close(err: &RdmaError) -> bool {
+    match err {
+        RdmaError::IpcError { reason } => {
+            reason.contains("early eof")
+                || reason.contains("unexpected end of file")
+                || reason.contains("connection reset")
+                || reason.contains("Connection reset")
         }
+        _ => false,
     }
 }
 
