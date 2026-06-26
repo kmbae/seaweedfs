@@ -112,8 +112,27 @@ func (b *Backend) Mkdir(ctx context.Context, fullPath string, mode, uid, gid uin
 	return AttrFromEntry(fullPath, entry), nil
 }
 
-func (b *Backend) DeleteFile(ctx context.Context, fullPath string, recursive bool) error {
-	return b.Store.DeleteEntry(ctx, cleanFullPath(fullPath), recursive)
+func (b *Backend) DeleteFile(ctx context.Context, fullPath string, isDir bool) error {
+	fullPath = cleanFullPath(fullPath)
+	entry, err := b.Store.LookupEntry(ctx, fullPath)
+	if err != nil {
+		return mapLookupErr(err)
+	}
+	if isDir {
+		if !entry.IsDirectory {
+			return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNotDir, Msg: "not a directory"}
+		}
+		entries, _, err := b.Store.ListEntries(ctx, fullPath, "", 1)
+		if err != nil {
+			return err
+		}
+		if len(entries) > 0 {
+			return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNotEmpty, Msg: "directory not empty"}
+		}
+	} else if entry.IsDirectory {
+		return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoIsDir, Msg: "is a directory"}
+	}
+	return b.Store.DeleteEntry(ctx, fullPath, false)
 }
 
 func (b *Backend) RenameEntry(ctx context.Context, oldPath, newPath string) error {
@@ -172,9 +191,9 @@ func (b *Backend) SetAttr(ctx context.Context, fullPath string, header swvfsprot
 	}
 	if header.Valid&swvfsproto.SetSize != 0 {
 		a.FileSize = header.Size
-		if header.Size == 0 {
-			entry.Chunks = nil
-			entry.Content = nil
+		entry.Chunks = trimChunksToSize(entry.GetChunks(), header.Size)
+		if uint64(len(entry.Content)) > header.Size {
+			entry.Content = entry.Content[:header.Size]
 		}
 	}
 	if header.Valid&swvfsproto.SetMTime != 0 {
@@ -231,6 +250,79 @@ func (b *Backend) StatFS(ctx context.Context, fullPath string) (*swvfsproto.Stat
 		Bsize:   statBlockSize,
 		Namelen: swvfsproto.NameMax,
 	}, nil
+}
+
+func (b *Backend) GetXAttr(ctx context.Context, fullPath, name string) ([]byte, error) {
+	if name == "" {
+		return nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoInval, Msg: "empty xattr name"}
+	}
+	entry, err := b.Store.LookupEntry(ctx, cleanFullPath(fullPath))
+	if err != nil {
+		return nil, mapLookupErr(err)
+	}
+	value, ok := entry.GetExtended()[name]
+	if !ok {
+		return nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoData, Msg: "xattr not found"}
+	}
+	return append([]byte(nil), value...), nil
+}
+
+func (b *Backend) ListXAttr(ctx context.Context, fullPath string) ([]byte, error) {
+	entry, err := b.Store.LookupEntry(ctx, cleanFullPath(fullPath))
+	if err != nil {
+		return nil, mapLookupErr(err)
+	}
+	if len(entry.GetExtended()) == 0 {
+		return nil, nil
+	}
+	names := make([]string, 0, len(entry.GetExtended()))
+	for name := range entry.GetExtended() {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var out []byte
+	for _, name := range names {
+		out = append(out, name...)
+		out = append(out, 0)
+	}
+	return out, nil
+}
+
+func (b *Backend) SetXAttr(ctx context.Context, fullPath, name string, value []byte, flags uint32, remove bool) error {
+	if name == "" {
+		return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoInval, Msg: "empty xattr name"}
+	}
+	fullPath = cleanFullPath(fullPath)
+	entry, err := b.Store.LookupEntry(ctx, fullPath)
+	if err != nil {
+		return mapLookupErr(err)
+	}
+	entry = proto.Clone(entry).(*filer_pb.Entry)
+	if entry.Extended == nil {
+		entry.Extended = map[string][]byte{}
+	}
+	_, exists := entry.Extended[name]
+	if remove {
+		if !exists {
+			return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoData, Msg: "xattr not found"}
+		}
+		delete(entry.Extended, name)
+	} else {
+		if flags&swvfsproto.XAttrCreate != 0 && exists {
+			return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoExist, Msg: "xattr exists"}
+		}
+		if flags&swvfsproto.XAttrReplace != 0 && !exists {
+			return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoData, Msg: "xattr not found"}
+		}
+		entry.Extended[name] = append([]byte(nil), value...)
+	}
+	if entry.Attributes == nil {
+		entry.Attributes = &filer_pb.FuseAttributes{}
+	}
+	now := time.Now()
+	entry.Attributes.Ctime = now.Unix()
+	entry.Attributes.CtimeNs = int32(now.Nanosecond())
+	return b.Store.SaveEntry(ctx, fullPath, entry)
 }
 
 func (b *Backend) ReadFile(ctx context.Context, fullPath string, offset, size uint64, preferRDMA bool) ([]byte, *swvfsproto.Attr, error) {
@@ -644,10 +736,10 @@ func entryFileSize(entry *filer_pb.Entry) uint64 {
 	if entry == nil {
 		return 0
 	}
-	var size uint64
-	if entry.Attributes != nil {
-		size = entry.Attributes.FileSize
+	if entry.Attributes != nil && entry.Attributes.FileSize > 0 {
+		return entry.Attributes.FileSize
 	}
+	var size uint64
 	for _, chunk := range entry.GetChunks() {
 		end := uint64(chunk.Offset + int64(chunk.Size))
 		if end > size {
@@ -660,6 +752,28 @@ func entryFileSize(entry *filer_pb.Entry) uint64 {
 		size = uint64(entry.RemoteEntry.RemoteSize)
 	}
 	return size
+}
+
+func trimChunksToSize(chunks []*filer_pb.FileChunk, size uint64) []*filer_pb.FileChunk {
+	if size == 0 || len(chunks) == 0 {
+		return nil
+	}
+	out := make([]*filer_pb.FileChunk, 0, len(chunks))
+	for _, chunk := range chunks {
+		if chunk == nil || chunk.Size == 0 {
+			continue
+		}
+		if chunk.Offset < 0 || uint64(chunk.Offset) >= size {
+			continue
+		}
+		next := proto.Clone(chunk).(*filer_pb.FileChunk)
+		end := uint64(next.Offset) + next.Size
+		if end > size {
+			next.Size = size - uint64(next.Offset)
+		}
+		out = append(out, next)
+	}
+	return out
 }
 
 func ParseFileID(fileID string) (volumeID uint32, needleID uint64, cookie uint32, err error) {

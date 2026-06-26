@@ -38,6 +38,12 @@ const (
 )
 
 const (
+	XAttrRemove  uint32 = 1 << 0
+	XAttrCreate  uint32 = 1
+	XAttrReplace uint32 = 2
+)
+
+const (
 	SetMode  uint32 = 1 << 0
 	SetUID   uint32 = 1 << 1
 	SetGID   uint32 = 1 << 2

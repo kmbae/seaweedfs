@@ -21,6 +21,15 @@ type fakeFileBackend struct {
 	mknodRdev       uint32
 }
 
+type fakeXAttrBackend struct {
+	fakeFileBackend
+	setPath   string
+	setName   string
+	setValue  []byte
+	setFlags  uint32
+	setRemove bool
+}
+
 func (f *fakeFileBackend) ReadFile(ctx context.Context, path string, offset, size uint64, preferRDMA bool) ([]byte, *swvfsproto.Attr, error) {
 	f.readPreferRDMA = preferRDMA
 	return []byte("data"), &swvfsproto.Attr{Ino: 1, Size: 4, Mode: 0100644, Nlink: 1}, nil
@@ -56,6 +65,26 @@ func (f *fakeFileBackend) Mknod(ctx context.Context, path string, mode, uid, gid
 	f.mknodMode = mode
 	f.mknodRdev = rdev
 	return &swvfsproto.Attr{Ino: 3, Mode: mode, UID: uid, GID: gid, Rdev: rdev, Nlink: 1}, nil
+}
+
+func (f *fakeXAttrBackend) GetXAttr(ctx context.Context, path, name string) ([]byte, error) {
+	if name == "user.exists" {
+		return []byte("value"), nil
+	}
+	return nil, ErrnoError{Errno: ErrnoNoData, Msg: "xattr not found"}
+}
+
+func (f *fakeXAttrBackend) ListXAttr(ctx context.Context, path string) ([]byte, error) {
+	return []byte("user.exists\x00"), nil
+}
+
+func (f *fakeXAttrBackend) SetXAttr(ctx context.Context, path, name string, value []byte, flags uint32, remove bool) error {
+	f.setPath = path
+	f.setName = name
+	f.setValue = append([]byte(nil), value...)
+	f.setFlags = flags
+	f.setRemove = remove
+	return nil
 }
 
 func TestHandlerPassesReadHint(t *testing.T) {
@@ -191,5 +220,58 @@ func TestHandlerXAttrDefaults(t *testing.T) {
 	var errno ErrnoError
 	if !errors.As(err, &errno) || errno.Errno != ErrnoNoData {
 		t.Fatalf("expected ENODATA, got %v", err)
+	}
+}
+
+func TestHandlerXAttrDelegatesToBackend(t *testing.T) {
+	backend := &fakeXAttrBackend{}
+	h := &Handler{Backend: backend}
+
+	reply, err := h.Handle(context.Background(), &swvfsproto.Request{
+		Header: swvfsproto.RequestHeader{Tag: 1, Op: swvfsproto.OpListXAttr},
+		Path1:  "/file",
+	})
+	if err != nil {
+		t.Fatalf("LISTXATTR Handle: %v", err)
+	}
+	if string(reply.Data) != "user.exists\x00" {
+		t.Fatalf("LISTXATTR data = %q", reply.Data)
+	}
+
+	reply, err = h.Handle(context.Background(), &swvfsproto.Request{
+		Header: swvfsproto.RequestHeader{Tag: 2, Op: swvfsproto.OpGetXAttr},
+		Path1:  "/file",
+		Path2:  "user.exists",
+	})
+	if err != nil {
+		t.Fatalf("GETXATTR Handle: %v", err)
+	}
+	if string(reply.Data) != "value" {
+		t.Fatalf("GETXATTR data = %q", reply.Data)
+	}
+
+	_, err = h.Handle(context.Background(), &swvfsproto.Request{
+		Header: swvfsproto.RequestHeader{Tag: 3, Op: swvfsproto.OpSetXAttr, Mode: swvfsproto.XAttrCreate},
+		Path1:  "/file",
+		Path2:  "user.exists",
+		Data:   []byte("new"),
+	})
+	if err != nil {
+		t.Fatalf("SETXATTR Handle: %v", err)
+	}
+	if backend.setPath != "/file" || backend.setName != "user.exists" || string(backend.setValue) != "new" || backend.setFlags != swvfsproto.XAttrCreate || backend.setRemove {
+		t.Fatalf("SETXATTR not delegated: %+v", backend)
+	}
+
+	_, err = h.Handle(context.Background(), &swvfsproto.Request{
+		Header: swvfsproto.RequestHeader{Tag: 4, Op: swvfsproto.OpSetXAttr, Valid: swvfsproto.XAttrRemove},
+		Path1:  "/file",
+		Path2:  "user.exists",
+	})
+	if err != nil {
+		t.Fatalf("REMOVEXATTR Handle: %v", err)
+	}
+	if !backend.setRemove {
+		t.Fatal("REMOVEXATTR remove flag was not delegated")
 	}
 }

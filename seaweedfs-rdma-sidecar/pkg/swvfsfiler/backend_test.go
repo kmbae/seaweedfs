@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"path"
+	"sort"
 	"syscall"
 	"testing"
 
@@ -33,9 +34,17 @@ func (s *fakeStore) LookupEntry(ctx context.Context, fullPath string) (*filer_pb
 
 func (s *fakeStore) ListEntries(ctx context.Context, dir string, start string, limit uint32) ([]*filer_pb.Entry, bool, error) {
 	var entries []*filer_pb.Entry
-	for _, entry := range s.entries {
+	dir = cleanFullPath(dir)
+	for fullPath, entry := range s.entries {
+		parent, name := splitFullPath(fullPath)
+		if parent != dir || name == "" {
+			continue
+		}
 		entries = append(entries, entry)
 	}
+	sort.Slice(entries, func(i, j int) bool {
+		return entries[i].Name < entries[j].Name
+	})
 	if len(entries) > int(limit) {
 		return entries[:limit], false, nil
 	}
@@ -229,6 +238,71 @@ func TestBackendSetAttrUpdatesTimesAndSize(t *testing.T) {
 	}
 }
 
+func TestBackendSetAttrTrimsChunksOnPartialTruncate(t *testing.T) {
+	store := &fakeStore{entries: map[string]*filer_pb.Entry{
+		"/file": {
+			Name:       "file",
+			Attributes: &filer_pb.FuseAttributes{FileMode: 0644, FileSize: 20},
+			Chunks: []*filer_pb.FileChunk{
+				{FileId: "3,aaa", Offset: 0, Size: 10},
+				{FileId: "3,bbb", Offset: 10, Size: 10},
+				{FileId: "3,ccc", Offset: 20, Size: 10},
+			},
+		},
+	}}
+	backend := &Backend{Store: store}
+	attr, err := backend.SetAttr(context.Background(), "/file", swvfsproto.RequestHeader{
+		Valid: swvfsproto.SetSize,
+		Size:  12,
+	})
+	if err != nil {
+		t.Fatalf("SetAttr: %v", err)
+	}
+	entry := store.entries["/file"]
+	if attr.Size != 12 || entryFileSize(entry) != 12 || entry.Attributes.GetFileSize() != 12 {
+		t.Fatalf("size mismatch: attr=%d entry=%d stored=%d", attr.Size, entryFileSize(entry), entry.Attributes.GetFileSize())
+	}
+	if len(entry.Chunks) != 2 || entry.Chunks[0].Size != 10 || entry.Chunks[1].Offset != 10 || entry.Chunks[1].Size != 2 {
+		t.Fatalf("chunks not trimmed: %+v", entry.Chunks)
+	}
+}
+
+func TestBackendDeleteFileEnforcesPOSIXDirectoryRules(t *testing.T) {
+	store := &fakeStore{entries: map[string]*filer_pb.Entry{
+		"/dir":       {Name: "dir", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{FileMode: uint32(os.ModeDir | 0755)}},
+		"/dir/child": {Name: "child", Attributes: &filer_pb.FuseAttributes{FileMode: 0644}},
+		"/file":      {Name: "file", Attributes: &filer_pb.FuseAttributes{FileMode: 0644}},
+	}}
+	backend := &Backend{Store: store}
+
+	err := backend.DeleteFile(context.Background(), "/dir", true)
+	var errno swvfsdaemon.ErrnoError
+	if !errors.As(err, &errno) || errno.Errno != swvfsdaemon.ErrnoNotEmpty {
+		t.Fatalf("expected ENOTEMPTY, got %v", err)
+	}
+	if store.entries["/dir"] == nil {
+		t.Fatal("non-empty directory was deleted")
+	}
+
+	err = backend.DeleteFile(context.Background(), "/file", true)
+	if !errors.As(err, &errno) || errno.Errno != swvfsdaemon.ErrnoNotDir {
+		t.Fatalf("expected ENOTDIR, got %v", err)
+	}
+
+	err = backend.DeleteFile(context.Background(), "/dir", false)
+	if !errors.As(err, &errno) || errno.Errno != swvfsdaemon.ErrnoIsDir {
+		t.Fatalf("expected EISDIR, got %v", err)
+	}
+
+	delete(store.entries, "/dir/child")
+	if err := backend.DeleteFile(context.Background(), "/dir", true); err != nil {
+		t.Fatalf("empty rmdir: %v", err)
+	}
+	if store.entries["/dir"] != nil {
+		t.Fatal("empty directory was not deleted")
+	}
+}
+
 func TestBackendSymlinkAndReadLink(t *testing.T) {
 	store := &fakeStore{entries: map[string]*filer_pb.Entry{}}
 	backend := &Backend{Store: store}
@@ -279,6 +353,54 @@ func TestBackendMknodStoresSpecialMode(t *testing.T) {
 	}
 	if store.entries["/fifo"].Attributes == nil || os.FileMode(store.entries["/fifo"].Attributes.FileMode)&os.ModeNamedPipe == 0 {
 		t.Fatalf("stored mode is not named pipe: %#o", store.entries["/fifo"].Attributes.GetFileMode())
+	}
+}
+
+func TestBackendXAttrLifecycle(t *testing.T) {
+	store := &fakeStore{entries: map[string]*filer_pb.Entry{
+		"/file": {Name: "file", Attributes: &filer_pb.FuseAttributes{FileMode: 0644}},
+	}}
+	backend := &Backend{Store: store}
+	ctx := context.Background()
+
+	if err := backend.SetXAttr(ctx, "/file", "user.alpha", []byte("one"), swvfsproto.XAttrCreate, false); err != nil {
+		t.Fatalf("set create xattr: %v", err)
+	}
+	value, err := backend.GetXAttr(ctx, "/file", "user.alpha")
+	if err != nil {
+		t.Fatalf("get xattr: %v", err)
+	}
+	if string(value) != "one" {
+		t.Fatalf("xattr value = %q", value)
+	}
+	list, err := backend.ListXAttr(ctx, "/file")
+	if err != nil {
+		t.Fatalf("list xattr: %v", err)
+	}
+	if string(list) != "user.alpha\x00" {
+		t.Fatalf("xattr list = %q", list)
+	}
+
+	err = backend.SetXAttr(ctx, "/file", "user.alpha", []byte("again"), swvfsproto.XAttrCreate, false)
+	var errno swvfsdaemon.ErrnoError
+	if !errors.As(err, &errno) || errno.Errno != swvfsdaemon.ErrnoExist {
+		t.Fatalf("expected EEXIST, got %v", err)
+	}
+
+	if err := backend.SetXAttr(ctx, "/file", "user.alpha", []byte("two"), swvfsproto.XAttrReplace, false); err != nil {
+		t.Fatalf("replace xattr: %v", err)
+	}
+	value, err = backend.GetXAttr(ctx, "/file", "user.alpha")
+	if err != nil || string(value) != "two" {
+		t.Fatalf("replaced xattr = %q err=%v", value, err)
+	}
+
+	if err := backend.SetXAttr(ctx, "/file", "user.alpha", nil, 0, true); err != nil {
+		t.Fatalf("remove xattr: %v", err)
+	}
+	_, err = backend.GetXAttr(ctx, "/file", "user.alpha")
+	if !errors.As(err, &errno) || errno.Errno != swvfsdaemon.ErrnoNoData {
+		t.Fatalf("expected ENODATA after remove, got %v", err)
 	}
 }
 

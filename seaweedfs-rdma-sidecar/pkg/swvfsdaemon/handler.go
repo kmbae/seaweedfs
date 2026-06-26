@@ -15,6 +15,10 @@ const (
 	ErrnoInval    int32 = -22
 	ErrnoNoData   int32 = -61
 	ErrnoTooLarge int32 = -7
+	ErrnoExist    int32 = -17
+	ErrnoNotDir   int32 = -20
+	ErrnoIsDir    int32 = -21
+	ErrnoNotEmpty int32 = -39
 )
 
 type ErrnoError struct {
@@ -45,6 +49,9 @@ type MetadataBackend interface {
 	ReadLink(ctx context.Context, linkPath string) ([]byte, error)
 	Mknod(ctx context.Context, path string, mode, uid, gid, rdev uint32) (*swvfsproto.Attr, error)
 	SetAttr(ctx context.Context, path string, header swvfsproto.RequestHeader) (*swvfsproto.Attr, error)
+	GetXAttr(ctx context.Context, path, name string) ([]byte, error)
+	SetXAttr(ctx context.Context, path, name string, value []byte, flags uint32, remove bool) error
+	ListXAttr(ctx context.Context, path string) ([]byte, error)
 	StatFS(ctx context.Context, path string) (*swvfsproto.StatFS, error)
 }
 
@@ -248,10 +255,39 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 		}
 		return &swvfsproto.Reply{Tag: req.Header.Tag, Data: swvfsproto.EncodeStatFS(*stat)}, nil
 	case swvfsproto.OpListXAttr:
-		return &swvfsproto.Reply{Tag: req.Header.Tag}, nil
+		backend, ok := h.Backend.(interface {
+			ListXAttr(context.Context, string) ([]byte, error)
+		})
+		if !ok {
+			return &swvfsproto.Reply{Tag: req.Header.Tag}, nil
+		}
+		data, err := backend.ListXAttr(ctx, req.Path1)
+		if err != nil {
+			return nil, err
+		}
+		return &swvfsproto.Reply{Tag: req.Header.Tag, Data: data}, nil
 	case swvfsproto.OpGetXAttr:
-		return nil, ErrnoError{Errno: ErrnoNoData, Msg: "xattr not found"}
+		backend, ok := h.Backend.(interface {
+			GetXAttr(context.Context, string, string) ([]byte, error)
+		})
+		if !ok {
+			return nil, ErrnoError{Errno: ErrnoNoData, Msg: "xattr not found"}
+		}
+		data, err := backend.GetXAttr(ctx, req.Path1, req.Path2)
+		if err != nil {
+			return nil, err
+		}
+		return &swvfsproto.Reply{Tag: req.Header.Tag, Data: data}, nil
 	case swvfsproto.OpSetXAttr:
+		backend, ok := h.Backend.(interface {
+			SetXAttr(context.Context, string, string, []byte, uint32, bool) error
+		})
+		if !ok {
+			return &swvfsproto.Reply{Tag: req.Header.Tag}, nil
+		}
+		if err := backend.SetXAttr(ctx, req.Path1, req.Path2, req.Data, req.Header.Mode, req.Header.Valid&swvfsproto.XAttrRemove != 0); err != nil {
+			return nil, err
+		}
 		return &swvfsproto.Reply{Tag: req.Header.Tag}, nil
 	default:
 		return nil, ErrnoError{Errno: ErrnoNoSys, Msg: fmt.Sprintf("swvfs op %d not implemented by RDMA daemon", req.Header.Op)}
