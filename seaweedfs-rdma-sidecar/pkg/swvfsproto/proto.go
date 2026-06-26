@@ -57,7 +57,7 @@ const (
 	NameMax    = 255
 	NameBuf    = 256
 	MaxDirents = 32
-	MaxWrite   = 1 << 20
+	MaxWrite   = 8 << 20
 
 	RequestHeaderSize = 88
 	AttrSize          = 72
