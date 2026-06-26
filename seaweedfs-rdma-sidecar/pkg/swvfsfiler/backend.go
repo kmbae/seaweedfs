@@ -59,7 +59,7 @@ func (b *Backend) LookupFile(ctx context.Context, fullPath string) (*swvfsproto.
 		if isLookupNotFound(err) {
 			listedEntry, ok, listErr := b.lookupFileFromDirectory(ctx, fullPath)
 			if listErr == nil && ok {
-				return AttrFromEntry(fullPath, listedEntry), nil
+				return b.attrFromEntry(ctx, fullPath, listedEntry)
 			}
 			if listErr != nil && !isLookupNotFound(listErr) {
 				return nil, listErr
@@ -67,7 +67,7 @@ func (b *Backend) LookupFile(ctx context.Context, fullPath string) (*swvfsproto.
 		}
 		return nil, mapLookupErr(err)
 	}
-	return AttrFromEntry(fullPath, entry), nil
+	return b.attrFromEntry(ctx, fullPath, entry)
 }
 
 func (b *Backend) lookupFileFromDirectory(ctx context.Context, fullPath string) (*filer_pb.Entry, bool, error) {
@@ -126,8 +126,12 @@ func (b *Backend) ReadDir(ctx context.Context, fullPath string, offset uint64, l
 			continue
 		}
 		entryPath := path.Join(fullPath, entry.Name)
+		attr, err := b.attrFromEntry(ctx, entryPath, entry)
+		if err != nil {
+			return nil, false, err
+		}
 		dirents = append(dirents, swvfsproto.Dirent{
-			Attr: *AttrFromEntry(entryPath, entry),
+			Attr: *attr,
 			Type: direntType(entry),
 			Name: entry.Name,
 		})
@@ -188,6 +192,32 @@ func (b *Backend) DeleteFile(ctx context.Context, fullPath string, isDir bool) e
 func (b *Backend) RenameEntry(ctx context.Context, oldPath, newPath string) error {
 	oldPath = cleanFullPath(oldPath)
 	newPath = cleanFullPath(newPath)
+	if oldPath == newPath {
+		_, err := b.Store.LookupEntry(ctx, oldPath)
+		return mapLookupErr(err)
+	}
+	oldEntry, err := b.Store.LookupEntry(ctx, oldPath)
+	if err != nil {
+		return mapLookupErr(err)
+	}
+	if target, err := b.Store.LookupEntry(ctx, newPath); err == nil {
+		switch {
+		case oldEntry.IsDirectory && !target.IsDirectory:
+			return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNotDir, Msg: "target is not a directory"}
+		case !oldEntry.IsDirectory && target.IsDirectory:
+			return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoIsDir, Msg: "target is a directory"}
+		case oldEntry.IsDirectory && target.IsDirectory:
+			entries, _, err := b.Store.ListEntries(ctx, newPath, "", 1)
+			if err != nil {
+				return err
+			}
+			if len(entries) > 0 {
+				return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNotEmpty, Msg: "target directory not empty"}
+			}
+		}
+	} else if !isLookupNotFound(err) {
+		return mapLookupErr(err)
+	}
 	if err := b.Store.RenameEntry(ctx, oldPath, newPath); err != nil {
 		return err
 	}
@@ -625,7 +655,7 @@ func AttrFromEntry(fullPath string, entry *filer_pb.Entry) *swvfsproto.Attr {
 			attr.Ino = a.Inode
 		}
 		perm := a.FileMode
-		if perm == 0 {
+		if perm == 0 && a.Inode == 0 {
 			perm = attr.Mode & 07777
 		}
 		attr.Mode = linuxModeFromFuseAttributes(entry, a, perm)
@@ -657,6 +687,45 @@ func AttrFromEntry(fullPath string, entry *filer_pb.Entry) *swvfsproto.Attr {
 	return attr
 }
 
+func (b *Backend) attrFromEntry(ctx context.Context, fullPath string, entry *filer_pb.Entry) (*swvfsproto.Attr, error) {
+	attr := AttrFromEntry(fullPath, entry)
+	if entry != nil && entry.IsDirectory {
+		nlink, err := b.directoryLinkCount(ctx, fullPath)
+		if err != nil {
+			return nil, err
+		}
+		attr.Nlink = nlink
+	}
+	return attr, nil
+}
+
+func (b *Backend) directoryLinkCount(ctx context.Context, fullPath string) (uint32, error) {
+	var childDirs uint32
+	start := ""
+	for {
+		entries, eof, err := b.Store.ListEntries(ctx, fullPath, start, swvfsproto.MaxDirents)
+		if err != nil {
+			return 0, err
+		}
+		if len(entries) == 0 {
+			return 2 + childDirs, nil
+		}
+		for _, entry := range entries {
+			if entry != nil && entry.IsDirectory {
+				childDirs++
+			}
+		}
+		if eof {
+			return 2 + childDirs, nil
+		}
+		last := entries[len(entries)-1]
+		if last == nil || last.Name == "" {
+			return 2 + childDirs, nil
+		}
+		start = last.Name
+	}
+}
+
 func rootAttr() *swvfsproto.Attr {
 	now := time.Now()
 	return &swvfsproto.Attr{
@@ -682,6 +751,8 @@ func newEntry(fullPath string, isDir bool, mode, uid, gid uint32) *filer_pb.Entr
 			FileMode: linuxModeToFileMode(mode, isDir),
 			Uid:      uid,
 			Gid:      gid,
+			Atime:    now.Unix(),
+			AtimeNs:  int32(now.Nanosecond()),
 			Mtime:    now.Unix(),
 			MtimeNs:  int32(now.Nanosecond()),
 			Ctime:    now.Unix(),
@@ -702,6 +773,8 @@ func newSymlinkEntry(fullPath, target string, uid, gid uint32) *filer_pb.Entry {
 			Uid:           uid,
 			Gid:           gid,
 			FileSize:      uint64(len(target)),
+			Atime:         now.Unix(),
+			AtimeNs:       int32(now.Nanosecond()),
 			Mtime:         now.Unix(),
 			MtimeNs:       int32(now.Nanosecond()),
 			Ctime:         now.Unix(),
@@ -723,6 +796,8 @@ func newSpecialEntry(fullPath string, mode, uid, gid, rdev uint32) *filer_pb.Ent
 			Uid:      uid,
 			Gid:      gid,
 			Rdev:     rdev,
+			Atime:    now.Unix(),
+			AtimeNs:  int32(now.Nanosecond()),
 			Mtime:    now.Unix(),
 			MtimeNs:  int32(now.Nanosecond()),
 			Ctime:    now.Unix(),

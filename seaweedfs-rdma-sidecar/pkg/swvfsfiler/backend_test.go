@@ -260,6 +260,54 @@ func TestBackendCreateFileTouchesParentTimes(t *testing.T) {
 	}
 }
 
+func TestAttrFromEntryPreservesZeroModeForNewEntry(t *testing.T) {
+	entry := newEntry("/zero", false, uint32(syscall.S_IFREG), 1000, 1000)
+	attr := AttrFromEntry("/zero", entry)
+	if attr.Mode&uint32(syscall.S_IFMT) != uint32(syscall.S_IFREG) {
+		t.Fatalf("attr mode is not regular: %#o", attr.Mode)
+	}
+	if attr.Mode&0777 != 0 {
+		t.Fatalf("zero permissions were not preserved: %#o", attr.Mode)
+	}
+
+	legacy := &filer_pb.Entry{Name: "legacy", Attributes: &filer_pb.FuseAttributes{}}
+	legacyAttr := AttrFromEntry("/legacy", legacy)
+	if legacyAttr.Mode&0777 != 0644 {
+		t.Fatalf("legacy empty file mode did not fall back to 0644: %#o", legacyAttr.Mode)
+	}
+}
+
+func TestNewEntriesSetAccessTime(t *testing.T) {
+	entries := []*filer_pb.Entry{
+		newEntry("/file", false, uint32(syscall.S_IFREG|0644), 1000, 1000),
+		newEntry("/dir", true, uint32(syscall.S_IFDIR|0755), 1000, 1000),
+		newSymlinkEntry("/link", "target", 1000, 1000),
+		newSpecialEntry("/fifo", uint32(syscall.S_IFIFO|0644), 1000, 1000, 0),
+	}
+	for _, entry := range entries {
+		if entry.Attributes == nil || entry.Attributes.GetAtime() == 0 {
+			t.Fatalf("%s access time was not initialized: %+v", entry.GetName(), entry.GetAttributes())
+		}
+	}
+}
+
+func TestBackendLookupDirectoryNlinkCountsImmediateChildDirectories(t *testing.T) {
+	store := &fakeStore{entries: map[string]*filer_pb.Entry{
+		"/dir":            {Name: "dir", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{FileMode: uint32(os.ModeDir | 0755)}},
+		"/dir/file":       {Name: "file", Attributes: &filer_pb.FuseAttributes{FileMode: 0644}},
+		"/dir/sub":        {Name: "sub", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{FileMode: uint32(os.ModeDir | 0755)}},
+		"/dir/sub/nested": {Name: "nested", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{FileMode: uint32(os.ModeDir | 0755)}},
+	}}
+	backend := &Backend{Store: store}
+	attr, err := backend.LookupFile(context.Background(), "/dir")
+	if err != nil {
+		t.Fatalf("LookupFile: %v", err)
+	}
+	if attr.Nlink != 3 {
+		t.Fatalf("directory nlink = %d, want 3", attr.Nlink)
+	}
+}
+
 func TestNewEntriesDoNotReusePathHashInode(t *testing.T) {
 	file := newEntry("/same/path", false, uint32(syscall.S_IFREG|0644), 1000, 1000)
 	time.Sleep(time.Nanosecond)
@@ -416,6 +464,23 @@ func TestBackendRenameEntry(t *testing.T) {
 	}
 	if store.entries["/dir/new"].Name != "new" {
 		t.Fatalf("new entry name = %q", store.entries["/dir/new"].Name)
+	}
+}
+
+func TestBackendRenameEntryRejectsNonEmptyTargetDirectory(t *testing.T) {
+	store := &fakeStore{entries: map[string]*filer_pb.Entry{
+		"/old":          {Name: "old", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{FileMode: uint32(os.ModeDir | 0755)}},
+		"/target":       {Name: "target", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{FileMode: uint32(os.ModeDir | 0755)}},
+		"/target/child": {Name: "child", Attributes: &filer_pb.FuseAttributes{FileMode: 0644}},
+	}}
+	backend := &Backend{Store: store}
+	err := backend.RenameEntry(context.Background(), "/old", "/target")
+	var errno swvfsdaemon.ErrnoError
+	if !errors.As(err, &errno) || errno.Errno != swvfsdaemon.ErrnoNotEmpty {
+		t.Fatalf("expected ENOTEMPTY, got %v", err)
+	}
+	if store.entries["/old"] == nil || store.entries["/target"] == nil || store.entries["/target/child"] == nil {
+		t.Fatalf("rename changed entries despite failure: %+v", store.entries)
 	}
 }
 
