@@ -442,7 +442,7 @@ func (c *Client) StartWrite(ctx context.Context, req *StartWriteRequest) (*Start
 	if req != nil && len(req.Data) >= SidebandMinSize {
 		reqCopy := *req
 		sideband = req.Data
-		reqCopy.Data = nil
+		reqCopy.Data = []byte{}
 		reqCopy.Size = uint64(len(sideband))
 		reqCopy.DataSideband = true
 		msgReq = &reqCopy

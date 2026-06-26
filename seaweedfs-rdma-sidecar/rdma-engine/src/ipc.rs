@@ -23,6 +23,69 @@ pub const MAX_IPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 /// large byte arrays in MessagePack.
 pub const SIDEBAND_MIN_SIZE: usize = 64 * 1024;
 
+fn deserialize_bytes_or_empty<'de, D>(deserializer: D) -> Result<Vec<u8>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct BytesOrEmptyVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for BytesOrEmptyVisitor {
+        type Value = Vec<u8>;
+
+        fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+            formatter.write_str("nil or byte array")
+        }
+
+        fn visit_unit<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Vec::new())
+        }
+
+        fn visit_none<E>(self) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(Vec::new())
+        }
+
+        fn visit_some<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+        where
+            D: serde::Deserializer<'de>,
+        {
+            deserialize_bytes_or_empty(deserializer)
+        }
+
+        fn visit_bytes<E>(self, value: &[u8]) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value.to_vec())
+        }
+
+        fn visit_byte_buf<E>(self, value: Vec<u8>) -> Result<Self::Value, E>
+        where
+            E: serde::de::Error,
+        {
+            Ok(value)
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut bytes = Vec::new();
+            while let Some(byte) = seq.next_element::<u8>()? {
+                bytes.push(byte);
+            }
+            Ok(bytes)
+        }
+    }
+
+    deserializer.deserialize_any(BytesOrEmptyVisitor)
+}
+
 /// Atomic counter for generating unique work request IDs
 /// This ensures no hash collisions that could cause incorrect completion handling
 static NEXT_WR_ID: AtomicU64 = AtomicU64::new(1);
@@ -153,7 +216,7 @@ pub struct StartWriteRequest {
     pub needle_id: u64,
     pub cookie: u32,
     pub size: u64,
-    #[serde(with = "serde_bytes")]
+    #[serde(default, serialize_with = "serde_bytes::serialize", deserialize_with = "deserialize_bytes_or_empty")]
     pub data: Vec<u8>,
     #[serde(default)]
     pub data_sideband: bool,
@@ -805,6 +868,51 @@ mod tests {
             IpcMessage::Ping(ping) => {
                 assert_eq!(ping.timestamp_ns, 12345);
                 assert_eq!(ping.client_id, Some("test".to_string()));
+            }
+            _ => panic!("Wrong message type"),
+        }
+    }
+
+    #[test]
+    fn test_start_write_accepts_nil_data_for_sideband() {
+        #[derive(Serialize)]
+        #[serde(tag = "type", content = "data")]
+        enum WireMessage<'a> {
+            StartWrite(WireStartWriteRequest<'a>),
+        }
+
+        #[derive(Serialize)]
+        struct WireStartWriteRequest<'a> {
+            volume_id: u32,
+            needle_id: u64,
+            cookie: u32,
+            size: u64,
+            data: Option<&'a [u8]>,
+            data_sideband: bool,
+            timeout_secs: u64,
+            auth_token: Option<String>,
+        }
+
+        let request = WireMessage::StartWrite(WireStartWriteRequest {
+            volume_id: 1,
+            needle_id: 2,
+            cookie: 3,
+            size: SIDEBAND_MIN_SIZE as u64,
+            data: None,
+            data_sideband: true,
+            timeout_secs: 30,
+            auth_token: None,
+        });
+
+        let serialized = rmp_serde::to_vec(&request).unwrap();
+        let deserialized: IpcMessage = rmp_serde::from_slice(&serialized).unwrap();
+
+        match deserialized {
+            IpcMessage::StartWrite(write) => {
+                assert_eq!(write.volume_id, 1);
+                assert_eq!(write.needle_id, 2);
+                assert!(write.data_sideband);
+                assert!(write.data.is_empty());
             }
             _ => panic!("Wrong message type"),
         }
