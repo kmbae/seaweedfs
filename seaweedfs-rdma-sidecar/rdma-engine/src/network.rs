@@ -6,7 +6,7 @@
 
 use crate::{
     buffer_pool::RegisteredBufferPool, ipc::MAX_IPC_MESSAGE_SIZE, local_volume::LocalVolumeReader,
-    rdma::RdmaContext, RdmaEngineConfig, RdmaError, RdmaResult,
+    rdma::RdmaContext, volume_grpc, RdmaEngineConfig, RdmaError, RdmaResult,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::header::{CONTENT_RANGE, RANGE};
@@ -23,7 +23,7 @@ use tracing::{debug, error, info, warn};
 static NEXT_NETWORK_WR_ID: AtomicU64 = AtomicU64::new(1_000_000);
 
 /// Format SeaweedFS file id: `{volume_id},{needle_id+cookie hex}` (matches Go needle.FileId).
-fn format_seaweed_file_id(volume_id: u32, needle_id: u64, cookie: u32) -> String {
+pub(crate) fn format_seaweed_file_id(volume_id: u32, needle_id: u64, cookie: u32) -> String {
     let mut bytes = [0u8; 12];
     bytes[0..8].copy_from_slice(&needle_id.to_be_bytes());
     bytes[8..12].copy_from_slice(&cookie.to_be_bytes());
@@ -134,6 +134,7 @@ pub struct WorkerAddressExchange {
 pub struct NetworkServer {
     listen_addr: SocketAddr,
     volume_server_url: String,
+    volume_write_url: String,
     rdma_context: Arc<RdmaContext>,
     local_reader: Option<Arc<LocalVolumeReader>>,
     registered_buffers: Arc<RegisteredBufferPool>,
@@ -144,10 +145,15 @@ impl NetworkServer {
         let listen_addr = SocketAddr::from(([0, 0, 0, 0], config.port));
         let volume_server_url = std::env::var("VOLUME_SERVER_URL")
             .unwrap_or_else(|_| "http://127.0.0.1:8444".to_string());
+        let volume_write_url = std::env::var("VOLUME_SERVER_GRPC_URL")
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| volume_server_url.clone());
         let local_reader = LocalVolumeReader::from_env().map(Arc::new);
         Self {
             listen_addr,
             volume_server_url,
+            volume_write_url,
             rdma_context,
             local_reader,
             registered_buffers: Arc::new(RegisteredBufferPool::from_env()),
@@ -165,6 +171,7 @@ impl NetworkServer {
                 Ok((stream, peer)) => {
                     debug!("Accepted remote read connection from {}", peer);
                     let url = self.volume_server_url.clone();
+                    let write_url = self.volume_write_url.clone();
                     let rdma_context = self.rdma_context.clone();
                     let local_reader = self.local_reader.clone();
                     let registered_buffers = self.registered_buffers.clone();
@@ -172,6 +179,7 @@ impl NetworkServer {
                         if let Err(e) = handle_connection(
                             stream,
                             &url,
+                            &write_url,
                             local_reader,
                             rdma_context,
                             registered_buffers,
@@ -194,6 +202,7 @@ impl NetworkServer {
 async fn handle_connection(
     mut stream: TcpStream,
     volume_server_url: &str,
+    volume_write_url: &str,
     local_reader: Option<Arc<LocalVolumeReader>>,
     rdma_context: Arc<RdmaContext>,
     registered_buffers: Arc<RegisteredBufferPool>,
@@ -272,8 +281,16 @@ async fn handle_connection(
             );
             let resp = match resolve_write_payload(&rdma_context, &registered_buffers, &req).await {
                 Ok((data, used_rdma)) => {
-                    match submit_needle_http(volume_server_url, &req, data).await {
-                        Ok(file_id) => RemoteNeedleWriteResponse {
+                    match submit_needle(
+                        volume_server_url,
+                        volume_write_url,
+                        local_reader.as_deref(),
+                        &req,
+                        data,
+                    )
+                    .await
+                    {
+                        Ok((file_id, source)) => RemoteNeedleWriteResponse {
                             success: true,
                             file_id,
                             transport: if used_rdma {
@@ -282,7 +299,7 @@ async fn handle_connection(
                                 default_transport()
                             },
                             real_rdma: used_rdma,
-                            source: "local-volume-http".to_string(),
+                            source,
                             message: None,
                         },
                         Err(e) => RemoteNeedleWriteResponse {
@@ -294,7 +311,7 @@ async fn handle_connection(
                                 default_transport()
                             },
                             real_rdma: used_rdma,
-                            source: "local-volume-http".to_string(),
+                            source: "volume-grpc".to_string(),
                             message: Some(e.to_string()),
                         },
                     }
@@ -304,13 +321,21 @@ async fn handle_connection(
                         "RDMA write payload GET failed, falling back to TCP payload: {}",
                         e
                     );
-                    match submit_needle_http(volume_server_url, &req, req.data.clone()).await {
-                        Ok(file_id) => RemoteNeedleWriteResponse {
+                    match submit_needle(
+                        volume_server_url,
+                        volume_write_url,
+                        local_reader.as_deref(),
+                        &req,
+                        req.data.clone(),
+                    )
+                    .await
+                    {
+                        Ok((file_id, source)) => RemoteNeedleWriteResponse {
                             success: true,
                             file_id,
                             transport: default_transport(),
                             real_rdma: false,
-                            source: "local-volume-http".to_string(),
+                            source,
                             message: Some(e.to_string()),
                         },
                         Err(upload_err) => RemoteNeedleWriteResponse {
@@ -542,6 +567,34 @@ fn normalize_http_read_data(
     }
     let end = start.saturating_add(requested).min(data.len());
     data[start..end].to_vec()
+}
+
+async fn submit_needle(
+    volume_server_url: &str,
+    volume_write_url: &str,
+    local_reader: Option<&LocalVolumeReader>,
+    req: &RemoteNeedleWriteRequest,
+    data: Vec<u8>,
+) -> RdmaResult<(String, String)> {
+    match volume_grpc::write_needle_blob(volume_write_url, local_reader, req, data.clone()).await {
+        Ok(file_id) => {
+            if let Some(reader) = local_reader {
+                reader.invalidate(req.volume_id);
+            }
+            Ok((file_id, "volume-grpc".to_string()))
+        }
+        Err(err) => {
+            warn!(
+                volume_id = req.volume_id,
+                needle_id = req.needle_id,
+                error = %err,
+                "direct volume gRPC write failed, falling back to local-volume HTTP"
+            );
+            submit_needle_http(volume_server_url, req, data)
+                .await
+                .map(|file_id| (file_id, "local-volume-http".to_string()))
+        }
+    }
 }
 
 async fn submit_needle_http(

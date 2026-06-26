@@ -1,0 +1,17 @@
+syntax = "proto3";
+
+package volume_server_pb;
+
+service VolumeServer {
+  rpc WriteNeedleBlob (WriteNeedleBlobRequest) returns (WriteNeedleBlobResponse);
+}
+
+message WriteNeedleBlobRequest {
+  uint32 volume_id = 1;
+  uint64 needle_id = 2;
+  int32 size = 3;
+  bytes needle_blob = 4;
+}
+
+message WriteNeedleBlobResponse {
+}

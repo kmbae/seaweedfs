@@ -11,6 +11,7 @@ RUN apt-get update && apt-get install -y \
     build-essential \
     libc6-dev \
     linux-libc-dev \
+    protobuf-compiler \
     libucx-dev \
     && rm -rf /var/lib/apt/lists/*
 
@@ -20,6 +21,8 @@ WORKDIR /app
 # Copy Rust project files
 COPY rdma-engine/Cargo.toml ./
 COPY rdma-engine/Cargo.lock ./
+COPY rdma-engine/build.rs ./
+COPY rdma-engine/proto ./proto
 COPY rdma-engine/src ./src
 
 # Build the release binary (pass CARGO_FEATURES=real-ucx for Mellanox UCX)

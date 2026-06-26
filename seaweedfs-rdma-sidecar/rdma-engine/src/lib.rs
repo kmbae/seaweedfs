@@ -34,6 +34,8 @@ pub mod memory;
 pub mod error;
 pub mod network;
 pub mod buffer_pool;
+pub mod needle_blob;
+pub mod volume_grpc;
 
 pub use error::{RdmaError, RdmaResult};
 

@@ -131,7 +131,11 @@ impl LocalVolumeReader {
         Ok(index)
     }
 
-    fn invalidate(&self, volume_id: u32) {
+    pub fn volume_version(&self, volume_id: u32) -> RdmaResult<u8> {
+        Ok(self.get_volume_index(volume_id)?.version)
+    }
+
+    pub fn invalidate(&self, volume_id: u32) {
         self.volumes.lock().remove(&volume_id);
     }
 
@@ -486,7 +490,7 @@ static CRC32C_TABLE: LazyLock<[u32; 256]> = LazyLock::new(|| {
     table
 });
 
-fn crc32c(data: &[u8]) -> u32 {
+pub(crate) fn crc32c(data: &[u8]) -> u32 {
     // Match Go's hash/crc32.Update(0, crc32.MakeTable(crc32.Castagnoli), data).
     let mut crc = !0u32;
     for b in data {
