@@ -487,12 +487,13 @@ static CRC32C_TABLE: LazyLock<[u32; 256]> = LazyLock::new(|| {
 });
 
 fn crc32c(data: &[u8]) -> u32 {
-    let mut crc = 0u32;
+    // Match Go's hash/crc32.Update(0, crc32.MakeTable(crc32.Castagnoli), data).
+    let mut crc = !0u32;
     for b in data {
         let idx = ((crc ^ *b as u32) & 0xff) as usize;
         crc = CRC32C_TABLE[idx] ^ (crc >> 8);
     }
-    crc
+    !crc
 }
 
 fn legacy_crc_value(raw: u32) -> u32 {
@@ -552,6 +553,12 @@ mod tests {
         let reader = LocalVolumeReader::new(dir.path(), dir.path(), "");
         let err = reader.read_needle(7, 42, 0x1122_3344, 0, 0).unwrap_err();
         assert!(format!("{err}").contains("invalid CRC"));
+    }
+
+    #[test]
+    fn crc32c_matches_go_castagnoli() {
+        assert_eq!(crc32c(b"123456789"), 0xe306_9283);
+        assert_eq!(legacy_crc_value(0xe306_9283), 0xc78a_b0e5);
     }
 
     fn write_test_volume(
