@@ -2,6 +2,7 @@
 FROM golang:1.25-alpine AS builder
 
 ARG GOPROXY=https://proxy.golang.org,direct
+ARG GO_TAGS=5BytesOffset
 ENV GOPROXY=${GOPROXY}
 
 RUN apk add --no-cache git ca-certificates tzdata
@@ -18,9 +19,9 @@ RUN go mod download
 COPY seaweedfs-rdma-sidecar/cmd/ ./cmd/
 COPY seaweedfs-rdma-sidecar/pkg/ ./pkg/
 
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o sidecar ./cmd/sidecar
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o demo-server ./cmd/demo-server
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o swvfs-rdma-daemon ./cmd/swvfs-rdma-daemon
+RUN CGO_ENABLED=0 GOOS=linux go build -tags "${GO_TAGS}" -a -installsuffix cgo -o sidecar ./cmd/sidecar
+RUN CGO_ENABLED=0 GOOS=linux go build -tags "${GO_TAGS}" -a -installsuffix cgo -o demo-server ./cmd/demo-server
+RUN CGO_ENABLED=0 GOOS=linux go build -tags "${GO_TAGS}" -a -installsuffix cgo -o swvfs-rdma-daemon ./cmd/swvfs-rdma-daemon
 
 FROM alpine:3.18
 
