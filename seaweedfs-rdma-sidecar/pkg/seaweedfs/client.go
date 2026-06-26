@@ -766,6 +766,9 @@ func (c *SeaweedFSRDMAClient) WriteNeedleBlobGRPC(ctx context.Context, req *Need
 	}); err != nil {
 		return "", fmt.Errorf("write needle blob to %s: %w", addr, err)
 	}
+	if c.localReader != nil {
+		c.localReader.Invalidate(req.VolumeID)
+	}
 
 	fileID := &needle.FileId{
 		VolumeId: needle.VolumeId(req.VolumeID),

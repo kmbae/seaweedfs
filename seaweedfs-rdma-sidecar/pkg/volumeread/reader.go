@@ -2,6 +2,7 @@
 package volumeread
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 
@@ -39,6 +40,15 @@ func (r *Reader) ReadNeedle(volumeID uint32, needleID uint64, cookie uint32, off
 		size = 4096
 	}
 
+	data, err := r.readNeedle(volumeID, needleID, cookie, offset, size)
+	if errors.Is(err, storage.ErrorNotFound) {
+		r.Invalidate(volumeID)
+		return r.readNeedle(volumeID, needleID, cookie, offset, size)
+	}
+	return data, err
+}
+
+func (r *Reader) readNeedle(volumeID uint32, needleID uint64, cookie uint32, offset, size uint64) ([]byte, error) {
 	vol, err := r.getVolume(needle.VolumeId(volumeID))
 	if err != nil {
 		return nil, err
@@ -50,6 +60,20 @@ func (r *Reader) ReadNeedle(volumeID uint32, needleID uint64, cookie uint32, off
 		int64(offset),
 		int64(size),
 	)
+}
+
+// Invalidate closes and removes a cached read-only volume handle.
+func (r *Reader) Invalidate(volumeID uint32) {
+	id := needle.VolumeId(volumeID)
+
+	r.mu.Lock()
+	vol := r.volumes[id]
+	delete(r.volumes, id)
+	r.mu.Unlock()
+
+	if vol != nil {
+		vol.Close()
+	}
 }
 
 // VolumeVersion returns the on-disk format version for a local volume.
