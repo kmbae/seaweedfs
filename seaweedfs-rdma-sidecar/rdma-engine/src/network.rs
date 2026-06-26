@@ -5,10 +5,13 @@
 //! transferred over a UCX stream after a worker-address handshake.
 
 use crate::{
-    ipc::MAX_IPC_MESSAGE_SIZE, local_volume::LocalVolumeReader, rdma::RdmaContext,
+    ipc::MAX_IPC_MESSAGE_SIZE,
+    local_volume::LocalVolumeReader,
+    rdma::{MemoryRegion, RdmaContext},
     RdmaEngineConfig, RdmaError, RdmaResult,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
+use parking_lot::Mutex;
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -21,6 +24,8 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
 static NEXT_NETWORK_WR_ID: AtomicU64 = AtomicU64::new(1_000_000);
+const DEFAULT_REGISTERED_BUFFER_POOL_SIZE: usize = 16;
+const MIN_REGISTERED_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Format SeaweedFS file id: `{volume_id},{needle_id+cookie hex}` (matches Go needle.FileId).
 fn format_seaweed_file_id(volume_id: u32, needle_id: u64, cookie: u32) -> String {
@@ -136,6 +141,7 @@ pub struct NetworkServer {
     volume_server_url: String,
     rdma_context: Arc<RdmaContext>,
     local_reader: Option<Arc<LocalVolumeReader>>,
+    registered_buffers: Arc<RegisteredBufferPool>,
 }
 
 impl NetworkServer {
@@ -149,6 +155,7 @@ impl NetworkServer {
             volume_server_url,
             rdma_context,
             local_reader,
+            registered_buffers: Arc::new(RegisteredBufferPool::from_env()),
         }
     }
 
@@ -165,9 +172,16 @@ impl NetworkServer {
                     let url = self.volume_server_url.clone();
                     let rdma_context = self.rdma_context.clone();
                     let local_reader = self.local_reader.clone();
+                    let registered_buffers = self.registered_buffers.clone();
                     tokio::spawn(async move {
-                        if let Err(e) =
-                            handle_connection(stream, &url, local_reader, rdma_context).await
+                        if let Err(e) = handle_connection(
+                            stream,
+                            &url,
+                            local_reader,
+                            rdma_context,
+                            registered_buffers,
+                        )
+                        .await
                         {
                             warn!("Remote read connection error from {}: {}", peer, e);
                         }
@@ -187,6 +201,7 @@ async fn handle_connection(
     volume_server_url: &str,
     local_reader: Option<Arc<LocalVolumeReader>>,
     rdma_context: Arc<RdmaContext>,
+    registered_buffers: Arc<RegisteredBufferPool>,
 ) -> RdmaResult<()> {
     let raw = read_raw_message(&mut stream).await?;
     let request: RemoteRequest =
@@ -200,55 +215,57 @@ async fn handle_connection(
                 "Remote read: volume={} needle={} offset={} size={}",
                 req.volume_id, req.needle_id, req.offset, req.size
             );
-            let resp = match fetch_needle_data(volume_server_url, local_reader.as_deref(), &req)
-                .await
-            {
-                Ok((data, source)) => match put_read_payload_rdma(&rdma_context, &req, &data).await
-                {
-                    Ok(true) => RemoteNeedleReadResponse {
-                        success: true,
-                        data: Vec::new(),
-                        size: data.len() as u64,
-                        transport: "rdma".to_string(),
-                        real_rdma: true,
-                        source,
-                        message: None,
-                    },
-                    Ok(false) => RemoteNeedleReadResponse {
-                        success: true,
-                        size: data.len() as u64,
-                        data,
-                        transport: default_transport(),
-                        real_rdma: false,
-                        source,
-                        message: None,
-                    },
-                    Err(e) => {
-                        warn!(
-                            "RDMA read payload PUT failed, falling back to TCP payload: {}",
-                            e
-                        );
-                        RemoteNeedleReadResponse {
-                            success: true,
-                            size: data.len() as u64,
-                            data,
-                            transport: default_transport(),
-                            real_rdma: false,
-                            source,
-                            message: Some(e.to_string()),
+            let resp =
+                match fetch_needle_data(volume_server_url, local_reader.as_deref(), &req).await {
+                    Ok((data, source)) => {
+                        match put_read_payload_rdma(&rdma_context, &registered_buffers, &req, &data)
+                            .await
+                        {
+                            Ok(true) => RemoteNeedleReadResponse {
+                                success: true,
+                                data: Vec::new(),
+                                size: data.len() as u64,
+                                transport: "rdma".to_string(),
+                                real_rdma: true,
+                                source,
+                                message: None,
+                            },
+                            Ok(false) => RemoteNeedleReadResponse {
+                                success: true,
+                                size: data.len() as u64,
+                                data,
+                                transport: default_transport(),
+                                real_rdma: false,
+                                source,
+                                message: None,
+                            },
+                            Err(e) => {
+                                warn!(
+                                    "RDMA read payload PUT failed, falling back to TCP payload: {}",
+                                    e
+                                );
+                                RemoteNeedleReadResponse {
+                                    success: true,
+                                    size: data.len() as u64,
+                                    data,
+                                    transport: default_transport(),
+                                    real_rdma: false,
+                                    source,
+                                    message: Some(e.to_string()),
+                                }
+                            }
                         }
                     }
-                },
-                Err(e) => RemoteNeedleReadResponse {
-                    success: false,
-                    data: Vec::new(),
-                    size: 0,
-                    transport: default_transport(),
-                    real_rdma: false,
-                    source: String::new(),
-                    message: Some(e.to_string()),
-                },
-            };
+                    Err(e) => RemoteNeedleReadResponse {
+                        success: false,
+                        data: Vec::new(),
+                        size: 0,
+                        transport: default_transport(),
+                        real_rdma: false,
+                        source: String::new(),
+                        message: Some(e.to_string()),
+                    },
+                };
             write_message(&mut stream, &resp).await
         }
         RemoteRequest::Write(req) => {
@@ -258,7 +275,7 @@ async fn handle_connection(
                 req.needle_id,
                 req.data.len()
             );
-            let resp = match resolve_write_payload(&rdma_context, &req).await {
+            let resp = match resolve_write_payload(&rdma_context, &registered_buffers, &req).await {
                 Ok((data, used_rdma)) => {
                     match submit_needle_http(volume_server_url, &req, data).await {
                         Ok(file_id) => RemoteNeedleWriteResponse {
@@ -327,6 +344,7 @@ async fn handle_connection(
 
 async fn put_read_payload_rdma(
     rdma_context: &Arc<RdmaContext>,
+    registered_buffers: &Arc<RegisteredBufferPool>,
     req: &RemoteNeedleReadRequest,
     data: &[u8],
 ) -> RdmaResult<bool> {
@@ -354,8 +372,9 @@ async fn put_read_payload_rdma(
     let remote_rkey = STANDARD
         .decode(&req.remote_key_b64)
         .map_err(|e| RdmaError::invalid_request(format!("invalid remote rkey: {}", e)))?;
-    let local_addr = data.as_ptr() as u64;
-    let memory_region = rdma_context.register_memory(local_addr, data.len()).await?;
+    let mut buffer = registered_buffers.acquire(rdma_context, data.len()).await?;
+    buffer.data[..data.len()].copy_from_slice(data);
+    let local_addr = buffer.region.addr;
     let wr_id = NEXT_NETWORK_WR_ID.fetch_add(1, Ordering::Relaxed);
     let peer_key = peer_cache_key("read", req.volume_id, req.needle_id, &worker_address);
     let result = rdma_context
@@ -369,13 +388,14 @@ async fn put_read_payload_rdma(
             wr_id,
         )
         .await;
-    let _ = rdma_context.deregister_memory(&memory_region).await;
+    registered_buffers.release(rdma_context, buffer).await;
     result?;
     Ok(true)
 }
 
 async fn resolve_write_payload(
     rdma_context: &Arc<RdmaContext>,
+    registered_buffers: &Arc<RegisteredBufferPool>,
     req: &RemoteNeedleWriteRequest,
 ) -> RdmaResult<(Vec<u8>, bool)> {
     if !rdma_context.is_real_rdma()
@@ -403,9 +423,8 @@ async fn resolve_write_payload(
     let remote_rkey = STANDARD
         .decode(&req.remote_key_b64)
         .map_err(|e| RdmaError::invalid_request(format!("invalid remote rkey: {}", e)))?;
-    let mut data = vec![0u8; size];
-    let local_addr = data.as_mut_ptr() as u64;
-    let memory_region = rdma_context.register_memory(local_addr, data.len()).await?;
+    let buffer = registered_buffers.acquire(rdma_context, size).await?;
+    let local_addr = buffer.region.addr;
     let wr_id = NEXT_NETWORK_WR_ID.fetch_add(1, Ordering::Relaxed);
     let peer_key = peer_cache_key("write", req.volume_id, req.needle_id, &worker_address);
     let result = rdma_context
@@ -415,13 +434,103 @@ async fn resolve_write_payload(
             local_addr,
             req.remote_addr,
             &remote_rkey,
-            data.len(),
+            size,
             wr_id,
         )
         .await;
-    let _ = rdma_context.deregister_memory(&memory_region).await;
-    result?;
+    if let Err(err) = result {
+        registered_buffers.release(rdma_context, buffer).await;
+        return Err(err);
+    }
+    let data = buffer.data[..size].to_vec();
+    registered_buffers.release(rdma_context, buffer).await;
     Ok((data, true))
+}
+
+struct RegisteredBufferPool {
+    idle: Mutex<Vec<RegisteredBuffer>>,
+    max_idle: usize,
+}
+
+struct RegisteredBuffer {
+    data: Vec<u8>,
+    region: MemoryRegion,
+}
+
+impl RegisteredBufferPool {
+    fn from_env() -> Self {
+        let max_idle = std::env::var("RDMA_REGISTERED_BUFFER_POOL_SIZE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_REGISTERED_BUFFER_POOL_SIZE);
+        Self {
+            idle: Mutex::new(Vec::new()),
+            max_idle,
+        }
+    }
+
+    async fn acquire(
+        &self,
+        rdma_context: &Arc<RdmaContext>,
+        size: usize,
+    ) -> RdmaResult<RegisteredBuffer> {
+        let capacity = registered_buffer_capacity(size)?;
+        if let Some(buffer) = self.take_idle(capacity) {
+            debug!(
+                "♻️ Reusing registered RDMA buffer: addr=0x{:x}, capacity={}, requested={}",
+                buffer.region.addr,
+                buffer.data.len(),
+                size
+            );
+            return Ok(buffer);
+        }
+
+        let mut data = vec![0u8; capacity];
+        let local_addr = data.as_mut_ptr() as u64;
+        let region = rdma_context.register_memory(local_addr, capacity).await?;
+        debug!(
+            "📌 Registered new pooled RDMA buffer: addr=0x{:x}, capacity={}, requested={}",
+            region.addr, capacity, size
+        );
+        Ok(RegisteredBuffer { data, region })
+    }
+
+    fn take_idle(&self, capacity: usize) -> Option<RegisteredBuffer> {
+        let mut idle = self.idle.lock();
+        let index = idle
+            .iter()
+            .position(|buffer| buffer.data.len() >= capacity)?;
+        Some(idle.swap_remove(index))
+    }
+
+    async fn release(&self, rdma_context: &Arc<RdmaContext>, buffer: RegisteredBuffer) {
+        let mut discard = Some(buffer);
+        {
+            let mut idle = self.idle.lock();
+            if idle.len() < self.max_idle {
+                idle.push(discard.take().expect("registered buffer"));
+            }
+        }
+        if let Some(buffer) = discard {
+            let _ = rdma_context.deregister_memory(&buffer.region).await;
+        }
+    }
+}
+
+fn registered_buffer_capacity(size: usize) -> RdmaResult<usize> {
+    if size == 0 {
+        return Err(RdmaError::invalid_request("registered buffer size is zero"));
+    }
+    if size > MAX_IPC_MESSAGE_SIZE {
+        return Err(RdmaError::ipc_error(format!(
+            "registered buffer too large: {} bytes",
+            size
+        )));
+    }
+    Ok(size
+        .max(MIN_REGISTERED_BUFFER_SIZE)
+        .next_power_of_two()
+        .min(MAX_IPC_MESSAGE_SIZE))
 }
 
 fn has_rdma_descriptor(worker_address_b64: &str, remote_addr: u64, remote_key_b64: &str) -> bool {
@@ -691,5 +800,22 @@ mod tests {
         let read_key = peer_cache_key("read", 7, 42, b"worker-a");
         let write_key = peer_cache_key("write", 7, 42, b"worker-a");
         assert_ne!(read_key, write_key);
+    }
+
+    #[test]
+    fn registered_buffer_capacity_rounds_for_reuse() {
+        assert_eq!(
+            registered_buffer_capacity(1).unwrap(),
+            MIN_REGISTERED_BUFFER_SIZE
+        );
+        assert_eq!(
+            registered_buffer_capacity(MIN_REGISTERED_BUFFER_SIZE + 1).unwrap(),
+            MIN_REGISTERED_BUFFER_SIZE * 2
+        );
+        assert_eq!(
+            registered_buffer_capacity(MAX_IPC_MESSAGE_SIZE).unwrap(),
+            MAX_IPC_MESSAGE_SIZE
+        );
+        assert!(registered_buffer_capacity(MAX_IPC_MESSAGE_SIZE + 1).is_err());
     }
 }
