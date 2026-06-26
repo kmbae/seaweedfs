@@ -19,6 +19,10 @@ use std::path::Path;
 /// Must match network.rs remote path and Go ipc/client.go (64 MiB).
 pub const MAX_IPC_MESSAGE_SIZE: usize = 64 * 1024 * 1024;
 
+/// Payload size where IPC switches to raw sideband bytes instead of embedding
+/// large byte arrays in MessagePack.
+pub const SIDEBAND_MIN_SIZE: usize = 64 * 1024;
+
 /// Atomic counter for generating unique work request IDs
 /// This ensures no hash collisions that could cause incorrect completion handling
 static NEXT_WR_ID: AtomicU64 = AtomicU64::new(1);
@@ -132,6 +136,12 @@ pub struct CompleteReadResponse {
     /// Data copied into the local RDMA buffer during the read
     #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
+    /// If true, data follows the MessagePack frame as raw bytes.
+    #[serde(default)]
+    pub data_sideband: bool,
+    /// Number of raw sideband data bytes after the MessagePack frame.
+    #[serde(default)]
+    pub data_size: u64,
     /// Any cleanup messages
     pub message: Option<String>,
 }
@@ -145,6 +155,8 @@ pub struct StartWriteRequest {
     pub size: u64,
     #[serde(with = "serde_bytes")]
     pub data: Vec<u8>,
+    #[serde(default)]
+    pub data_sideband: bool,
     pub timeout_secs: u64,
     pub auth_token: Option<String>,
 }
@@ -157,6 +169,7 @@ impl std::fmt::Debug for StartWriteRequest {
             .field("cookie", &self.cookie)
             .field("size", &self.size)
             .field("data", &format_args!("[{} bytes]", self.data.len()))
+            .field("data_sideband", &self.data_sideband)
             .field("timeout_secs", &self.timeout_secs)
             .field("auth_token", &self.auth_token)
             .finish()
@@ -415,18 +428,20 @@ impl IpcServer {
                 .map_err(|e| RdmaError::ipc_error(format!("Failed to read message: {}", e)))?;
             
             // Deserialize message
-            let request: IpcMessage = rmp_serde::from_slice(&buffer)
+            let mut request: IpcMessage = rmp_serde::from_slice(&buffer)
                 .map_err(|e| RdmaError::SerializationError { reason: e.to_string() })?;
-            
+            Self::read_request_sideband(&mut reader, &mut request).await?;
+
             debug!("Received IPC message: {:?}", request);
             
             // Process message
-            let response = Self::process_message(
+            let mut response = Self::process_message(
                 request,
                 &rdma_context,
                 &session_manager,
             ).await;
-            
+            let response_sideband = Self::extract_response_sideband(&mut response);
+
             // Serialize response
             let response_data = rmp_serde::to_vec(&response)
                 .map_err(|e| RdmaError::SerializationError { reason: e.to_string() })?;
@@ -437,6 +452,10 @@ impl IpcServer {
                 .map_err(|e| RdmaError::ipc_error(format!("Failed to write response length: {}", e)))?;
             writer.write_all(&response_data).await
                 .map_err(|e| RdmaError::ipc_error(format!("Failed to write response: {}", e)))?;
+            if let Some(sideband) = response_sideband {
+                writer.write_all(&sideband).await
+                    .map_err(|e| RdmaError::ipc_error(format!("Failed to write response sideband: {}", e)))?;
+            }
             writer.flush().await
                 .map_err(|e| RdmaError::ipc_error(format!("Failed to flush response: {}", e)))?;
             
@@ -444,6 +463,53 @@ impl IpcServer {
         }
         
         Ok(())
+    }
+
+    async fn read_request_sideband<R>(
+        reader: &mut R,
+        message: &mut IpcMessage,
+    ) -> RdmaResult<()>
+    where
+        R: tokio::io::AsyncRead + Unpin,
+    {
+        if let IpcMessage::StartWrite(req) = message {
+            if !req.data_sideband {
+                return Ok(());
+            }
+            if req.size as usize > MAX_IPC_MESSAGE_SIZE {
+                return Err(RdmaError::ipc_error(format!(
+                    "StartWrite sideband too large: {} bytes",
+                    req.size
+                )));
+            }
+            if !req.data.is_empty() {
+                return Err(RdmaError::ipc_error(
+                    "StartWrite sideband request also carried inline data",
+                ));
+            }
+
+            let mut data = vec![0u8; req.size as usize];
+            reader
+                .read_exact(&mut data)
+                .await
+                .map_err(|e| RdmaError::ipc_error(format!("Failed to read request sideband: {}", e)))?;
+            req.data = data;
+            req.data_sideband = false;
+        }
+        Ok(())
+    }
+
+    fn extract_response_sideband(message: &mut IpcMessage) -> Option<Vec<u8>> {
+        if let IpcMessage::CompleteReadResponse(resp) = message {
+            if resp.data.len() < SIDEBAND_MIN_SIZE {
+                return None;
+            }
+            let data = std::mem::take(&mut resp.data);
+            resp.data_sideband = true;
+            resp.data_size = data.len() as u64;
+            return Some(data);
+        }
+        None
     }
     
     /// Process IPC message and generate response
@@ -604,6 +670,8 @@ impl IpcServer {
             success: req.success,
             server_crc: Some(0x12345678), // Mock CRC
             data,
+            data_sideband: false,
+            data_size: 0,
             message: Some("Session completed successfully".to_string()),
         })
     }

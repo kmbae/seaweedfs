@@ -68,21 +68,24 @@ type CompleteReadRequest struct {
 
 // CompleteReadResponse corresponds to Rust CompleteReadResponse
 type CompleteReadResponse struct {
-	Success   bool    `msgpack:"success"`
-	ServerCrc *uint32 `msgpack:"server_crc,omitempty"`
-	Data      []byte  `msgpack:"data"`
-	Message   *string `msgpack:"message,omitempty"`
+	Success      bool    `msgpack:"success"`
+	ServerCrc    *uint32 `msgpack:"server_crc,omitempty"`
+	Data         []byte  `msgpack:"data"`
+	DataSideband bool    `msgpack:"data_sideband,omitempty"`
+	DataSize     uint64  `msgpack:"data_size,omitempty"`
+	Message      *string `msgpack:"message,omitempty"`
 }
 
 // StartWriteRequest corresponds to Rust StartWriteRequest
 type StartWriteRequest struct {
-	VolumeID    uint32  `msgpack:"volume_id"`
-	NeedleID    uint64  `msgpack:"needle_id"`
-	Cookie      uint32  `msgpack:"cookie"`
-	Size        uint64  `msgpack:"size"`
-	Data        []byte  `msgpack:"data"`
-	TimeoutSecs uint64  `msgpack:"timeout_secs"`
-	AuthToken   *string `msgpack:"auth_token,omitempty"`
+	VolumeID     uint32  `msgpack:"volume_id"`
+	NeedleID     uint64  `msgpack:"needle_id"`
+	Cookie       uint32  `msgpack:"cookie"`
+	Size         uint64  `msgpack:"size"`
+	Data         []byte  `msgpack:"data"`
+	DataSideband bool    `msgpack:"data_sideband,omitempty"`
+	TimeoutSecs  uint64  `msgpack:"timeout_secs"`
+	AuthToken    *string `msgpack:"auth_token,omitempty"`
 }
 
 // StartWriteResponse corresponds to Rust StartWriteResponse

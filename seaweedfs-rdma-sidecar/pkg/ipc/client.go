@@ -19,11 +19,16 @@ import (
 // MaxMessageSize is the maximum serialized IPC frame size (must match rdma-engine ipc.rs).
 const MaxMessageSize = 64 * 1024 * 1024
 
+// SidebandMinSize is the payload size where raw sideband IPC avoids MessagePack
+// encoding large byte slices. The control frame stays MessagePack-compatible.
+const SidebandMinSize = 64 * 1024
+
 // Client provides IPC communication with the Rust RDMA engine
 type Client struct {
 	socketPath string
 	conn       net.Conn
 	mu         sync.RWMutex
+	ioMu       sync.Mutex
 	logger     *logrus.Logger
 	connected  bool
 }
@@ -113,6 +118,23 @@ func IsBrokenError(err error) bool {
 
 // SendMessage sends an IPC message and waits for response
 func (c *Client) SendMessage(ctx context.Context, msg *IpcMessage) (*IpcMessage, error) {
+	c.ioMu.Lock()
+	defer c.ioMu.Unlock()
+
+	return c.sendMessageLocked(ctx, msg, nil)
+}
+
+// SendMessageWithSideband sends a MessagePack control frame followed by raw
+// payload bytes on the same Unix socket. The server must know from the control
+// frame how many sideband bytes to read.
+func (c *Client) SendMessageWithSideband(ctx context.Context, msg *IpcMessage, sideband []byte) (*IpcMessage, error) {
+	c.ioMu.Lock()
+	defer c.ioMu.Unlock()
+
+	return c.sendMessageLocked(ctx, msg, sideband)
+}
+
+func (c *Client) sendMessageLocked(ctx context.Context, msg *IpcMessage, sideband []byte) (*IpcMessage, error) {
 	c.mu.RLock()
 	conn := c.conn
 	connected := c.connected
@@ -156,18 +178,26 @@ func (c *Client) SendMessage(ctx context.Context, msg *IpcMessage) (*IpcMessage,
 		c.markDisconnected()
 		return nil, fmt.Errorf("failed to send message data: %w", err)
 	}
+	if len(sideband) > 0 {
+		if err := writeFull(conn, sideband); err != nil {
+			c.logger.WithError(err).Error("❌ Failed to send sideband payload")
+			c.markDisconnected()
+			return nil, fmt.Errorf("failed to send sideband payload: %w", err)
+		}
+	}
 
 	c.logger.WithFields(logrus.Fields{
-		"type": msg.Type,
-		"size": len(data),
+		"type":          msg.Type,
+		"size":          len(data),
+		"sideband_size": len(sideband),
 	}).Debug("📤 Message sent successfully")
 
 	// Read response
-	return c.readResponse(ctx, conn)
+	return c.readResponseLocked(ctx, conn)
 }
 
 // readResponse reads and deserializes the response message
-func (c *Client) readResponse(ctx context.Context, conn net.Conn) (*IpcMessage, error) {
+func (c *Client) readResponseLocked(ctx context.Context, conn net.Conn) (*IpcMessage, error) {
 	// Set read timeout
 	if deadline, ok := ctx.Deadline(); ok {
 		conn.SetReadDeadline(deadline)
@@ -206,10 +236,46 @@ func (c *Client) readResponse(ctx context.Context, conn net.Conn) (*IpcMessage, 
 		c.logger.WithError(err).Error("❌ Failed to unmarshal response")
 		return nil, fmt.Errorf("failed to unmarshal response: %w", err)
 	}
+	if err := c.readResponseSideband(ctx, conn, &response); err != nil {
+		c.markDisconnected()
+		return nil, err
+	}
 
 	c.logger.WithField("type", response.Type).Debug("📥 Response deserialized successfully")
 
 	return &response, nil
+}
+
+func (c *Client) readResponseSideband(ctx context.Context, conn net.Conn, response *IpcMessage) error {
+	if response == nil || response.Type != MsgCompleteReadResponse {
+		return nil
+	}
+	data, err := msgpack.Marshal(response.Data)
+	if err != nil {
+		return fmt.Errorf("failed to marshal complete read response for sideband check: %w", err)
+	}
+	var completeResp CompleteReadResponse
+	if err := msgpack.Unmarshal(data, &completeResp); err != nil {
+		return fmt.Errorf("failed to unmarshal complete read response for sideband check: %w", err)
+	}
+	if !completeResp.DataSideband {
+		return nil
+	}
+	if completeResp.DataSize > MaxMessageSize {
+		return fmt.Errorf("sideband response too large: %d bytes", completeResp.DataSize)
+	}
+	if deadline, ok := ctx.Deadline(); ok {
+		conn.SetReadDeadline(deadline)
+	} else {
+		conn.SetReadDeadline(time.Now().Add(30 * time.Second))
+	}
+	completeResp.Data = make([]byte, int(completeResp.DataSize))
+	if _, err := io.ReadFull(conn, completeResp.Data); err != nil {
+		return fmt.Errorf("failed to read response sideband payload: %w", err)
+	}
+	completeResp.DataSideband = false
+	response.Data = &completeResp
+	return nil
 }
 
 func writeFull(conn net.Conn, data []byte) error {
@@ -371,9 +437,25 @@ func (c *Client) StartRead(ctx context.Context, req *StartReadRequest) (*StartRe
 
 // StartWrite initiates an RDMA write operation
 func (c *Client) StartWrite(ctx context.Context, req *StartWriteRequest) (*StartWriteResponse, error) {
-	msg := NewStartWriteMessage(req)
+	msgReq := req
+	var sideband []byte
+	if req != nil && len(req.Data) >= SidebandMinSize {
+		reqCopy := *req
+		sideband = req.Data
+		reqCopy.Data = nil
+		reqCopy.Size = uint64(len(sideband))
+		reqCopy.DataSideband = true
+		msgReq = &reqCopy
+	}
+	msg := NewStartWriteMessage(msgReq)
 
-	response, err := c.SendMessage(ctx, msg)
+	var response *IpcMessage
+	var err error
+	if len(sideband) > 0 {
+		response, err = c.SendMessageWithSideband(ctx, msg, sideband)
+	} else {
+		response, err = c.SendMessage(ctx, msg)
+	}
 	if err != nil {
 		return nil, err
 	}
