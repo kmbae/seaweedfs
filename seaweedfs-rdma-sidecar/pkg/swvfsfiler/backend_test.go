@@ -3,6 +3,7 @@ package swvfsfiler
 import (
 	"context"
 	"errors"
+	"syscall"
 	"testing"
 
 	"seaweedfs-rdma-sidecar/pkg/swvfsdaemon"
@@ -151,6 +152,28 @@ func TestBackendWriteAssignsAndSavesChunk(t *testing.T) {
 	}
 	if attr.Size != 7 {
 		t.Fatalf("attr size = %d", attr.Size)
+	}
+}
+
+func TestBackendMkdirStoresDirectoryMode(t *testing.T) {
+	store := &fakeStore{entries: map[string]*filer_pb.Entry{}}
+	backend := &Backend{Store: store}
+	attr, err := backend.Mkdir(context.Background(), "/bench", uint32(syscall.S_IFDIR|0755), 1000, 1000)
+	if err != nil {
+		t.Fatalf("Mkdir: %v", err)
+	}
+	entry := store.entries["/bench"]
+	if entry == nil {
+		t.Fatal("directory entry was not saved")
+	}
+	if !entry.IsDirectory {
+		t.Fatal("entry was not marked as directory")
+	}
+	if entry.Attributes == nil || entry.Attributes.FileMode&uint32(syscall.S_IFMT) != uint32(syscall.S_IFDIR) {
+		t.Fatalf("saved mode is not a directory: %#o", entry.Attributes.GetFileMode())
+	}
+	if attr.Mode&uint32(syscall.S_IFMT) != uint32(syscall.S_IFDIR) {
+		t.Fatalf("attr mode is not a directory: %#o", attr.Mode)
 	}
 }
 
