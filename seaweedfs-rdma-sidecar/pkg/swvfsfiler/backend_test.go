@@ -405,6 +405,11 @@ func TestBackendLinkEntryStoresHardLinkMetadata(t *testing.T) {
 	if linked.Name != "hard" {
 		t.Fatalf("linked name = %q", linked.Name)
 	}
+	sourceAttr := AttrFromEntry("/file", source)
+	linkedAttr := AttrFromEntry("/hard", linked)
+	if sourceAttr.Ino != linkedAttr.Ino {
+		t.Fatalf("hardlinks have different inode numbers: source=%d linked=%d", sourceAttr.Ino, linkedAttr.Ino)
+	}
 
 	_, err = backend.LinkEntry(context.Background(), "/file", "/hard")
 	var errno swvfsdaemon.ErrnoError

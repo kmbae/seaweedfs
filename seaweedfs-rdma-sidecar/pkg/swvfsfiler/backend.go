@@ -612,6 +612,9 @@ func AttrFromEntry(fullPath string, entry *filer_pb.Entry) *swvfsproto.Attr {
 	if entry.HardLinkCounter > 0 {
 		attr.Nlink = uint32(entry.HardLinkCounter)
 	}
+	if len(entry.HardLinkId) > 0 {
+		attr.Ino = stableInodeFromBytes(entry.HardLinkId)
+	}
 	if attr.MtimeSec == 0 {
 		now := time.Now()
 		attr.MtimeSec = now.Unix()
@@ -956,7 +959,16 @@ func isLookupNotFound(err error) bool {
 func stableInode(fullPath string) uint64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(cleanFullPath(fullPath)))
-	v := h.Sum64()
+	return normalizeInode(h.Sum64())
+}
+
+func stableInodeFromBytes(data []byte) uint64 {
+	h := fnv.New64a()
+	_, _ = h.Write(data)
+	return normalizeInode(h.Sum64())
+}
+
+func normalizeInode(v uint64) uint64 {
 	if v < 2 {
 		v += 2
 	}
