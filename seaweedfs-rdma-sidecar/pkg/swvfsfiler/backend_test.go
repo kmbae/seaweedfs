@@ -128,6 +128,7 @@ type capturePlane struct {
 	readPrefer  bool
 	writePrefer bool
 	writes      int
+	writeSizes  []int
 }
 
 func (p *capturePlane) ReadNeedle(ctx context.Context, req swvfsdaemon.NeedleReadRequest) (*swvfsdaemon.NeedleReadResult, error) {
@@ -138,6 +139,7 @@ func (p *capturePlane) ReadNeedle(ctx context.Context, req swvfsdaemon.NeedleRea
 func (p *capturePlane) WriteNeedle(ctx context.Context, req swvfsdaemon.NeedleWriteRequest) (*swvfsdaemon.NeedleWriteResult, error) {
 	p.writePrefer = req.PreferRDMA
 	p.writes++
+	p.writeSizes = append(p.writeSizes, len(req.Data))
 	return &swvfsdaemon.NeedleWriteResult{FileID: req.FileID, Source: "rdma", UsedRDMA: req.PreferRDMA}, nil
 }
 
@@ -198,6 +200,13 @@ func TestBackendWriteAssignsAndSavesChunk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WriteFile: %v", err)
 	}
+	if plane.writes != 0 {
+		t.Fatalf("write flushed before FlushFile: writes=%d", plane.writes)
+	}
+	attr, err = backend.FlushFile(context.Background(), "/file")
+	if err != nil {
+		t.Fatalf("FlushFile: %v", err)
+	}
 	if !plane.writePrefer || plane.writes != 1 {
 		t.Fatalf("write routing mismatch: prefer=%v writes=%d", plane.writePrefer, plane.writes)
 	}
@@ -210,6 +219,52 @@ func TestBackendWriteAssignsAndSavesChunk(t *testing.T) {
 	}
 	if entry.Chunks[0].Offset != 4 || entry.Chunks[0].Size != 3 {
 		t.Fatalf("chunk = %+v", entry.Chunks[0])
+	}
+	if attr.Size != 7 {
+		t.Fatalf("attr size = %d", attr.Size)
+	}
+}
+
+func TestBackendSequentialWritesCoalesceUntilFlush(t *testing.T) {
+	store := &fakeStore{entries: map[string]*filer_pb.Entry{}}
+	plane := &capturePlane{}
+	backend := &Backend{
+		Store: store,
+		Router: &swvfsdaemon.Router{
+			RDMA:            plane,
+			Fallback:        plane,
+			EnableWriteRDMA: true,
+			FallbackOnError: true,
+		},
+	}
+
+	if _, err := backend.WriteFile(context.Background(), "/file", 0, []byte("abc"), 0644, 1000, 1000, true); err != nil {
+		t.Fatalf("first WriteFile: %v", err)
+	}
+	if _, err := backend.WriteFile(context.Background(), "/file", 3, []byte("defg"), 0644, 1000, 1000, true); err != nil {
+		t.Fatalf("second WriteFile: %v", err)
+	}
+	if plane.writes != 0 {
+		t.Fatalf("writes before flush = %d", plane.writes)
+	}
+	data, attr, err := backend.ReadFile(context.Background(), "/file", 0, 7, true)
+	if err != nil {
+		t.Fatalf("ReadFile pending: %v", err)
+	}
+	if string(data) != "abcdefg" || attr.Size != 7 {
+		t.Fatalf("pending read data=%q size=%d", data, attr.Size)
+	}
+
+	attr, err = backend.FlushFile(context.Background(), "/file")
+	if err != nil {
+		t.Fatalf("FlushFile: %v", err)
+	}
+	if plane.writes != 1 || len(plane.writeSizes) != 1 || plane.writeSizes[0] != 7 {
+		t.Fatalf("coalesced writes mismatch: writes=%d sizes=%v", plane.writes, plane.writeSizes)
+	}
+	entry := store.entries["/file"]
+	if entry == nil || len(entry.Chunks) != 1 || entry.Chunks[0].Size != 7 {
+		t.Fatalf("saved chunks = %+v", entry)
 	}
 	if attr.Size != 7 {
 		t.Fatalf("attr size = %d", attr.Size)

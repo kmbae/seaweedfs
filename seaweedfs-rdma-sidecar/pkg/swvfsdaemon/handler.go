@@ -256,6 +256,19 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 		}
 		return reply, nil
 	case swvfsproto.OpFlush, swvfsproto.OpRelease:
+		if backend, ok := h.Backend.(interface {
+			FlushFile(context.Context, string) (*swvfsproto.Attr, error)
+		}); ok {
+			attr, err := backend.FlushFile(ctx, req.Path1)
+			if err != nil {
+				return nil, err
+			}
+			reply := &swvfsproto.Reply{Tag: req.Header.Tag}
+			if attr != nil {
+				reply.Attr = *attr
+			}
+			return reply, nil
+		}
 		return &swvfsproto.Reply{Tag: req.Header.Tag}, nil
 	case swvfsproto.OpStatFS:
 		backend, ok := h.Backend.(interface {

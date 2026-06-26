@@ -13,6 +13,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -37,6 +38,9 @@ type MetadataStore interface {
 type Backend struct {
 	Store  MetadataStore
 	Router *swvfsdaemon.Router
+
+	mu      sync.Mutex
+	pending map[string]*pendingWrite
 }
 
 const (
@@ -47,27 +51,154 @@ const (
 	statBlockSize    = 4096
 	defaultTotalSize = uint64(1) << 50
 	defaultFileCount = uint64(1) << 32
+
+	defaultBufferedWriteMax = 32 << 20
+	defaultRegularMode      = uint32(syscall.S_IFREG | 0644)
 )
+
+type pendingWrite struct {
+	path       string
+	offset     uint64
+	data       []byte
+	mode       uint32
+	uid        uint32
+	gid        uint32
+	preferRDMA bool
+	updated    time.Time
+}
+
+func (p *pendingWrite) end() uint64 {
+	if p == nil {
+		return 0
+	}
+	return p.offset + uint64(len(p.data))
+}
+
+func (p *pendingWrite) clone() *pendingWrite {
+	if p == nil {
+		return nil
+	}
+	next := *p
+	next.data = append([]byte(nil), p.data...)
+	return &next
+}
+
+func (b *Backend) pendingSnapshot(fullPath string) *pendingWrite {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.pending == nil {
+		return nil
+	}
+	return b.pending[cleanFullPath(fullPath)].clone()
+}
+
+func (b *Backend) takePending(fullPath string) *pendingWrite {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.pending == nil {
+		return nil
+	}
+	fullPath = cleanFullPath(fullPath)
+	p := b.pending[fullPath]
+	if p != nil {
+		delete(b.pending, fullPath)
+	}
+	return p
+}
+
+func attrFromPending(p *pendingWrite) *swvfsproto.Attr {
+	if p == nil {
+		return nil
+	}
+	now := p.updated
+	if now.IsZero() {
+		now = time.Now()
+	}
+	mode := p.mode
+	if mode == 0 {
+		mode = defaultRegularMode
+	}
+	if mode&uint32(syscall.S_IFMT) == 0 {
+		mode = uint32(syscall.S_IFREG) | (mode & 07777)
+	}
+	return &swvfsproto.Attr{
+		Ino:       stableInode(p.path),
+		Size:      p.end(),
+		Mode:      mode,
+		Nlink:     1,
+		UID:       p.uid,
+		GID:       p.gid,
+		MtimeSec:  now.Unix(),
+		CtimeSec:  now.Unix(),
+		AtimeSec:  now.Unix(),
+		MtimeNsec: uint32(now.Nanosecond()),
+		CtimeNsec: uint32(now.Nanosecond()),
+		AtimeNsec: uint32(now.Nanosecond()),
+	}
+}
+
+func overlayPendingAttr(attr *swvfsproto.Attr, pending *pendingWrite) *swvfsproto.Attr {
+	if attr == nil || pending == nil {
+		return attr
+	}
+	if end := pending.end(); end > attr.Size {
+		attr.Size = end
+	}
+	if !pending.updated.IsZero() {
+		attr.MtimeSec = pending.updated.Unix()
+		attr.MtimeNsec = uint32(pending.updated.Nanosecond())
+		attr.CtimeSec = pending.updated.Unix()
+		attr.CtimeNsec = uint32(pending.updated.Nanosecond())
+	}
+	return attr
+}
+
+func overlayPendingData(dst []byte, readOffset uint64, pending *pendingWrite) {
+	if len(dst) == 0 || pending == nil || len(pending.data) == 0 {
+		return
+	}
+	readEnd := readOffset + uint64(len(dst))
+	pendingStart := pending.offset
+	pendingEnd := pending.end()
+	if readEnd <= pendingStart || readOffset >= pendingEnd {
+		return
+	}
+	start := maxUint64(readOffset, pendingStart)
+	end := minUint64(readEnd, pendingEnd)
+	copy(dst[int(start-readOffset):int(end-readOffset)], pending.data[int(start-pendingStart):int(end-pendingStart)])
+}
 
 func (b *Backend) LookupFile(ctx context.Context, fullPath string) (*swvfsproto.Attr, error) {
 	fullPath = cleanFullPath(fullPath)
 	if fullPath == "/" {
 		return rootAttr(), nil
 	}
+	pending := b.pendingSnapshot(fullPath)
 	entry, err := b.Store.LookupEntry(ctx, fullPath)
 	if err != nil {
 		if isLookupNotFound(err) {
 			listedEntry, ok, listErr := b.lookupFileFromDirectory(ctx, fullPath)
 			if listErr == nil && ok {
-				return b.attrFromEntry(ctx, fullPath, listedEntry)
+				attr, err := b.attrFromEntry(ctx, fullPath, listedEntry)
+				if err != nil {
+					return nil, err
+				}
+				return overlayPendingAttr(attr, pending), nil
 			}
 			if listErr != nil && !isLookupNotFound(listErr) {
 				return nil, listErr
 			}
+			if pending != nil {
+				return attrFromPending(pending), nil
+			}
 		}
 		return nil, mapLookupErr(err)
 	}
-	return b.attrFromEntry(ctx, fullPath, entry)
+	attr, err := b.attrFromEntry(ctx, fullPath, entry)
+	if err != nil {
+		return nil, err
+	}
+	return overlayPendingAttr(attr, pending), nil
 }
 
 func (b *Backend) lookupFileFromDirectory(ctx context.Context, fullPath string) (*filer_pb.Entry, bool, error) {
@@ -165,6 +296,9 @@ func (b *Backend) Mkdir(ctx context.Context, fullPath string, mode, uid, gid uin
 
 func (b *Backend) DeleteFile(ctx context.Context, fullPath string, isDir bool) error {
 	fullPath = cleanFullPath(fullPath)
+	if _, err := b.FlushFile(ctx, fullPath); err != nil {
+		return err
+	}
 	entry, err := b.Store.LookupEntry(ctx, fullPath)
 	if err != nil {
 		return mapLookupErr(err)
@@ -192,6 +326,12 @@ func (b *Backend) DeleteFile(ctx context.Context, fullPath string, isDir bool) e
 func (b *Backend) RenameEntry(ctx context.Context, oldPath, newPath string) error {
 	oldPath = cleanFullPath(oldPath)
 	newPath = cleanFullPath(newPath)
+	if _, err := b.FlushFile(ctx, oldPath); err != nil {
+		return err
+	}
+	if _, err := b.FlushFile(ctx, newPath); err != nil {
+		return err
+	}
 	if oldPath == newPath {
 		_, err := b.Store.LookupEntry(ctx, oldPath)
 		return mapLookupErr(err)
@@ -235,6 +375,12 @@ func (b *Backend) RenameEntry(ctx context.Context, oldPath, newPath string) erro
 func (b *Backend) LinkEntry(ctx context.Context, oldPath, newPath string) (*swvfsproto.Attr, error) {
 	oldPath = cleanFullPath(oldPath)
 	newPath = cleanFullPath(newPath)
+	if _, err := b.FlushFile(ctx, oldPath); err != nil {
+		return nil, err
+	}
+	if _, err := b.FlushFile(ctx, newPath); err != nil {
+		return nil, err
+	}
 	if newPath == "/" {
 		return nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoPerm, Msg: "cannot link over root"}
 	}
@@ -343,6 +489,9 @@ func (b *Backend) Mknod(ctx context.Context, fullPath string, mode, uid, gid, rd
 
 func (b *Backend) SetAttr(ctx context.Context, fullPath string, header swvfsproto.RequestHeader) (*swvfsproto.Attr, error) {
 	fullPath = cleanFullPath(fullPath)
+	if _, err := b.FlushFile(ctx, fullPath); err != nil {
+		return nil, err
+	}
 	entry, err := b.Store.LookupEntry(ctx, fullPath)
 	if err != nil {
 		return nil, mapLookupErr(err)
@@ -465,6 +614,9 @@ func (b *Backend) SetXAttr(ctx context.Context, fullPath, name string, value []b
 		return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoInval, Msg: "empty xattr name"}
 	}
 	fullPath = cleanFullPath(fullPath)
+	if _, err := b.FlushFile(ctx, fullPath); err != nil {
+		return err
+	}
 	entry, err := b.Store.LookupEntry(ctx, fullPath)
 	if err != nil {
 		return mapLookupErr(err)
@@ -501,26 +653,40 @@ func (b *Backend) ReadFile(ctx context.Context, fullPath string, offset, size ui
 	if b == nil || b.Store == nil || b.Router == nil {
 		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "swvfs filer backend is not configured"}
 	}
-	entry, err := b.Store.LookupEntry(ctx, cleanFullPath(fullPath))
+	fullPath = cleanFullPath(fullPath)
+	pending := b.pendingSnapshot(fullPath)
+	entry, err := b.Store.LookupEntry(ctx, fullPath)
 	if err != nil {
-		return nil, nil, mapLookupErr(err)
+		if !isLookupNotFound(err) || pending == nil {
+			return nil, nil, mapLookupErr(err)
+		}
+		attr := attrFromPending(pending)
+		if offset >= attr.Size || size == 0 {
+			return nil, attr, nil
+		}
+		readSize := minUint64(size, attr.Size-offset)
+		out := make([]byte, readSize)
+		overlayPendingData(out, offset, pending)
+		return out, attr, nil
 	}
 	if entry.IsDirectory {
 		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoInval, Msg: "cannot read a directory"}
 	}
-	attr := AttrFromEntry(fullPath, entry)
-	fileSize := entryFileSize(entry)
+	attr := overlayPendingAttr(AttrFromEntry(fullPath, entry), pending)
+	fileSize := attr.Size
 	if offset >= fileSize || size == 0 {
 		return nil, attr, nil
 	}
 	readSize := minUint64(size, fileSize-offset)
 
 	if len(entry.Content) > 0 {
+		out := make([]byte, readSize)
 		stop := minUint64(uint64(len(entry.Content)), offset+readSize)
-		if offset >= stop {
-			return nil, attr, nil
+		if offset < stop {
+			copy(out, entry.Content[offset:stop])
 		}
-		return append([]byte(nil), entry.Content[offset:stop]...), attr, nil
+		overlayPendingData(out, offset, pending)
+		return out, attr, nil
 	}
 
 	out := make([]byte, readSize)
@@ -551,8 +717,10 @@ func (b *Backend) ReadFile(ctx context.Context, fullPath string, offset, size ui
 			return nil, nil, err
 		}
 		dstStart := uint64(view.start) - offset
-		copy(out[dstStart:minUint64(uint64(len(out)), dstStart+uint64(view.size))], resp.Data)
+		dstEnd := minUint64(uint64(len(out)), dstStart+uint64(view.size))
+		copy(out[int(dstStart):int(dstEnd)], resp.Data)
 	}
+	overlayPendingData(out, offset, pending)
 	return out, attr, nil
 }
 
@@ -569,7 +737,66 @@ func (b *Backend) WriteFile(ctx context.Context, fullPath string, offset uint64,
 		return AttrFromEntry(fullPath, entry), nil
 	}
 
-	fileID, volumeServer, err := b.Store.AssignVolume(ctx, fullPath, uint64(len(data)))
+	payload := append([]byte(nil), data...)
+	for {
+		var flush *pendingWrite
+		b.mu.Lock()
+		if b.pending == nil {
+			b.pending = make(map[string]*pendingWrite)
+		}
+		pending := b.pending[fullPath]
+		if pending != nil && offset != pending.end() {
+			flush = pending
+			delete(b.pending, fullPath)
+			b.mu.Unlock()
+			if _, err := b.persistPendingWrite(ctx, flush); err != nil {
+				return nil, err
+			}
+			continue
+		}
+		if pending == nil {
+			pending = &pendingWrite{
+				path:       fullPath,
+				offset:     offset,
+				mode:       mode,
+				uid:        uid,
+				gid:        gid,
+				preferRDMA: preferRDMA,
+			}
+			b.pending[fullPath] = pending
+		}
+		pending.data = append(pending.data, payload...)
+		pending.preferRDMA = pending.preferRDMA || preferRDMA
+		pending.updated = time.Now()
+		if len(pending.data) >= defaultBufferedWriteMax {
+			flush = pending
+			delete(b.pending, fullPath)
+			b.mu.Unlock()
+			return b.persistPendingWrite(ctx, flush)
+		}
+		attr := attrFromPending(pending)
+		b.mu.Unlock()
+		return attr, nil
+	}
+}
+
+func (b *Backend) FlushFile(ctx context.Context, fullPath string) (*swvfsproto.Attr, error) {
+	pending := b.takePending(fullPath)
+	if pending == nil {
+		return nil, nil
+	}
+	return b.persistPendingWrite(ctx, pending)
+}
+
+func (b *Backend) persistPendingWrite(ctx context.Context, pending *pendingWrite) (*swvfsproto.Attr, error) {
+	if pending == nil || len(pending.data) == 0 {
+		return nil, nil
+	}
+	mode := pending.mode
+	if mode == 0 {
+		mode = defaultRegularMode
+	}
+	fileID, volumeServer, err := b.Store.AssignVolume(ctx, pending.path, uint64(len(pending.data)))
 	if err != nil {
 		return nil, err
 	}
@@ -577,13 +804,12 @@ func (b *Backend) WriteFile(ctx context.Context, fullPath string, offset uint64,
 		FileID:       fileID,
 		VolumeServer: volumeServer,
 		RDMAServer:   volumeServer,
-		Data:         data,
-		PreferRDMA:   preferRDMA,
+		Data:         pending.data,
+		PreferRDMA:   pending.preferRDMA,
 	}); err != nil {
 		return nil, err
 	}
-
-	entry, err := b.lookupOrCreateEntry(ctx, fullPath, mode, uid, gid)
+	entry, err := b.lookupOrCreateEntry(ctx, pending.path, mode, pending.uid, pending.gid)
 	if err != nil {
 		return nil, err
 	}
@@ -591,22 +817,22 @@ func (b *Backend) WriteFile(ctx context.Context, fullPath string, offset uint64,
 	tsNs := now.UnixNano()
 	entry.Chunks = append(entry.GetChunks(), &filer_pb.FileChunk{
 		FileId:       fileID,
-		Offset:       int64(offset),
-		Size:         uint64(len(data)),
+		Offset:       int64(pending.offset),
+		Size:         uint64(len(pending.data)),
 		ModifiedTsNs: tsNs,
 	})
 	if entry.Attributes == nil {
 		entry.Attributes = &filer_pb.FuseAttributes{}
 	}
-	entry.Attributes.FileSize = maxUint64(entry.Attributes.FileSize, offset+uint64(len(data)))
+	entry.Attributes.FileSize = maxUint64(entry.Attributes.FileSize, pending.end())
 	entry.Attributes.Mtime = now.Unix()
 	entry.Attributes.MtimeNs = int32(now.Nanosecond())
 	entry.Attributes.Ctime = now.Unix()
 	entry.Attributes.CtimeNs = int32(now.Nanosecond())
-	if err := b.Store.SaveEntry(ctx, fullPath, entry); err != nil {
+	if err := b.Store.SaveEntry(ctx, pending.path, entry); err != nil {
 		return nil, err
 	}
-	return AttrFromEntry(fullPath, entry), nil
+	return AttrFromEntry(pending.path, entry), nil
 }
 
 func (b *Backend) lookupOrCreateEntry(ctx context.Context, fullPath string, mode, uid, gid uint32) (*filer_pb.Entry, error) {
