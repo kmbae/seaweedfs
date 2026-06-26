@@ -8,6 +8,7 @@ import (
 	"sort"
 	"syscall"
 	"testing"
+	"time"
 
 	"seaweedfs-rdma-sidecar/pkg/swvfsdaemon"
 	"seaweedfs-rdma-sidecar/pkg/swvfsproto"
@@ -234,6 +235,46 @@ func TestBackendMkdirStoresDirectoryMode(t *testing.T) {
 	}
 	if attr.Mode&uint32(syscall.S_IFMT) != uint32(syscall.S_IFDIR) {
 		t.Fatalf("attr mode is not a directory: %#o", attr.Mode)
+	}
+}
+
+func TestBackendCreateFileTouchesParentTimes(t *testing.T) {
+	store := &fakeStore{entries: map[string]*filer_pb.Entry{
+		"/dir": {
+			Name:        "dir",
+			IsDirectory: true,
+			Attributes: &filer_pb.FuseAttributes{
+				FileMode: uint32(os.ModeDir | 0755),
+				Mtime:    1,
+				Ctime:    1,
+			},
+		},
+	}}
+	backend := &Backend{Store: store}
+	if _, err := backend.CreateFile(context.Background(), "/dir/file", uint32(syscall.S_IFREG|0644), 1000, 1000); err != nil {
+		t.Fatalf("CreateFile: %v", err)
+	}
+	parent := store.entries["/dir"]
+	if parent.Attributes.GetMtime() <= 1 || parent.Attributes.GetCtime() <= 1 {
+		t.Fatalf("parent times were not touched: %+v", parent.Attributes)
+	}
+}
+
+func TestNewEntriesDoNotReusePathHashInode(t *testing.T) {
+	file := newEntry("/same/path", false, uint32(syscall.S_IFREG|0644), 1000, 1000)
+	time.Sleep(time.Nanosecond)
+	fifo := newSpecialEntry("/same/path", uint32(syscall.S_IFIFO|0644), 1000, 1000, 0)
+
+	fileAttr := AttrFromEntry("/same/path", file)
+	fifoAttr := AttrFromEntry("/same/path", fifo)
+	if fileAttr.Ino == 0 || fifoAttr.Ino == 0 {
+		t.Fatalf("new entry inode is zero: file=%d fifo=%d", fileAttr.Ino, fifoAttr.Ino)
+	}
+	if fileAttr.Ino == fifoAttr.Ino {
+		t.Fatalf("new entries reused inode for same path: %d", fileAttr.Ino)
+	}
+	if fileAttr.Ino == stableInode("/same/path") || fifoAttr.Ino == stableInode("/same/path") {
+		t.Fatalf("new entry fell back to path hash inode: file=%d fifo=%d", fileAttr.Ino, fifoAttr.Ino)
 	}
 }
 

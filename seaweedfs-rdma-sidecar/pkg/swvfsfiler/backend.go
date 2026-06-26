@@ -137,7 +137,11 @@ func (b *Backend) ReadDir(ctx context.Context, fullPath string, offset uint64, l
 
 func (b *Backend) CreateFile(ctx context.Context, fullPath string, mode, uid, gid uint32) (*swvfsproto.Attr, error) {
 	entry := newEntry(fullPath, false, mode, uid, gid)
-	if err := b.Store.SaveEntry(ctx, cleanFullPath(fullPath), entry); err != nil {
+	fullPath = cleanFullPath(fullPath)
+	if err := b.Store.SaveEntry(ctx, fullPath, entry); err != nil {
+		return nil, err
+	}
+	if err := b.touchParent(ctx, fullPath); err != nil {
 		return nil, err
 	}
 	return AttrFromEntry(fullPath, entry), nil
@@ -145,7 +149,11 @@ func (b *Backend) CreateFile(ctx context.Context, fullPath string, mode, uid, gi
 
 func (b *Backend) Mkdir(ctx context.Context, fullPath string, mode, uid, gid uint32) (*swvfsproto.Attr, error) {
 	entry := newEntry(fullPath, true, mode, uid, gid)
-	if err := b.Store.SaveEntry(ctx, cleanFullPath(fullPath), entry); err != nil {
+	fullPath = cleanFullPath(fullPath)
+	if err := b.Store.SaveEntry(ctx, fullPath, entry); err != nil {
+		return nil, err
+	}
+	if err := b.touchParent(ctx, fullPath); err != nil {
 		return nil, err
 	}
 	return AttrFromEntry(fullPath, entry), nil
@@ -171,11 +179,27 @@ func (b *Backend) DeleteFile(ctx context.Context, fullPath string, isDir bool) e
 	} else if entry.IsDirectory {
 		return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoIsDir, Msg: "is a directory"}
 	}
-	return b.Store.DeleteEntry(ctx, fullPath, false)
+	if err := b.Store.DeleteEntry(ctx, fullPath, false); err != nil {
+		return err
+	}
+	return b.touchParent(ctx, fullPath)
 }
 
 func (b *Backend) RenameEntry(ctx context.Context, oldPath, newPath string) error {
-	return b.Store.RenameEntry(ctx, cleanFullPath(oldPath), cleanFullPath(newPath))
+	oldPath = cleanFullPath(oldPath)
+	newPath = cleanFullPath(newPath)
+	if err := b.Store.RenameEntry(ctx, oldPath, newPath); err != nil {
+		return err
+	}
+	if err := b.touchParent(ctx, oldPath); err != nil {
+		return err
+	}
+	oldDir, _ := splitFullPath(oldPath)
+	newDir, _ := splitFullPath(newPath)
+	if newDir != oldDir {
+		return b.touchParent(ctx, newPath)
+	}
+	return nil
 }
 
 func (b *Backend) LinkEntry(ctx context.Context, oldPath, newPath string) (*swvfsproto.Attr, error) {
@@ -236,6 +260,9 @@ func (b *Backend) LinkEntry(ctx context.Context, oldPath, newPath string) (*swvf
 		}
 		return nil, err
 	}
+	if err := b.touchParent(ctx, newPath); err != nil {
+		return nil, err
+	}
 	return AttrFromEntry(oldPath, updated), nil
 }
 
@@ -252,6 +279,9 @@ func (b *Backend) Symlink(ctx context.Context, linkPath, target string, uid, gid
 	linkPath = cleanFullPath(linkPath)
 	entry := newSymlinkEntry(linkPath, target, uid, gid)
 	if err := b.Store.SaveEntry(ctx, linkPath, entry); err != nil {
+		return nil, err
+	}
+	if err := b.touchParent(ctx, linkPath); err != nil {
 		return nil, err
 	}
 	return AttrFromEntry(linkPath, entry), nil
@@ -273,6 +303,9 @@ func (b *Backend) Mknod(ctx context.Context, fullPath string, mode, uid, gid, rd
 	fullPath = cleanFullPath(fullPath)
 	entry := newSpecialEntry(fullPath, mode, uid, gid, rdev)
 	if err := b.Store.SaveEntry(ctx, fullPath, entry); err != nil {
+		return nil, err
+	}
+	if err := b.touchParent(ctx, fullPath); err != nil {
 		return nil, err
 	}
 	return AttrFromEntry(fullPath, entry), nil
@@ -645,6 +678,7 @@ func newEntry(fullPath string, isDir bool, mode, uid, gid uint32) *filer_pb.Entr
 		Name:        path.Base(cleanFullPath(fullPath)),
 		IsDirectory: isDir,
 		Attributes: &filer_pb.FuseAttributes{
+			Inode:    newEntryInode(fullPath, now),
 			FileMode: linuxModeToFileMode(mode, isDir),
 			Uid:      uid,
 			Gid:      gid,
@@ -663,6 +697,7 @@ func newSymlinkEntry(fullPath, target string, uid, gid uint32) *filer_pb.Entry {
 	return &filer_pb.Entry{
 		Name: path.Base(cleanFullPath(fullPath)),
 		Attributes: &filer_pb.FuseAttributes{
+			Inode:         newEntryInode(fullPath, now),
 			FileMode:      uint32(os.ModeSymlink | 0777),
 			Uid:           uid,
 			Gid:           gid,
@@ -683,6 +718,7 @@ func newSpecialEntry(fullPath string, mode, uid, gid, rdev uint32) *filer_pb.Ent
 	return &filer_pb.Entry{
 		Name: path.Base(cleanFullPath(fullPath)),
 		Attributes: &filer_pb.FuseAttributes{
+			Inode:    newEntryInode(fullPath, now),
 			FileMode: linuxModeToFileMode(mode, false),
 			Uid:      uid,
 			Gid:      gid,
@@ -695,6 +731,30 @@ func newSpecialEntry(fullPath string, mode, uid, gid, rdev uint32) *filer_pb.Ent
 			CrtimeNs: int32(now.Nanosecond()),
 		},
 	}
+}
+
+func (b *Backend) touchParent(ctx context.Context, fullPath string) error {
+	dir, _ := splitFullPath(fullPath)
+	if dir == "" || dir == "/" {
+		return nil
+	}
+	parent, err := b.Store.LookupEntry(ctx, dir)
+	if err != nil {
+		if isLookupNotFound(err) {
+			return nil
+		}
+		return mapLookupErr(err)
+	}
+	parent = proto.Clone(parent).(*filer_pb.Entry)
+	if parent.Attributes == nil {
+		parent.Attributes = &filer_pb.FuseAttributes{FileMode: uint32(os.ModeDir | 0755)}
+	}
+	now := time.Now()
+	parent.Attributes.Mtime = now.Unix()
+	parent.Attributes.MtimeNs = int32(now.Nanosecond())
+	parent.Attributes.Ctime = now.Unix()
+	parent.Attributes.CtimeNs = int32(now.Nanosecond())
+	return b.Store.SaveEntry(ctx, dir, parent)
 }
 
 func normalizeFileMode(isDir bool, mode uint32) uint32 {
@@ -959,6 +1019,12 @@ func isLookupNotFound(err error) bool {
 func stableInode(fullPath string) uint64 {
 	h := fnv.New64a()
 	_, _ = h.Write([]byte(cleanFullPath(fullPath)))
+	return normalizeInode(h.Sum64())
+}
+
+func newEntryInode(fullPath string, now time.Time) uint64 {
+	h := fnv.New64a()
+	_, _ = fmt.Fprintf(h, "%s\x00%d\x00%d", cleanFullPath(fullPath), now.UnixNano(), os.Getpid())
 	return normalizeInode(h.Sum64())
 }
 
