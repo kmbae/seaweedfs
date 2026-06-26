@@ -14,6 +14,8 @@ type fakeFileBackend struct {
 	writePreferRDMA bool
 	renamedOld      string
 	renamedNew      string
+	linkedOld       string
+	linkedNew       string
 	symlinkPath     string
 	symlinkTarget   string
 	mknodPath       string
@@ -48,6 +50,12 @@ func (f *fakeFileBackend) RenameEntry(ctx context.Context, oldPath, newPath stri
 	f.renamedOld = oldPath
 	f.renamedNew = newPath
 	return nil
+}
+
+func (f *fakeFileBackend) LinkEntry(ctx context.Context, oldPath, newPath string) (*swvfsproto.Attr, error) {
+	f.linkedOld = oldPath
+	f.linkedNew = newPath
+	return &swvfsproto.Attr{Ino: 1, Size: 4, Mode: 0100644, Nlink: 2}, nil
 }
 
 func (f *fakeFileBackend) Symlink(ctx context.Context, linkPath, target string, uid, gid uint32) (*swvfsproto.Attr, error) {
@@ -154,7 +162,19 @@ func TestHandlerMetadataMutations(t *testing.T) {
 	}
 
 	reply, err := h.Handle(context.Background(), &swvfsproto.Request{
-		Header: swvfsproto.RequestHeader{Tag: 2, Op: swvfsproto.OpSymlink, UID: 1000, GID: 1000},
+		Header: swvfsproto.RequestHeader{Tag: 2, Op: swvfsproto.OpLink},
+		Path1:  "/old",
+		Path2:  "/hard",
+	})
+	if err != nil {
+		t.Fatalf("link Handle: %v", err)
+	}
+	if backend.linkedOld != "/old" || backend.linkedNew != "/hard" || reply.Attr.Nlink != 2 {
+		t.Fatalf("link mismatch: old=%q new=%q reply=%+v", backend.linkedOld, backend.linkedNew, reply.Attr)
+	}
+
+	reply, err = h.Handle(context.Background(), &swvfsproto.Request{
+		Header: swvfsproto.RequestHeader{Tag: 3, Op: swvfsproto.OpSymlink, UID: 1000, GID: 1000},
 		Path1:  "/link",
 		Path2:  "target",
 	})
@@ -166,7 +186,7 @@ func TestHandlerMetadataMutations(t *testing.T) {
 	}
 
 	reply, err = h.Handle(context.Background(), &swvfsproto.Request{
-		Header: swvfsproto.RequestHeader{Tag: 3, Op: swvfsproto.OpReadLink},
+		Header: swvfsproto.RequestHeader{Tag: 4, Op: swvfsproto.OpReadLink},
 		Path1:  "/link",
 	})
 	if err != nil {
@@ -177,7 +197,7 @@ func TestHandlerMetadataMutations(t *testing.T) {
 	}
 
 	reply, err = h.Handle(context.Background(), &swvfsproto.Request{
-		Header: swvfsproto.RequestHeader{Tag: 4, Op: swvfsproto.OpMknod, Mode: uint32(syscall.S_IFIFO | 0600), UID: 1000, GID: 1000, Size: 123},
+		Header: swvfsproto.RequestHeader{Tag: 5, Op: swvfsproto.OpMknod, Mode: uint32(syscall.S_IFIFO | 0600), UID: 1000, GID: 1000, Size: 123},
 		Path1:  "/fifo",
 	})
 	if err != nil {

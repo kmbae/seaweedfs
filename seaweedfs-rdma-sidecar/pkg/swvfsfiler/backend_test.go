@@ -378,6 +378,54 @@ func TestBackendRenameEntry(t *testing.T) {
 	}
 }
 
+func TestBackendLinkEntryStoresHardLinkMetadata(t *testing.T) {
+	store := &fakeStore{entries: map[string]*filer_pb.Entry{
+		"/file": {Name: "file", Attributes: &filer_pb.FuseAttributes{FileMode: 0644, FileSize: 9}},
+	}}
+	backend := &Backend{Store: store}
+
+	attr, err := backend.LinkEntry(context.Background(), "/file", "/hard")
+	if err != nil {
+		t.Fatalf("LinkEntry: %v", err)
+	}
+	if attr.Nlink != 2 {
+		t.Fatalf("link attr nlink = %d", attr.Nlink)
+	}
+	source := store.entries["/file"]
+	linked := store.entries["/hard"]
+	if source == nil || linked == nil {
+		t.Fatalf("entries missing after link: %+v", store.entries)
+	}
+	if len(source.HardLinkId) == 0 || string(source.HardLinkId) != string(linked.HardLinkId) {
+		t.Fatalf("hardlink ids differ: source=%x linked=%x", source.HardLinkId, linked.HardLinkId)
+	}
+	if source.HardLinkCounter != 2 || linked.HardLinkCounter != 2 {
+		t.Fatalf("hardlink counters = source:%d linked:%d", source.HardLinkCounter, linked.HardLinkCounter)
+	}
+	if linked.Name != "hard" {
+		t.Fatalf("linked name = %q", linked.Name)
+	}
+
+	_, err = backend.LinkEntry(context.Background(), "/file", "/hard")
+	var errno swvfsdaemon.ErrnoError
+	if !errors.As(err, &errno) || errno.Errno != swvfsdaemon.ErrnoExist {
+		t.Fatalf("expected EEXIST for existing link path, got %v", err)
+	}
+}
+
+func TestBackendLinkEntryRejectsDirectories(t *testing.T) {
+	store := &fakeStore{entries: map[string]*filer_pb.Entry{
+		"/dir": {Name: "dir", IsDirectory: true, Attributes: &filer_pb.FuseAttributes{FileMode: uint32(os.ModeDir | 0755)}},
+	}}
+	backend := &Backend{Store: store}
+
+	_, err := backend.LinkEntry(context.Background(), "/dir", "/dir-link")
+	var errno swvfsdaemon.ErrnoError
+	if !errors.As(err, &errno) || errno.Errno != swvfsdaemon.ErrnoPerm {
+		t.Fatalf("expected EPERM for directory hardlink, got %v", err)
+	}
+}
+
 func TestBackendMknodStoresSpecialMode(t *testing.T) {
 	store := &fakeStore{entries: map[string]*filer_pb.Entry{}}
 	backend := &Backend{Store: store}

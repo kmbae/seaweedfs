@@ -3,6 +3,7 @@ package swvfsfiler
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
 	"fmt"
 	"hash/fnv"
@@ -175,6 +176,76 @@ func (b *Backend) DeleteFile(ctx context.Context, fullPath string, isDir bool) e
 
 func (b *Backend) RenameEntry(ctx context.Context, oldPath, newPath string) error {
 	return b.Store.RenameEntry(ctx, cleanFullPath(oldPath), cleanFullPath(newPath))
+}
+
+func (b *Backend) LinkEntry(ctx context.Context, oldPath, newPath string) (*swvfsproto.Attr, error) {
+	oldPath = cleanFullPath(oldPath)
+	newPath = cleanFullPath(newPath)
+	if newPath == "/" {
+		return nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoPerm, Msg: "cannot link over root"}
+	}
+	if _, err := b.Store.LookupEntry(ctx, newPath); err == nil {
+		return nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoExist, Msg: "link path exists"}
+	} else if !isLookupNotFound(err) {
+		return nil, mapLookupErr(err)
+	}
+
+	source, err := b.Store.LookupEntry(ctx, oldPath)
+	if err != nil {
+		return nil, mapLookupErr(err)
+	}
+	if source.IsDirectory {
+		return nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoPerm, Msg: "cannot hardlink a directory"}
+	}
+
+	original, ok := proto.Clone(source).(*filer_pb.Entry)
+	if !ok {
+		return nil, fmt.Errorf("clone hardlink source entry")
+	}
+	updated, ok := proto.Clone(source).(*filer_pb.Entry)
+	if !ok {
+		return nil, fmt.Errorf("clone hardlink updated source entry")
+	}
+	if updated.Attributes == nil {
+		updated.Attributes = &filer_pb.FuseAttributes{}
+	}
+	if len(updated.HardLinkId) == 0 {
+		id, err := newHardLinkID()
+		if err != nil {
+			return nil, err
+		}
+		updated.HardLinkId = id
+		updated.HardLinkCounter = 1
+	}
+	updated.HardLinkCounter++
+	now := time.Now()
+	updated.Attributes.Ctime = now.Unix()
+	updated.Attributes.CtimeNs = int32(now.Nanosecond())
+
+	if err := b.Store.SaveEntry(ctx, oldPath, updated); err != nil {
+		return nil, err
+	}
+	linked, ok := proto.Clone(updated).(*filer_pb.Entry)
+	if !ok {
+		return nil, fmt.Errorf("clone hardlink target entry")
+	}
+	linked.Name = path.Base(newPath)
+	if err := b.Store.SaveEntry(ctx, newPath, linked); err != nil {
+		if rollbackErr := b.Store.SaveEntry(ctx, oldPath, original); rollbackErr != nil {
+			return nil, fmt.Errorf("create hardlink: %w (rollback failed: %v)", err, rollbackErr)
+		}
+		return nil, err
+	}
+	return AttrFromEntry(oldPath, updated), nil
+}
+
+func newHardLinkID() ([]byte, error) {
+	id := make([]byte, 17)
+	if _, err := rand.Read(id[:16]); err != nil {
+		return nil, err
+	}
+	id[16] = 1
+	return id, nil
 }
 
 func (b *Backend) Symlink(ctx context.Context, linkPath, target string, uid, gid uint32) (*swvfsproto.Attr, error) {
@@ -537,6 +608,9 @@ func AttrFromEntry(fullPath string, entry *filer_pb.Entry) *swvfsproto.Attr {
 		if a.FileSize > attr.Size {
 			attr.Size = a.FileSize
 		}
+	}
+	if entry.HardLinkCounter > 0 {
+		attr.Nlink = uint32(entry.HardLinkCounter)
 	}
 	if attr.MtimeSec == 0 {
 		now := time.Now()

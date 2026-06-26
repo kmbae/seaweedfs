@@ -10,6 +10,7 @@ import (
 
 const (
 	ErrnoIO       int32 = -5
+	ErrnoPerm     int32 = -1
 	ErrnoNoEnt    int32 = -2
 	ErrnoNoSys    int32 = -38
 	ErrnoInval    int32 = -22
@@ -45,6 +46,7 @@ type MetadataBackend interface {
 	Mkdir(ctx context.Context, path string, mode, uid, gid uint32) (*swvfsproto.Attr, error)
 	DeleteFile(ctx context.Context, path string, recursive bool) error
 	RenameEntry(ctx context.Context, oldPath, newPath string) error
+	LinkEntry(ctx context.Context, oldPath, newPath string) (*swvfsproto.Attr, error)
 	Symlink(ctx context.Context, linkPath, target string, uid, gid uint32) (*swvfsproto.Attr, error)
 	ReadLink(ctx context.Context, linkPath string) ([]byte, error)
 	Mknod(ctx context.Context, path string, mode, uid, gid, rdev uint32) (*swvfsproto.Attr, error)
@@ -193,6 +195,22 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 			return nil, err
 		}
 		return &swvfsproto.Reply{Tag: req.Header.Tag}, nil
+	case swvfsproto.OpLink:
+		backend, ok := h.Backend.(interface {
+			LinkEntry(context.Context, string, string) (*swvfsproto.Attr, error)
+		})
+		if !ok {
+			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "link is not implemented"}
+		}
+		attr, err := backend.LinkEntry(ctx, req.Path1, req.Path2)
+		if err != nil {
+			return nil, err
+		}
+		reply := &swvfsproto.Reply{Tag: req.Header.Tag}
+		if attr != nil {
+			reply.Attr = *attr
+		}
+		return reply, nil
 	case swvfsproto.OpSymlink:
 		backend, ok := h.Backend.(interface {
 			Symlink(context.Context, string, string, uint32, uint32) (*swvfsproto.Attr, error)
