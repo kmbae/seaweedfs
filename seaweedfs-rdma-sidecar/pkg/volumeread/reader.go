@@ -52,6 +52,15 @@ func (r *Reader) ReadNeedle(volumeID uint32, needleID uint64, cookie uint32, off
 	)
 }
 
+// VolumeVersion returns the on-disk format version for a local volume.
+func (r *Reader) VolumeVersion(volumeID uint32) (needle.Version, error) {
+	vol, err := r.getVolume(needle.VolumeId(volumeID))
+	if err != nil {
+		return 0, err
+	}
+	return vol.Version(), nil
+}
+
 func (r *Reader) getVolume(id needle.VolumeId) (*storage.Volume, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

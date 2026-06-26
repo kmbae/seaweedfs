@@ -65,6 +65,37 @@ func TestAppend(t *testing.T) {
 	}
 }
 
+func TestEncodeNeedleBlobRoundTrip(t *testing.T) {
+	data := []byte("rdma direct volume write payload")
+	n := &Needle{
+		Id:           123,
+		Cookie:       456,
+		Data:         data,
+		LastModified: 0x12345,
+		Checksum:     NewCRC(data),
+	}
+	n.SetHasLastModifiedDate()
+
+	blob, size, err := EncodeNeedleBlob(n, Version3)
+	if err != nil {
+		t.Fatalf("EncodeNeedleBlob: %v", err)
+	}
+	if size != n.Size {
+		t.Fatalf("size = %d, want encoded size %d", size, n.Size)
+	}
+
+	decoded := new(Needle)
+	if err := decoded.ReadBytes(blob, 0, size, Version3); err != nil {
+		t.Fatalf("ReadBytes: %v", err)
+	}
+	if decoded.Id != n.Id || decoded.Cookie != n.Cookie {
+		t.Fatalf("decoded id/cookie = %d/%d, want %d/%d", decoded.Id, decoded.Cookie, n.Id, n.Cookie)
+	}
+	if !bytes.Equal(decoded.Data, data) {
+		t.Fatalf("decoded data = %q, want %q", decoded.Data, data)
+	}
+}
+
 func versionString(v Version) string {
 	switch v {
 	case Version1:

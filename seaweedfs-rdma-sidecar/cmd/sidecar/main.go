@@ -118,6 +118,7 @@ func runSidecar(cmd *cobra.Command, args []string) error {
 	mux := http.NewServeMux()
 	mux.Handle("/read", &httpserver.ReadHandler{Client: sfClient, Logger: logger, Timeout: timeout})
 	mux.Handle("/write", &httpserver.WriteHandler{Client: sfClient, Logger: logger, Timeout: timeout})
+	mux.Handle("/local-volume/", &httpserver.LocalVolumeHandler{Client: sfClient, Logger: logger, Timeout: timeout, VolumeServerURL: volumeServerURL})
 	mux.HandleFunc("/health", healthHandler(logger, healthRdma))
 	mux.HandleFunc("/rdma/worker-address", workerAddressHandler(healthRdma))
 	mux.HandleFunc("/rdma/capabilities", capabilitiesHandler(healthRdma))

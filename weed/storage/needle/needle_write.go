@@ -1,6 +1,7 @@
 package needle
 
 import (
+	"bytes"
 	"fmt"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -42,6 +43,17 @@ func (n *Needle) Append(w backend.BackendStorageFile, version Version) (offset u
 	}
 
 	return offset, size, actualSize, err
+}
+
+// EncodeNeedleBlob serializes a needle into the on-disk blob format expected by
+// WriteNeedleBlob. The volume server will stamp the final append timestamp.
+func EncodeNeedleBlob(n *Needle, version Version) (data []byte, size Size, err error) {
+	var bytesBuffer bytes.Buffer
+	_, _, err = writeNeedleByVersion(version, n, 0, &bytesBuffer)
+	if err != nil {
+		return nil, 0, err
+	}
+	return append([]byte(nil), bytesBuffer.Bytes()...), n.Size, nil
 }
 
 func WriteNeedleBlob(w backend.BackendStorageFile, dataSlice []byte, size Size, appendAtNs uint64, version Version) (offset uint64, err error) {

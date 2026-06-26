@@ -16,9 +16,14 @@ import (
 	"seaweedfs-rdma-sidecar/pkg/remote"
 	"seaweedfs-rdma-sidecar/pkg/volumeread"
 
+	"github.com/seaweedfs/seaweedfs/weed/operation"
+	"github.com/seaweedfs/seaweedfs/weed/pb"
+	"github.com/seaweedfs/seaweedfs/weed/pb/volume_server_pb"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 	"github.com/sirupsen/logrus"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // SeaweedFSRDMAClient provides SeaweedFS-specific RDMA operations
@@ -335,6 +340,18 @@ func (c *SeaweedFSRDMAClient) ReadNeedleRange(ctx context.Context, volumeID uint
 	return c.ReadNeedle(ctx, req)
 }
 
+// ReadLocalNeedle reads from the local shared volume directory without going
+// through the volume server HTTP handler. It is intended for volume-sidecars.
+func (c *SeaweedFSRDMAClient) ReadLocalNeedle(ctx context.Context, req *NeedleReadRequest) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if c.localReader == nil {
+		return nil, fmt.Errorf("local volume reader is not configured")
+	}
+	return c.localReader.ReadNeedle(req.VolumeID, req.NeedleID, req.Cookie, req.Offset, req.Size)
+}
+
 func (c *SeaweedFSRDMAClient) readNeedleViaRemoteRDMA(ctx context.Context, req *NeedleReadRequest, rdmaReq *rdma.ReadRequest) ([]byte, string, string, bool, error) {
 	if c.rdmaClient == nil || !c.rdmaClient.IsRealRdma() {
 		return nil, "", "", false, nil
@@ -475,6 +492,21 @@ func normalizedRemoteTransport(transport string) string {
 		return "tcp"
 	}
 	return transport
+}
+
+func volumeServerAddress(volumeServer string) (pb.ServerAddress, error) {
+	volumeServer = strings.TrimSpace(volumeServer)
+	if volumeServer == "" {
+		return "", fmt.Errorf("empty volume server URL")
+	}
+	if !strings.HasPrefix(volumeServer, "http://") {
+		volumeServer = "http://" + strings.TrimPrefix(volumeServer, "https://")
+	}
+	addr, _, err := pb.ParseUrl(volumeServer)
+	if err != nil {
+		return "", fmt.Errorf("parse volume server %q: %w", volumeServer, err)
+	}
+	return addr, nil
 }
 
 // httpFallback performs HTTP fallback read from SeaweedFS volume server
@@ -680,6 +712,67 @@ func (c *SeaweedFSRDMAClient) WriteNeedle(ctx context.Context, req *NeedleWriteR
 		RealRDMA:    false,
 		DataSource:  "http",
 	}, nil
+}
+
+// WriteNeedleBlobGRPC persists a raw payload via the volume server's blob gRPC
+// API. The payload is encoded locally using the target volume's on-disk version,
+// while the actual append and needle-map update remain inside the volume server.
+func (c *SeaweedFSRDMAClient) WriteNeedleBlobGRPC(ctx context.Context, req *NeedleWriteRequest) (string, error) {
+	if len(req.Data) == 0 {
+		return "", fmt.Errorf("empty write payload")
+	}
+
+	version := needle.GetCurrentVersion()
+	if c.localReader != nil {
+		localVersion, err := c.localReader.VolumeVersion(req.VolumeID)
+		if err != nil {
+			return "", fmt.Errorf("local volume version: %w", err)
+		}
+		version = localVersion
+	}
+
+	n := &needle.Needle{
+		Id:           types.NeedleId(req.NeedleID),
+		Cookie:       types.Cookie(req.Cookie),
+		Data:         req.Data,
+		LastModified: uint64(time.Now().Unix()),
+	}
+	n.SetHasLastModifiedDate()
+	n.Checksum = needle.NewCRC(n.Data)
+
+	blob, size, err := needle.EncodeNeedleBlob(n, version)
+	if err != nil {
+		return "", fmt.Errorf("encode needle blob: %w", err)
+	}
+
+	volumeServer := req.VolumeServer
+	if volumeServer == "" {
+		volumeServer = c.volumeServerURL
+	}
+	addr, err := volumeServerAddress(volumeServer)
+	if err != nil {
+		return "", err
+	}
+
+	dialOption := grpc.WithTransportCredentials(insecure.NewCredentials())
+	if err := operation.WithVolumeServerClient(false, addr, dialOption, func(client volume_server_pb.VolumeServerClient) error {
+		_, err := client.WriteNeedleBlob(ctx, &volume_server_pb.WriteNeedleBlobRequest{
+			VolumeId:   req.VolumeID,
+			NeedleId:   req.NeedleID,
+			Size:       int32(size),
+			NeedleBlob: blob,
+		})
+		return err
+	}); err != nil {
+		return "", fmt.Errorf("write needle blob to %s: %w", addr, err)
+	}
+
+	fileID := &needle.FileId{
+		VolumeId: needle.VolumeId(req.VolumeID),
+		Key:      types.NeedleId(req.NeedleID),
+		Cookie:   types.Cookie(req.Cookie),
+	}
+	return fileID.String(), nil
 }
 
 func (c *SeaweedFSRDMAClient) writeNeedleViaRemoteRDMA(ctx context.Context, req *NeedleWriteRequest, writeReq *rdma.WriteRequest) (string, string, bool, error) {
