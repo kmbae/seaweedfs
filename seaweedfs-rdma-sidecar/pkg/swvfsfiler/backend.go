@@ -8,6 +8,7 @@ import (
 	"hash/fnv"
 	"io"
 	"net/url"
+	"os"
 	"path"
 	"sort"
 	"strings"
@@ -379,14 +380,11 @@ func newEntry(fullPath string, isDir bool, mode, uid, gid uint32) *filer_pb.Entr
 }
 
 func normalizeFileMode(isDir bool, mode uint32) uint32 {
-	perm := mode & 07777
+	perm := os.FileMode(mode & 07777)
 	if isDir {
-		return uint32(syscall.S_IFDIR) | perm
+		return uint32(os.ModeDir | perm)
 	}
-	if mode&uint32(syscall.S_IFMT) != 0 {
-		return mode
-	}
-	return uint32(syscall.S_IFREG) | perm
+	return uint32(perm)
 }
 
 func direntType(entry *filer_pb.Entry) uint32 {

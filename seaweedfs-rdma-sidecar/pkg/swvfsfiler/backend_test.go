@@ -3,6 +3,7 @@ package swvfsfiler
 import (
 	"context"
 	"errors"
+	"os"
 	"syscall"
 	"testing"
 
@@ -169,7 +170,7 @@ func TestBackendMkdirStoresDirectoryMode(t *testing.T) {
 	if !entry.IsDirectory {
 		t.Fatal("entry was not marked as directory")
 	}
-	if entry.Attributes == nil || entry.Attributes.FileMode&uint32(syscall.S_IFMT) != uint32(syscall.S_IFDIR) {
+	if entry.Attributes == nil || os.FileMode(entry.Attributes.FileMode)&os.ModeDir == 0 {
 		t.Fatalf("saved mode is not a directory: %#o", entry.Attributes.GetFileMode())
 	}
 	if attr.Mode&uint32(syscall.S_IFMT) != uint32(syscall.S_IFDIR) {
