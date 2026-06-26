@@ -8,7 +8,7 @@
 
 use crate::{RdmaError, RdmaResult};
 use parking_lot::Mutex;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -36,6 +36,9 @@ const VERSION_3: u8 = 3;
 const FLAG_IS_COMPRESSED: u8 = 0x01;
 const FLAG_IS_CHUNK_MANIFEST: u8 = 0x80;
 
+const DEFAULT_LOCAL_NEEDLE_CACHE_BYTES: usize = 256 * 1024 * 1024;
+const DEFAULT_LOCAL_NEEDLE_CACHE_ENTRIES: usize = 128;
+
 /// Read-only direct reader for local SeaweedFS `.dat/.idx` files.
 pub struct LocalVolumeReader {
     data_dir: PathBuf,
@@ -51,6 +54,7 @@ struct VolumeIndex {
     idx_meta: IndexMeta,
     version: u8,
     entries: HashMap<u64, IndexEntry>,
+    needle_cache: Mutex<NeedleDataCache>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -63,6 +67,21 @@ struct IndexEntry {
 struct IndexMeta {
     len: u64,
     modified: Option<SystemTime>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct NeedleCacheKey {
+    needle_id: u64,
+    cookie: u32,
+}
+
+#[derive(Debug)]
+struct NeedleDataCache {
+    max_bytes: usize,
+    max_entries: usize,
+    bytes: usize,
+    items: HashMap<NeedleCacheKey, Arc<Vec<u8>>>,
+    order: VecDeque<NeedleCacheKey>,
 }
 
 impl LocalVolumeReader {
@@ -162,6 +181,7 @@ impl VolumeIndex {
             idx_meta,
             version,
             entries,
+            needle_cache: Mutex::new(NeedleDataCache::from_env()),
         })
     }
 
@@ -185,6 +205,10 @@ impl VolumeIndex {
             .ok_or(LocalVolumeError::NotFound)?;
         if entry.offset == 0 || entry.size <= 0 {
             return Err(LocalVolumeError::NotFound);
+        }
+        let cache_key = NeedleCacheKey { needle_id, cookie };
+        if let Some(data) = self.needle_cache.lock().get(&cache_key) {
+            return Ok(slice_plain_data(&data, offset, size));
         }
 
         let dat = File::open(&self.dat_path)?;
@@ -217,19 +241,94 @@ impl VolumeIndex {
             entry.offset + NEEDLE_HEADER_SIZE as u64,
             body_len as usize,
         )?;
-        let data = extract_plain_data(&body, entry.size, self.version)?;
-
-        let start = offset as usize;
-        if start >= data.len() {
-            return Ok(Vec::new());
-        }
-        let end = if size == 0 {
-            data.len()
-        } else {
-            start.saturating_add(size as usize).min(data.len())
-        };
-        Ok(data[start..end].to_vec())
+        let data = Arc::new(extract_plain_data(&body, entry.size, self.version)?);
+        self.needle_cache.lock().insert(cache_key, data.clone());
+        Ok(slice_plain_data(&data, offset, size))
     }
+}
+
+impl NeedleDataCache {
+    fn from_env() -> Self {
+        Self {
+            max_bytes: env_usize(
+                "SEAWEEDFS_RDMA_LOCAL_NEEDLE_CACHE_BYTES",
+                DEFAULT_LOCAL_NEEDLE_CACHE_BYTES,
+            ),
+            max_entries: env_usize(
+                "SEAWEEDFS_RDMA_LOCAL_NEEDLE_CACHE_ENTRIES",
+                DEFAULT_LOCAL_NEEDLE_CACHE_ENTRIES,
+            ),
+            bytes: 0,
+            items: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn get(&mut self, key: &NeedleCacheKey) -> Option<Arc<Vec<u8>>> {
+        let data = self.items.get(key).cloned()?;
+        self.touch(key);
+        Some(data)
+    }
+
+    fn insert(&mut self, key: NeedleCacheKey, data: Arc<Vec<u8>>) {
+        if !self.enabled() || data.len() > self.max_bytes {
+            return;
+        }
+        if let Some(old) = self.items.remove(&key) {
+            self.bytes = self.bytes.saturating_sub(old.len());
+            self.remove_order(&key);
+        }
+        self.bytes += data.len();
+        self.items.insert(key, data);
+        self.order.push_back(key);
+        self.evict();
+    }
+
+    fn enabled(&self) -> bool {
+        self.max_bytes > 0 && self.max_entries > 0
+    }
+
+    fn evict(&mut self) {
+        while self.bytes > self.max_bytes || self.items.len() > self.max_entries {
+            let Some(key) = self.order.pop_front() else {
+                break;
+            };
+            if let Some(data) = self.items.remove(&key) {
+                self.bytes = self.bytes.saturating_sub(data.len());
+            }
+        }
+    }
+
+    fn touch(&mut self, key: &NeedleCacheKey) {
+        self.remove_order(key);
+        self.order.push_back(*key);
+    }
+
+    fn remove_order(&mut self, key: &NeedleCacheKey) {
+        if let Some(pos) = self.order.iter().position(|candidate| candidate == key) {
+            self.order.remove(pos);
+        }
+    }
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .unwrap_or(default)
+}
+
+fn slice_plain_data(data: &[u8], offset: u64, size: u64) -> Vec<u8> {
+    let start = offset as usize;
+    if start >= data.len() {
+        return Vec::new();
+    }
+    let end = if size == 0 {
+        data.len()
+    } else {
+        start.saturating_add(size as usize).min(data.len())
+    };
+    data[start..end].to_vec()
 }
 
 impl IndexMeta {
@@ -519,6 +618,24 @@ mod tests {
         let reader = LocalVolumeReader::new(dir.path(), dir.path(), "");
         let got = reader.read_needle(7, 42, 0x1122_3344, 6, 11).unwrap();
         assert_eq!(got, b"direct rdma");
+    }
+
+    #[test]
+    fn caches_plain_needle_data_for_subsequent_ranges() {
+        let dir = tempdir().unwrap();
+        let data = b"hello direct rdma local volume";
+        write_test_volume(dir.path(), 7, 42, 0x1122_3344, data, 3);
+
+        let reader = LocalVolumeReader::new(dir.path(), dir.path(), "");
+        assert_eq!(
+            reader.read_needle(7, 42, 0x1122_3344, 0, 5).unwrap(),
+            b"hello"
+        );
+        std::fs::remove_file(dir.path().join("7.dat")).unwrap();
+        assert_eq!(
+            reader.read_needle(7, 42, 0x1122_3344, 6, 11).unwrap(),
+            b"direct rdma"
+        );
     }
 
     #[test]
