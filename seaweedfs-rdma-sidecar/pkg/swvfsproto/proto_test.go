@@ -40,6 +40,29 @@ func TestRequestEncodeDecode(t *testing.T) {
 	}
 }
 
+func TestDecodeRequestDataAliasesInputBuffer(t *testing.T) {
+	req := &Request{
+		Header: RequestHeader{
+			Tag: 1,
+			Op:  OpWrite,
+		},
+		Path1: "/bench/file",
+		Data:  []byte("abc"),
+	}
+	encoded, err := req.Encode()
+	if err != nil {
+		t.Fatalf("Encode: %v", err)
+	}
+	got, err := DecodeRequest(encoded)
+	if err != nil {
+		t.Fatalf("DecodeRequest: %v", err)
+	}
+	encoded[len(encoded)-1] = 'z'
+	if string(got.Data) != "abz" {
+		t.Fatalf("data = %q, want borrowed payload to reflect input buffer mutation", got.Data)
+	}
+}
+
 func TestDecodeRequestRejectsBadLength(t *testing.T) {
 	buf := make([]byte, RequestHeaderSize)
 	binary.LittleEndian.PutUint32(buf[44:48], 10)

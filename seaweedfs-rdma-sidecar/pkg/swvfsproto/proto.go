@@ -107,6 +107,9 @@ func (r *Request) WriteRDMAPreferred() bool {
 	return r != nil && r.Header.Op == OpWrite && r.Header.Valid&WriteFRDMAPreferred != 0
 }
 
+// DecodeRequest decodes a kernel request. Path strings are copied by Go string
+// conversion, but Data aliases buf to avoid an extra large write-payload copy.
+// Callers that need to retain Data beyond the lifetime of buf must copy it.
 func DecodeRequest(buf []byte) (*Request, error) {
 	if len(buf) < RequestHeaderSize {
 		return nil, fmt.Errorf("%w: got %d need %d", ErrShortRequest, len(buf), RequestHeaderSize)
@@ -124,7 +127,7 @@ func DecodeRequest(buf []byte) (*Request, error) {
 	pos += int(h.Plen1)
 	path2 := string(buf[pos : pos+int(h.Plen2)])
 	pos += int(h.Plen2)
-	data := append([]byte(nil), buf[pos:pos+int(h.Dlen)]...)
+	data := buf[pos : pos+int(h.Dlen)]
 	return &Request{Header: h, Path1: path1, Path2: path2, Data: data}, nil
 }
 
