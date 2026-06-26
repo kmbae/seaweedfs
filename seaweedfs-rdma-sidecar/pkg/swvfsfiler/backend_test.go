@@ -17,6 +17,7 @@ import (
 
 type fakeStore struct {
 	entries      map[string]*filer_pb.Entry
+	lookupMisses map[string]bool
 	savedPath    string
 	assignedPath string
 	totalSize    uint64
@@ -25,6 +26,9 @@ type fakeStore struct {
 }
 
 func (s *fakeStore) LookupEntry(ctx context.Context, fullPath string) (*filer_pb.Entry, error) {
+	if s.lookupMisses[fullPath] {
+		return nil, filer_pb.ErrNotFound
+	}
 	entry := s.entries[fullPath]
 	if entry == nil {
 		return nil, filer_pb.ErrNotFound
@@ -45,10 +49,43 @@ func (s *fakeStore) ListEntries(ctx context.Context, dir string, start string, l
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].Name < entries[j].Name
 	})
+	if start != "" {
+		keep := entries[:0]
+		for _, entry := range entries {
+			if entry.Name > start {
+				keep = append(keep, entry)
+			}
+		}
+		entries = keep
+	}
 	if len(entries) > int(limit) {
 		return entries[:limit], false, nil
 	}
 	return entries, true, nil
+}
+
+func TestBackendLookupFallsBackToDirectoryListing(t *testing.T) {
+	store := &fakeStore{
+		entries: map[string]*filer_pb.Entry{
+			"/dir/file": {
+				Name: "file",
+				Attributes: &filer_pb.FuseAttributes{
+					FileMode: 0644,
+					FileSize: 13,
+				},
+			},
+		},
+		lookupMisses: map[string]bool{"/dir/file": true},
+	}
+	backend := &Backend{Store: store}
+
+	attr, err := backend.LookupFile(context.Background(), "/dir/file")
+	if err != nil {
+		t.Fatalf("LookupFile: %v", err)
+	}
+	if attr == nil || attr.Size != 13 || attr.Mode&0777 != 0644 {
+		t.Fatalf("unexpected attr: %+v", attr)
+	}
 }
 
 func (s *fakeStore) SaveEntry(ctx context.Context, fullPath string, entry *filer_pb.Entry) error {

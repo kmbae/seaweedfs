@@ -55,9 +55,47 @@ func (b *Backend) LookupFile(ctx context.Context, fullPath string) (*swvfsproto.
 	}
 	entry, err := b.Store.LookupEntry(ctx, fullPath)
 	if err != nil {
+		if isLookupNotFound(err) {
+			listedEntry, ok, listErr := b.lookupFileFromDirectory(ctx, fullPath)
+			if listErr == nil && ok {
+				return AttrFromEntry(fullPath, listedEntry), nil
+			}
+			if listErr != nil && !isLookupNotFound(listErr) {
+				return nil, listErr
+			}
+		}
 		return nil, mapLookupErr(err)
 	}
 	return AttrFromEntry(fullPath, entry), nil
+}
+
+func (b *Backend) lookupFileFromDirectory(ctx context.Context, fullPath string) (*filer_pb.Entry, bool, error) {
+	dir, name := splitFullPath(fullPath)
+	if name == "" {
+		return nil, false, nil
+	}
+
+	start := ""
+	for i := 0; i < 16; i++ {
+		entries, eof, err := b.Store.ListEntries(ctx, dir, start, swvfsproto.MaxDirents)
+		if err != nil {
+			return nil, false, err
+		}
+		if len(entries) == 0 {
+			return nil, false, nil
+		}
+		for _, entry := range entries {
+			if entry != nil && entry.Name == name {
+				return entry, true, nil
+			}
+		}
+		last := entries[len(entries)-1]
+		if eof || last == nil || last.Name == "" || last.Name >= name {
+			return nil, false, nil
+		}
+		start = last.Name
+	}
+	return nil, false, nil
 }
 
 func (b *Backend) ReadDir(ctx context.Context, fullPath string, offset uint64, limit uint32) ([]swvfsproto.Dirent, bool, error) {
@@ -831,10 +869,14 @@ func mapLookupErr(err error) error {
 	if err == nil {
 		return nil
 	}
-	if errors.Is(err, filer_pb.ErrNotFound) || errors.Is(err, io.EOF) {
+	if isLookupNotFound(err) {
 		return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoEnt, Msg: err.Error()}
 	}
 	return err
+}
+
+func isLookupNotFound(err error) bool {
+	return errors.Is(err, filer_pb.ErrNotFound) || errors.Is(err, io.EOF)
 }
 
 func stableInode(fullPath string) uint64 {
