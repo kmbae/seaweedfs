@@ -8,6 +8,8 @@ use crate::{ipc::MAX_IPC_MESSAGE_SIZE, rdma::RdmaContext, RdmaEngineConfig, Rdma
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -93,6 +95,12 @@ pub struct RemoteNeedleWriteResponse {
 
 fn default_transport() -> String {
     "tcp".to_string()
+}
+
+fn peer_cache_key(prefix: &str, volume_id: u32, needle_id: u64, worker_address: &[u8]) -> String {
+    let mut hasher = DefaultHasher::new();
+    worker_address.hash(&mut hasher);
+    format!("{}-{}-{}-{:016x}", prefix, volume_id, needle_id, hasher.finish())
 }
 
 /// Untagged enum to distinguish read vs write requests on the wire.
@@ -289,7 +297,7 @@ async fn put_read_payload_rdma(
     let local_addr = data.as_ptr() as u64;
     let memory_region = rdma_context.register_memory(local_addr, data.len()).await?;
     let wr_id = NEXT_NETWORK_WR_ID.fetch_add(1, Ordering::Relaxed);
-    let peer_key = format!("read-{}-{}", req.volume_id, req.needle_id);
+    let peer_key = peer_cache_key("read", req.volume_id, req.needle_id, &worker_address);
     let result = rdma_context
         .post_write_peer(
             &peer_key,
@@ -329,7 +337,7 @@ async fn resolve_write_payload(
     let local_addr = data.as_mut_ptr() as u64;
     let memory_region = rdma_context.register_memory(local_addr, data.len()).await?;
     let wr_id = NEXT_NETWORK_WR_ID.fetch_add(1, Ordering::Relaxed);
-    let peer_key = format!("write-{}-{}", req.volume_id, req.needle_id);
+    let peer_key = peer_cache_key("write", req.volume_id, req.needle_id, &worker_address);
     let result = rdma_context
         .post_read_peer(
             &peer_key,
@@ -573,5 +581,26 @@ mod tests {
         let data = b"0123456789".to_vec();
         let out = normalize_http_read_data(data.clone(), &read_req(3, 0), false);
         assert_eq!(out, data);
+    }
+
+    #[test]
+    fn peer_cache_key_is_stable_for_same_worker() {
+        let key1 = peer_cache_key("read", 7, 42, b"worker-a");
+        let key2 = peer_cache_key("read", 7, 42, b"worker-a");
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn peer_cache_key_changes_with_worker() {
+        let key1 = peer_cache_key("read", 7, 42, b"worker-a");
+        let key2 = peer_cache_key("read", 7, 42, b"worker-b");
+        assert_ne!(key1, key2);
+    }
+
+    #[test]
+    fn peer_cache_key_separates_read_and_write() {
+        let read_key = peer_cache_key("read", 7, 42, b"worker-a");
+        let write_key = peer_cache_key("write", 7, 42, b"worker-a");
+        assert_ne!(read_key, write_key);
     }
 }
