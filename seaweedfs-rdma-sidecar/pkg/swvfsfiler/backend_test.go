@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"os"
+	"path"
 	"syscall"
 	"testing"
 
@@ -49,6 +50,17 @@ func (s *fakeStore) SaveEntry(ctx context.Context, fullPath string, entry *filer
 
 func (s *fakeStore) DeleteEntry(ctx context.Context, fullPath string, recursive bool) error {
 	delete(s.entries, fullPath)
+	return nil
+}
+
+func (s *fakeStore) RenameEntry(ctx context.Context, oldPath, newPath string) error {
+	entry := s.entries[oldPath]
+	if entry == nil {
+		return filer_pb.ErrNotFound
+	}
+	delete(s.entries, oldPath)
+	entry.Name = path.Base(newPath)
+	s.entries[newPath] = entry
 	return nil
 }
 
@@ -214,6 +226,59 @@ func TestBackendSetAttrUpdatesTimesAndSize(t *testing.T) {
 	}
 	if attr.Size != 0 || attr.MtimeSec != 123 || attr.AtimeSec != 789 {
 		t.Fatalf("attr mismatch: %+v", attr)
+	}
+}
+
+func TestBackendSymlinkAndReadLink(t *testing.T) {
+	store := &fakeStore{entries: map[string]*filer_pb.Entry{}}
+	backend := &Backend{Store: store}
+	attr, err := backend.Symlink(context.Background(), "/link", "../target", 1000, 1000)
+	if err != nil {
+		t.Fatalf("Symlink: %v", err)
+	}
+	if attr.Mode&uint32(syscall.S_IFMT) != uint32(syscall.S_IFLNK) {
+		t.Fatalf("attr mode is not a symlink: %#o", attr.Mode)
+	}
+	if attr.Size != uint64(len("../target")) {
+		t.Fatalf("symlink attr size = %d", attr.Size)
+	}
+	target, err := backend.ReadLink(context.Background(), "/link")
+	if err != nil {
+		t.Fatalf("ReadLink: %v", err)
+	}
+	if string(target) != "../target" {
+		t.Fatalf("target = %q", target)
+	}
+}
+
+func TestBackendRenameEntry(t *testing.T) {
+	store := &fakeStore{entries: map[string]*filer_pb.Entry{
+		"/old": {Name: "old", Attributes: &filer_pb.FuseAttributes{FileMode: 0644}},
+	}}
+	backend := &Backend{Store: store}
+	if err := backend.RenameEntry(context.Background(), "/old", "/dir/new"); err != nil {
+		t.Fatalf("RenameEntry: %v", err)
+	}
+	if store.entries["/old"] != nil || store.entries["/dir/new"] == nil {
+		t.Fatalf("rename not reflected: %+v", store.entries)
+	}
+	if store.entries["/dir/new"].Name != "new" {
+		t.Fatalf("new entry name = %q", store.entries["/dir/new"].Name)
+	}
+}
+
+func TestBackendMknodStoresSpecialMode(t *testing.T) {
+	store := &fakeStore{entries: map[string]*filer_pb.Entry{}}
+	backend := &Backend{Store: store}
+	attr, err := backend.Mknod(context.Background(), "/fifo", uint32(syscall.S_IFIFO|0644), 1000, 1000, 0)
+	if err != nil {
+		t.Fatalf("Mknod: %v", err)
+	}
+	if attr.Mode&uint32(syscall.S_IFMT) != uint32(syscall.S_IFIFO) {
+		t.Fatalf("attr mode is not FIFO: %#o", attr.Mode)
+	}
+	if store.entries["/fifo"].Attributes == nil || os.FileMode(store.entries["/fifo"].Attributes.FileMode)&os.ModeNamedPipe == 0 {
+		t.Fatalf("stored mode is not named pipe: %#o", store.entries["/fifo"].Attributes.GetFileMode())
 	}
 }
 

@@ -28,6 +28,7 @@ type MetadataStore interface {
 	ListEntries(ctx context.Context, dir string, start string, limit uint32) ([]*filer_pb.Entry, bool, error)
 	SaveEntry(ctx context.Context, fullPath string, entry *filer_pb.Entry) error
 	DeleteEntry(ctx context.Context, fullPath string, recursive bool) error
+	RenameEntry(ctx context.Context, oldPath, newPath string) error
 	AssignVolume(ctx context.Context, fullPath string, size uint64) (fileID, volumeServer string, err error)
 	LookupFileID(ctx context.Context, fileID string) ([]string, error)
 }
@@ -113,6 +114,40 @@ func (b *Backend) Mkdir(ctx context.Context, fullPath string, mode, uid, gid uin
 
 func (b *Backend) DeleteFile(ctx context.Context, fullPath string, recursive bool) error {
 	return b.Store.DeleteEntry(ctx, cleanFullPath(fullPath), recursive)
+}
+
+func (b *Backend) RenameEntry(ctx context.Context, oldPath, newPath string) error {
+	return b.Store.RenameEntry(ctx, cleanFullPath(oldPath), cleanFullPath(newPath))
+}
+
+func (b *Backend) Symlink(ctx context.Context, linkPath, target string, uid, gid uint32) (*swvfsproto.Attr, error) {
+	linkPath = cleanFullPath(linkPath)
+	entry := newSymlinkEntry(linkPath, target, uid, gid)
+	if err := b.Store.SaveEntry(ctx, linkPath, entry); err != nil {
+		return nil, err
+	}
+	return AttrFromEntry(linkPath, entry), nil
+}
+
+func (b *Backend) ReadLink(ctx context.Context, linkPath string) ([]byte, error) {
+	linkPath = cleanFullPath(linkPath)
+	entry, err := b.Store.LookupEntry(ctx, linkPath)
+	if err != nil {
+		return nil, mapLookupErr(err)
+	}
+	if entry.Attributes == nil || entry.Attributes.SymlinkTarget == "" {
+		return nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoInval, Msg: "not a symbolic link"}
+	}
+	return []byte(entry.Attributes.SymlinkTarget), nil
+}
+
+func (b *Backend) Mknod(ctx context.Context, fullPath string, mode, uid, gid, rdev uint32) (*swvfsproto.Attr, error) {
+	fullPath = cleanFullPath(fullPath)
+	entry := newSpecialEntry(fullPath, mode, uid, gid, rdev)
+	if err := b.Store.SaveEntry(ctx, fullPath, entry); err != nil {
+		return nil, err
+	}
+	return AttrFromEntry(fullPath, entry), nil
 }
 
 func (b *Backend) SetAttr(ctx context.Context, fullPath string, header swvfsproto.RequestHeader) (*swvfsproto.Attr, error) {
@@ -359,14 +394,7 @@ func AttrFromEntry(fullPath string, entry *filer_pb.Entry) *swvfsproto.Attr {
 		if perm == 0 {
 			perm = attr.Mode & 07777
 		}
-		switch {
-		case entry.IsDirectory:
-			attr.Mode = uint32(syscall.S_IFDIR) | (perm & 07777)
-		case a.SymlinkTarget != "":
-			attr.Mode = uint32(syscall.S_IFLNK) | (perm & 07777)
-		default:
-			attr.Mode = uint32(syscall.S_IFREG) | (perm & 07777)
-		}
+		attr.Mode = linuxModeFromFuseAttributes(entry, a, perm)
 		attr.UID = a.Uid
 		attr.GID = a.Gid
 		attr.Rdev = a.Rdev
@@ -410,7 +438,7 @@ func newEntry(fullPath string, isDir bool, mode, uid, gid uint32) *filer_pb.Entr
 		Name:        path.Base(cleanFullPath(fullPath)),
 		IsDirectory: isDir,
 		Attributes: &filer_pb.FuseAttributes{
-			FileMode: normalizeFileMode(isDir, mode),
+			FileMode: linuxModeToFileMode(mode, isDir),
 			Uid:      uid,
 			Gid:      gid,
 			Mtime:    now.Unix(),
@@ -423,12 +451,93 @@ func newEntry(fullPath string, isDir bool, mode, uid, gid uint32) *filer_pb.Entr
 	}
 }
 
+func newSymlinkEntry(fullPath, target string, uid, gid uint32) *filer_pb.Entry {
+	now := time.Now()
+	return &filer_pb.Entry{
+		Name: path.Base(cleanFullPath(fullPath)),
+		Attributes: &filer_pb.FuseAttributes{
+			FileMode:      uint32(os.ModeSymlink | 0777),
+			Uid:           uid,
+			Gid:           gid,
+			FileSize:      uint64(len(target)),
+			Mtime:         now.Unix(),
+			MtimeNs:       int32(now.Nanosecond()),
+			Ctime:         now.Unix(),
+			CtimeNs:       int32(now.Nanosecond()),
+			Crtime:        now.Unix(),
+			CrtimeNs:      int32(now.Nanosecond()),
+			SymlinkTarget: target,
+		},
+	}
+}
+
+func newSpecialEntry(fullPath string, mode, uid, gid, rdev uint32) *filer_pb.Entry {
+	now := time.Now()
+	return &filer_pb.Entry{
+		Name: path.Base(cleanFullPath(fullPath)),
+		Attributes: &filer_pb.FuseAttributes{
+			FileMode: linuxModeToFileMode(mode, false),
+			Uid:      uid,
+			Gid:      gid,
+			Rdev:     rdev,
+			Mtime:    now.Unix(),
+			MtimeNs:  int32(now.Nanosecond()),
+			Ctime:    now.Unix(),
+			CtimeNs:  int32(now.Nanosecond()),
+			Crtime:   now.Unix(),
+			CrtimeNs: int32(now.Nanosecond()),
+		},
+	}
+}
+
 func normalizeFileMode(isDir bool, mode uint32) uint32 {
+	return linuxModeToFileMode(mode, isDir)
+}
+
+func linuxModeToFileMode(mode uint32, forceDir bool) uint32 {
 	perm := os.FileMode(mode & 07777)
-	if isDir {
+	switch mode & uint32(syscall.S_IFMT) {
+	case uint32(syscall.S_IFDIR):
+		return uint32(os.ModeDir | perm)
+	case uint32(syscall.S_IFLNK):
+		return uint32(os.ModeSymlink | perm)
+	case uint32(syscall.S_IFIFO):
+		return uint32(os.ModeNamedPipe | perm)
+	case uint32(syscall.S_IFSOCK):
+		return uint32(os.ModeSocket | perm)
+	case uint32(syscall.S_IFCHR):
+		return uint32(os.ModeDevice | os.ModeCharDevice | perm)
+	case uint32(syscall.S_IFBLK):
+		return uint32(os.ModeDevice | perm)
+	}
+	if forceDir {
 		return uint32(os.ModeDir | perm)
 	}
 	return uint32(perm)
+}
+
+func linuxModeFromFuseAttributes(entry *filer_pb.Entry, attr *filer_pb.FuseAttributes, fallbackPerm uint32) uint32 {
+	perm := fallbackPerm & 07777
+	if attr == nil {
+		return uint32(syscall.S_IFREG) | perm
+	}
+	fileMode := os.FileMode(attr.FileMode)
+	switch {
+	case entry != nil && entry.IsDirectory || fileMode&os.ModeDir != 0:
+		return uint32(syscall.S_IFDIR) | perm
+	case attr.SymlinkTarget != "" || fileMode&os.ModeSymlink != 0:
+		return uint32(syscall.S_IFLNK) | perm
+	case fileMode&os.ModeNamedPipe != 0:
+		return uint32(syscall.S_IFIFO) | perm
+	case fileMode&os.ModeSocket != 0:
+		return uint32(syscall.S_IFSOCK) | perm
+	case fileMode&os.ModeDevice != 0 && fileMode&os.ModeCharDevice != 0:
+		return uint32(syscall.S_IFCHR) | perm
+	case fileMode&os.ModeDevice != 0:
+		return uint32(syscall.S_IFBLK) | perm
+	default:
+		return uint32(syscall.S_IFREG) | perm
+	}
 }
 
 func direntType(entry *filer_pb.Entry) uint32 {

@@ -20,6 +20,8 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
+const defaultRDMAMinSize = 8 << 20
+
 var (
 	devPath           string
 	filerAddresses    string
@@ -27,6 +29,8 @@ var (
 	enableReadRDMA    bool
 	enableWriteRDMA   bool
 	enablePayloadRDMA bool
+	readRDMAMinSize   uint64
+	writeRDMAMinSize  uint64
 	forceRDMA         bool
 	fallbackOnError   bool
 	maxConnections    int
@@ -51,9 +55,11 @@ carries RDMA preference hints.`,
 	root.Flags().StringVar(&devPath, "dev", "/dev/seaweedvfs", "seaweedvfs character device")
 	root.Flags().StringVar(&filerAddresses, "filer", "127.0.0.1:8888", "comma-separated filer HTTP addresses; use host:http.grpc for an explicit gRPC port")
 	root.Flags().StringVar(&engineSocket, "engine-socket", "/tmp/rdma-engine.sock", "RDMA engine Unix socket")
-	root.Flags().BoolVar(&enableReadRDMA, "enable-read-rdma", true, "prefer RDMA for READ requests carrying the kernel RDMA hint")
-	root.Flags().BoolVar(&enableWriteRDMA, "enable-write-rdma", true, "prefer RDMA for WRITE requests carrying the kernel RDMA hint")
-	root.Flags().BoolVar(&enablePayloadRDMA, "enable-payload-rdma", true, "enable real payload RDMA in the SeaweedFS data plane")
+	root.Flags().BoolVar(&enableReadRDMA, "enable-read-rdma", false, "prefer RDMA for READ requests carrying the kernel RDMA hint")
+	root.Flags().BoolVar(&enableWriteRDMA, "enable-write-rdma", false, "prefer RDMA for WRITE requests carrying the kernel RDMA hint")
+	root.Flags().BoolVar(&enablePayloadRDMA, "enable-payload-rdma", false, "enable real payload RDMA in the SeaweedFS data plane")
+	root.Flags().Uint64Var(&readRDMAMinSize, "rdma-read-min-size", defaultRDMAMinSize, "minimum READ size in bytes before RDMA is considered; set 0 to allow all hinted reads")
+	root.Flags().Uint64Var(&writeRDMAMinSize, "rdma-write-min-size", defaultRDMAMinSize, "minimum WRITE size in bytes before RDMA is considered; set 0 to allow all hinted writes")
 	root.Flags().BoolVar(&forceRDMA, "force-rdma", false, "prefer RDMA for READ and WRITE even when the kernel request has no RDMA hint")
 	root.Flags().BoolVar(&fallbackOnError, "fallback-on-error", true, "fall back to TCP/HTTP when RDMA is unavailable")
 	root.Flags().IntVar(&maxConnections, "max-connections", 8, "maximum RDMA engine IPC connections")
@@ -108,11 +114,13 @@ func run(cmd *cobra.Command, args []string) error {
 	defer fallbackClient.Stop()
 
 	router := &swvfsdaemon.Router{
-		RDMA:            &swvfsfiler.SeaweedNeedlePlane{Client: rdmaClient},
-		Fallback:        &swvfsfiler.SeaweedNeedlePlane{Client: fallbackClient},
-		EnableReadRDMA:  enableReadRDMA,
-		EnableWriteRDMA: enableWriteRDMA,
-		FallbackOnError: fallbackOnError,
+		RDMA:             &swvfsfiler.SeaweedNeedlePlane{Client: rdmaClient},
+		Fallback:         &swvfsfiler.SeaweedNeedlePlane{Client: fallbackClient},
+		EnableReadRDMA:   enableReadRDMA,
+		EnableWriteRDMA:  enableWriteRDMA,
+		ReadRDMAMinSize:  readRDMAMinSize,
+		WriteRDMAMinSize: writeRDMAMinSize,
+		FallbackOnError:  fallbackOnError,
 	}
 	if err := swvfsdaemon.RequireRouter(router); err != nil {
 		return err
@@ -130,6 +138,8 @@ func run(cmd *cobra.Command, args []string) error {
 		"read_rdma":         enableReadRDMA,
 		"write_rdma":        enableWriteRDMA,
 		"payload_rdma":      enablePayloadRDMA,
+		"rdma_read_min":     readRDMAMinSize,
+		"rdma_write_min":    writeRDMAMinSize,
 		"force_rdma":        forceRDMA,
 		"fallback_on_error": fallbackOnError,
 	}).Info("starting swvfs RDMA daemon")

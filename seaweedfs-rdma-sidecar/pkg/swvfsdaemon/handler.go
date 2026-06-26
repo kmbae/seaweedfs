@@ -40,6 +40,10 @@ type MetadataBackend interface {
 	CreateFile(ctx context.Context, path string, mode, uid, gid uint32) (*swvfsproto.Attr, error)
 	Mkdir(ctx context.Context, path string, mode, uid, gid uint32) (*swvfsproto.Attr, error)
 	DeleteFile(ctx context.Context, path string, recursive bool) error
+	RenameEntry(ctx context.Context, oldPath, newPath string) error
+	Symlink(ctx context.Context, linkPath, target string, uid, gid uint32) (*swvfsproto.Attr, error)
+	ReadLink(ctx context.Context, linkPath string) ([]byte, error)
+	Mknod(ctx context.Context, path string, mode, uid, gid, rdev uint32) (*swvfsproto.Attr, error)
 	SetAttr(ctx context.Context, path string, header swvfsproto.RequestHeader) (*swvfsproto.Attr, error)
 	StatFS(ctx context.Context, path string) (*swvfsproto.StatFS, error)
 }
@@ -171,6 +175,61 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 			return nil, err
 		}
 		return &swvfsproto.Reply{Tag: req.Header.Tag}, nil
+	case swvfsproto.OpRename:
+		backend, ok := h.Backend.(interface {
+			RenameEntry(context.Context, string, string) error
+		})
+		if !ok {
+			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rename is not implemented"}
+		}
+		if err := backend.RenameEntry(ctx, req.Path1, req.Path2); err != nil {
+			return nil, err
+		}
+		return &swvfsproto.Reply{Tag: req.Header.Tag}, nil
+	case swvfsproto.OpSymlink:
+		backend, ok := h.Backend.(interface {
+			Symlink(context.Context, string, string, uint32, uint32) (*swvfsproto.Attr, error)
+		})
+		if !ok {
+			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "symlink is not implemented"}
+		}
+		attr, err := backend.Symlink(ctx, req.Path1, req.Path2, req.Header.UID, req.Header.GID)
+		if err != nil {
+			return nil, err
+		}
+		reply := &swvfsproto.Reply{Tag: req.Header.Tag}
+		if attr != nil {
+			reply.Attr = *attr
+		}
+		return reply, nil
+	case swvfsproto.OpReadLink:
+		backend, ok := h.Backend.(interface {
+			ReadLink(context.Context, string) ([]byte, error)
+		})
+		if !ok {
+			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "readlink is not implemented"}
+		}
+		target, err := backend.ReadLink(ctx, req.Path1)
+		if err != nil {
+			return nil, err
+		}
+		return &swvfsproto.Reply{Tag: req.Header.Tag, Data: target}, nil
+	case swvfsproto.OpMknod:
+		backend, ok := h.Backend.(interface {
+			Mknod(context.Context, string, uint32, uint32, uint32, uint32) (*swvfsproto.Attr, error)
+		})
+		if !ok {
+			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "mknod is not implemented"}
+		}
+		attr, err := backend.Mknod(ctx, req.Path1, req.Header.Mode, req.Header.UID, req.Header.GID, uint32(req.Header.Size))
+		if err != nil {
+			return nil, err
+		}
+		reply := &swvfsproto.Reply{Tag: req.Header.Tag}
+		if attr != nil {
+			reply.Attr = *attr
+		}
+		return reply, nil
 	case swvfsproto.OpFlush, swvfsproto.OpRelease:
 		return &swvfsproto.Reply{Tag: req.Header.Tag}, nil
 	case swvfsproto.OpStatFS:

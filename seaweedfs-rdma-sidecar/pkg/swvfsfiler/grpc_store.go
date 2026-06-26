@@ -103,6 +103,20 @@ func (s *GRPCStore) DeleteEntry(ctx context.Context, fullPath string, recursive 
 	})
 }
 
+func (s *GRPCStore) RenameEntry(ctx context.Context, oldPath, newPath string) error {
+	oldDir, oldName := splitFullPath(oldPath)
+	newDir, newName := splitFullPath(newPath)
+	return s.withFiler(ctx, func(client filer_pb.SeaweedFilerClient) error {
+		_, err := client.AtomicRenameEntry(ctx, &filer_pb.AtomicRenameEntryRequest{
+			OldDirectory: oldDir,
+			OldName:      oldName,
+			NewDirectory: newDir,
+			NewName:      newName,
+		})
+		return err
+	})
+}
+
 func (s *GRPCStore) AssignVolume(ctx context.Context, fullPath string, size uint64) (fileID, volumeServer string, err error) {
 	err = s.withFiler(ctx, func(client filer_pb.SeaweedFilerClient) error {
 		resp, err := client.AssignVolume(ctx, &filer_pb.AssignVolumeRequest{
