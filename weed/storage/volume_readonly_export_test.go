@@ -2,6 +2,8 @@ package storage
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
@@ -31,6 +33,9 @@ func TestOpenReadonlyVolumeForcesReadOnlyDataAndIndex(t *testing.T) {
 
 	if !readonly.noWriteOrDelete {
 		t.Fatal("readonly volume was not marked no-write")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "1.sdx")); !os.IsNotExist(err) {
+		t.Fatalf("readonly volume should not create sorted index file: %v", err)
 	}
 
 	data, err := readonly.ReadNeedleRange(n.Id, n.Cookie, 0, int64(len(payload)))

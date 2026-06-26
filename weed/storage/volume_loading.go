@@ -293,7 +293,12 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 		// (issue #8928). The check piggybacks on MaxNeedleEnd, which the load
 		// walks below populate without a second linear scan.
 
-		if v.noWriteOrDelete || v.noWriteCanDelete {
+		if forceReadOnly && needleMapKind == NeedleMapInMemory {
+			glog.V(2).Infoln("loading readonly memory index", v.FileName(".idx"), "to memory")
+			if v.nm, err = LoadCompactNeedleMap(indexFile, v.Version()); err != nil {
+				glog.V(0).Infof("loading readonly index %s to memory error: %v", v.FileName(".idx"), err)
+			}
+		} else if v.noWriteOrDelete || v.noWriteCanDelete {
 			if v.nm, err = NewSortedFileNeedleMap(v.IndexFileName(), indexFile, v.Version()); err != nil {
 				glog.V(0).Infof("loading sorted db %s error: %v", v.FileName(".sdx"), err)
 			}
