@@ -570,7 +570,7 @@ func (c *SeaweedFSRDMAClient) httpFallback(ctx context.Context, req *NeedleReadR
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusPartialContent {
 		return nil, fmt.Errorf("HTTP request failed with status: %d", resp.StatusCode)
 	}
 
@@ -579,6 +579,8 @@ func (c *SeaweedFSRDMAClient) httpFallback(ctx context.Context, req *NeedleReadR
 	if err != nil {
 		return nil, fmt.Errorf("failed to read HTTP response body: %w", err)
 	}
+	rangeApplied := resp.StatusCode == http.StatusPartialContent || resp.Header.Get("Content-Range") != ""
+	data = normalizeHTTPReadData(data, req.Offset, req.Size, rangeApplied)
 
 	c.logger.WithFields(logrus.Fields{
 		"volume_id": req.VolumeID,
@@ -587,6 +589,24 @@ func (c *SeaweedFSRDMAClient) httpFallback(ctx context.Context, req *NeedleReadR
 	}).Debug("📥 HTTP fallback successful")
 
 	return data, nil
+}
+
+func normalizeHTTPReadData(data []byte, offset, size uint64, rangeApplied bool) []byte {
+	if size == 0 || uint64(len(data)) <= size {
+		return data
+	}
+	requested := int(size)
+	if rangeApplied {
+		return data[:requested]
+	}
+	if offset >= uint64(len(data)) {
+		return nil
+	}
+	end := offset + size
+	if end < offset || end > uint64(len(data)) {
+		end = uint64(len(data))
+	}
+	return data[int(offset):int(end)]
 }
 
 // NeedleWriteRequest represents a SeaweedFS needle write request
