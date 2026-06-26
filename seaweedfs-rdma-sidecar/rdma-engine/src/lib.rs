@@ -33,6 +33,7 @@ pub mod local_volume;
 pub mod memory;
 pub mod error;
 pub mod network;
+pub mod buffer_pool;
 
 pub use error::{RdmaError, RdmaResult};
 

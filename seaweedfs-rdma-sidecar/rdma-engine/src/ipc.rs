@@ -1,19 +1,24 @@
 //! IPC (Inter-Process Communication) module for communicating with Go sidecar
 //!
-//! This module handles high-performance IPC between the Rust RDMA engine and 
+//! This module handles high-performance IPC between the Rust RDMA engine and
 //! the Go control plane sidecar using Unix domain sockets and MessagePack serialization.
 
-use crate::{RdmaError, RdmaResult, rdma::RdmaContext, session::SessionManager};
+use crate::{
+    buffer_pool::{RegisteredBuffer, RegisteredBufferPool},
+    rdma::RdmaContext,
+    session::SessionManager,
+    RdmaError, RdmaResult,
+};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::net::{UnixListener, UnixStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tracing::{info, debug, error};
-use uuid::Uuid;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
+use tokio::io::{AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::{UnixListener, UnixStream};
+use tracing::{debug, error, info};
+use uuid::Uuid;
 
 /// Max serialized MessagePack frame size on the Unix IPC socket.
 /// Must match network.rs remote path and Go ipc/client.go (64 MiB).
@@ -98,12 +103,12 @@ pub enum IpcMessage {
     StartRead(StartReadRequest),
     /// Response with RDMA session information
     StartReadResponse(StartReadResponse),
-    
+
     /// Request to complete an RDMA operation
     CompleteRead(CompleteReadRequest),
     /// Response confirming completion
     CompleteReadResponse(CompleteReadResponse),
-    
+
     /// Request to start an RDMA write operation
     StartWrite(StartWriteRequest),
     /// Response with write session information
@@ -118,7 +123,7 @@ pub enum IpcMessage {
     GetCapabilities(GetCapabilitiesRequest),
     /// Response with engine capabilities
     GetCapabilitiesResponse(GetCapabilitiesResponse),
-    
+
     /// Health check ping
     Ping(PingRequest),
     /// Ping response
@@ -127,7 +132,7 @@ pub enum IpcMessage {
     /// Request local UCX worker address (for peer connection)
     GetWorkerAddress(GetWorkerAddressRequest),
     GetWorkerAddressResponse(GetWorkerAddressResponse),
-    
+
     /// Error response
     Error(ErrorResponse),
 }
@@ -216,7 +221,11 @@ pub struct StartWriteRequest {
     pub needle_id: u64,
     pub cookie: u32,
     pub size: u64,
-    #[serde(default, serialize_with = "serde_bytes::serialize", deserialize_with = "deserialize_bytes_or_empty")]
+    #[serde(
+        default,
+        serialize_with = "serde_bytes::serialize",
+        deserialize_with = "deserialize_bytes_or_empty"
+    )]
     pub data: Vec<u8>,
     #[serde(default)]
     pub data_sideband: bool,
@@ -363,6 +372,7 @@ pub struct IpcServer {
     listener: Option<UnixListener>,
     rdma_context: Arc<RdmaContext>,
     session_manager: Arc<SessionManager>,
+    registered_buffers: Arc<RegisteredBufferPool>,
     shutdown_flag: Arc<parking_lot::RwLock<bool>>,
 }
 
@@ -375,19 +385,21 @@ impl IpcServer {
     ) -> RdmaResult<Self> {
         // Remove existing socket if it exists
         if Path::new(socket_path).exists() {
-            std::fs::remove_file(socket_path)
-                .map_err(|e| RdmaError::ipc_error(format!("Failed to remove existing socket: {}", e)))?;
+            std::fs::remove_file(socket_path).map_err(|e| {
+                RdmaError::ipc_error(format!("Failed to remove existing socket: {}", e))
+            })?;
         }
-        
+
         Ok(Self {
             socket_path: socket_path.to_string(),
             listener: None,
             rdma_context,
             session_manager,
+            registered_buffers: Arc::new(RegisteredBufferPool::from_env()),
             shutdown_flag: Arc::new(parking_lot::RwLock::new(false)),
         })
     }
-    
+
     /// Start the IPC server
     pub async fn run(&mut self) -> RdmaResult<()> {
         let listener = UnixListener::bind(&self.socket_path)
@@ -395,11 +407,13 @@ impl IpcServer {
 
         #[cfg(unix)]
         std::fs::set_permissions(&self.socket_path, std::fs::Permissions::from_mode(0o777))
-            .map_err(|e| RdmaError::ipc_error(format!("Failed to set Unix socket permissions: {}", e)))?;
-        
+            .map_err(|e| {
+                RdmaError::ipc_error(format!("Failed to set Unix socket permissions: {}", e))
+            })?;
+
         info!("🎯 IPC server listening on: {}", self.socket_path);
         self.listener = Some(listener);
-        
+
         if let Some(ref listener) = self.listener {
             loop {
                 // Check shutdown flag
@@ -407,25 +421,33 @@ impl IpcServer {
                     info!("IPC server shutting down");
                     break;
                 }
-                
+
                 // Accept connection with timeout
                 let accept_result = tokio::time::timeout(
                     tokio::time::Duration::from_millis(100),
-                    listener.accept()
-                ).await;
-                
+                    listener.accept(),
+                )
+                .await;
+
                 match accept_result {
                     Ok(Ok((stream, addr))) => {
                         debug!("New IPC connection from: {:?}", addr);
 
                         let rdma_context = self.rdma_context.clone();
                         let session_manager = self.session_manager.clone();
+                        let registered_buffers = self.registered_buffers.clone();
                         let shutdown_flag = self.shutdown_flag.clone();
 
                         tokio::spawn(async move {
                             if let Err(e) = Self::handle_connection(
-                                stream, rdma_context, session_manager, shutdown_flag,
-                            ).await {
+                                stream,
+                                rdma_context,
+                                session_manager,
+                                registered_buffers,
+                                shutdown_flag,
+                            )
+                            .await
+                            {
                                 error!("IPC connection error: {}", e);
                             }
                         });
@@ -441,36 +463,39 @@ impl IpcServer {
                 }
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Handle a single IPC connection
     async fn handle_connection(
         stream: UnixStream,
         rdma_context: Arc<RdmaContext>,
         session_manager: Arc<SessionManager>,
+        registered_buffers: Arc<RegisteredBufferPool>,
         shutdown_flag: Arc<parking_lot::RwLock<bool>>,
     ) -> RdmaResult<()> {
         let (reader_half, writer_half) = stream.into_split();
         let mut reader = BufReader::new(reader_half);
         let mut writer = BufWriter::new(writer_half);
-        
+
         let mut buffer = Vec::with_capacity(4096);
-        
+
         loop {
             // Check shutdown
             if *shutdown_flag.read() {
                 break;
             }
-            
+
             // Read message length (4 bytes)
             let mut len_bytes = [0u8; 4];
             match tokio::time::timeout(
                 tokio::time::Duration::from_millis(100),
-                reader.read_exact(&mut len_bytes)
-            ).await {
-                Ok(Ok(_)) => {},
+                reader.read_exact(&mut len_bytes),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
                 Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                     debug!("IPC connection closed by peer");
                     break;
@@ -478,60 +503,71 @@ impl IpcServer {
                 Ok(Err(e)) => return Err(RdmaError::ipc_error(format!("Read error: {}", e))),
                 Err(_) => continue, // Timeout, check shutdown flag
             }
-            
+
             let msg_len = u32::from_le_bytes(len_bytes) as usize;
             if msg_len > MAX_IPC_MESSAGE_SIZE {
                 return Err(RdmaError::ipc_error("Message too large"));
             }
-            
+
             // Read message data
             buffer.clear();
             buffer.resize(msg_len, 0);
-            reader.read_exact(&mut buffer).await
+            reader
+                .read_exact(&mut buffer)
+                .await
                 .map_err(|e| RdmaError::ipc_error(format!("Failed to read message: {}", e)))?;
-            
+
             // Deserialize message
-            let mut request: IpcMessage = rmp_serde::from_slice(&buffer)
-                .map_err(|e| RdmaError::SerializationError { reason: e.to_string() })?;
+            let mut request: IpcMessage =
+                rmp_serde::from_slice(&buffer).map_err(|e| RdmaError::SerializationError {
+                    reason: e.to_string(),
+                })?;
             Self::read_request_sideband(&mut reader, &mut request).await?;
 
             debug!("Received IPC message: {:?}", request);
-            
+
             // Process message
             let mut response = Self::process_message(
                 request,
                 &rdma_context,
                 &session_manager,
-            ).await;
+                &registered_buffers,
+            )
+            .await;
             let response_sideband = Self::extract_response_sideband(&mut response);
 
             // Serialize response
-            let response_data = rmp_serde::to_vec(&response)
-                .map_err(|e| RdmaError::SerializationError { reason: e.to_string() })?;
-            
+            let response_data =
+                rmp_serde::to_vec(&response).map_err(|e| RdmaError::SerializationError {
+                    reason: e.to_string(),
+                })?;
+
             // Send response
             let response_len = (response_data.len() as u32).to_le_bytes();
-            writer.write_all(&response_len).await
-                .map_err(|e| RdmaError::ipc_error(format!("Failed to write response length: {}", e)))?;
-            writer.write_all(&response_data).await
+            writer.write_all(&response_len).await.map_err(|e| {
+                RdmaError::ipc_error(format!("Failed to write response length: {}", e))
+            })?;
+            writer
+                .write_all(&response_data)
+                .await
                 .map_err(|e| RdmaError::ipc_error(format!("Failed to write response: {}", e)))?;
             if let Some(sideband) = response_sideband {
-                writer.write_all(&sideband).await
-                    .map_err(|e| RdmaError::ipc_error(format!("Failed to write response sideband: {}", e)))?;
+                writer.write_all(&sideband).await.map_err(|e| {
+                    RdmaError::ipc_error(format!("Failed to write response sideband: {}", e))
+                })?;
             }
-            writer.flush().await
+            writer
+                .flush()
+                .await
                 .map_err(|e| RdmaError::ipc_error(format!("Failed to flush response: {}", e)))?;
-            
+
             debug!("Sent IPC response");
         }
-        
+
         Ok(())
     }
 
-    async fn read_request_sideband<R>(
-        reader: &mut R,
-        message: &mut IpcMessage,
-    ) -> RdmaResult<()>
+    async fn read_request_sideband<R>(reader: &mut R, message: &mut IpcMessage) -> RdmaResult<()>
     where
         R: tokio::io::AsyncRead + Unpin,
     {
@@ -552,10 +588,9 @@ impl IpcServer {
             }
 
             let mut data = vec![0u8; req.size as usize];
-            reader
-                .read_exact(&mut data)
-                .await
-                .map_err(|e| RdmaError::ipc_error(format!("Failed to read request sideband: {}", e)))?;
+            reader.read_exact(&mut data).await.map_err(|e| {
+                RdmaError::ipc_error(format!("Failed to read request sideband: {}", e))
+            })?;
             req.data = data;
             req.data_sideband = false;
         }
@@ -574,12 +609,13 @@ impl IpcServer {
         }
         None
     }
-    
+
     /// Process IPC message and generate response
     async fn process_message(
         message: IpcMessage,
         rdma_context: &Arc<RdmaContext>,
         session_manager: &Arc<SessionManager>,
+        registered_buffers: &Arc<RegisteredBufferPool>,
     ) -> IpcMessage {
         match message {
             IpcMessage::Ping(req) => {
@@ -590,11 +626,11 @@ impl IpcServer {
                     server_rtt_ns: server_timestamp.saturating_sub(req.timestamp_ns),
                 })
             }
-            
+
             IpcMessage::GetCapabilities(_req) => {
                 let device_info = rdma_context.device_info();
                 let active_sessions = session_manager.active_session_count().await;
-                
+
                 IpcMessage::GetCapabilitiesResponse(GetCapabilitiesResponse {
                     device_name: device_info.name.clone(),
                     vendor_id: device_info.vendor_id,
@@ -608,30 +644,58 @@ impl IpcServer {
                     real_rdma: rdma_context.is_real_rdma(),
                 })
             }
-            
+
             IpcMessage::StartRead(req) => {
-                match Self::handle_start_read(req, rdma_context, session_manager).await {
+                match Self::handle_start_read(
+                    req,
+                    rdma_context,
+                    session_manager,
+                    registered_buffers,
+                )
+                .await
+                {
                     Ok(response) => IpcMessage::StartReadResponse(response),
                     Err(error) => IpcMessage::Error(ErrorResponse::from(&error)),
                 }
             }
-            
+
             IpcMessage::CompleteRead(req) => {
-                match Self::handle_complete_read(req, session_manager).await {
+                match Self::handle_complete_read(
+                    req,
+                    rdma_context,
+                    session_manager,
+                    registered_buffers,
+                )
+                .await
+                {
                     Ok(response) => IpcMessage::CompleteReadResponse(response),
                     Err(error) => IpcMessage::Error(ErrorResponse::from(&error)),
                 }
             }
 
             IpcMessage::StartWrite(req) => {
-                match Self::handle_start_write(req, rdma_context, session_manager).await {
+                match Self::handle_start_write(
+                    req,
+                    rdma_context,
+                    session_manager,
+                    registered_buffers,
+                )
+                .await
+                {
                     Ok(response) => IpcMessage::StartWriteResponse(response),
                     Err(error) => IpcMessage::Error(ErrorResponse::from(&error)),
                 }
             }
 
             IpcMessage::CompleteWrite(req) => {
-                match Self::handle_complete_write(req, session_manager).await {
+                match Self::handle_complete_write(
+                    req,
+                    rdma_context,
+                    session_manager,
+                    registered_buffers,
+                )
+                .await
+                {
                     Ok(response) => IpcMessage::CompleteWriteResponse(response),
                     Err(error) => IpcMessage::Error(ErrorResponse::from(&error)),
                 }
@@ -642,16 +706,14 @@ impl IpcServer {
                     .ok()
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(18515u16);
-                let worker_address_b64 = rdma_context
-                    .worker_address_b64()
-                    .unwrap_or_default();
+                let worker_address_b64 = rdma_context.worker_address_b64().unwrap_or_default();
                 IpcMessage::GetWorkerAddressResponse(GetWorkerAddressResponse {
                     worker_address_b64,
                     listen_port,
                     real_rdma: rdma_context.is_real_rdma(),
                 })
             }
-            
+
             _ => IpcMessage::Error(ErrorResponse {
                 code: "UNSUPPORTED_MESSAGE".to_string(),
                 message: "Unsupported message type".to_string(),
@@ -660,42 +722,52 @@ impl IpcServer {
             }),
         }
     }
-    
+
     /// Handle StartRead request
     async fn handle_start_read(
         req: StartReadRequest,
         rdma_context: &Arc<RdmaContext>,
         session_manager: &Arc<SessionManager>,
+        registered_buffers: &Arc<RegisteredBufferPool>,
     ) -> RdmaResult<StartReadResponse> {
-        info!("🚀 Starting RDMA read: volume={}, needle={}, size={}", 
-              req.volume_id, req.needle_id, req.size);
-        
+        info!(
+            "🚀 Starting RDMA read: volume={}, needle={}, size={}",
+            req.volume_id, req.needle_id, req.size
+        );
+
         // Create session
         let session_id = Uuid::new_v4().to_string();
         let transfer_size = if req.size == 0 { 65536 } else { req.size }; // Default 64KB
-        
-        // Allocate local buffer
-        let buffer = vec![0u8; transfer_size as usize];
-        let local_addr = buffer.as_ptr() as u64;
-        
-        // Register memory for RDMA
-        let memory_region = rdma_context.register_memory(local_addr, transfer_size as usize).await?;
-        
+
+        if session_manager.active_session_count().await >= session_manager.max_sessions() {
+            return Err(RdmaError::TooManySessions {
+                max_sessions: session_manager.max_sessions(),
+            });
+        }
+
+        let buffer = registered_buffers
+            .acquire(rdma_context, transfer_size as usize)
+            .await?;
+        let local_addr = buffer.region.addr;
+        let memory_region = buffer.region.clone();
+
         // Create and store session
-        session_manager.create_session(
-            session_id.clone(),
-            req.volume_id,
-            req.needle_id,
-            req.remote_addr,
-            req.remote_key,
-            transfer_size,
-            buffer,
-            memory_region.clone(),
-            chrono::Duration::seconds(req.timeout_secs as i64),
-        ).await?;
-        
+        session_manager
+            .create_session(
+                session_id.clone(),
+                req.volume_id,
+                req.needle_id,
+                req.remote_addr,
+                req.remote_key,
+                transfer_size,
+                buffer.data,
+                memory_region.clone(),
+                chrono::Duration::seconds(req.timeout_secs as i64),
+            )
+            .await?;
+
         let expires_at = chrono::Utc::now() + chrono::Duration::seconds(req.timeout_secs as i64);
-        
+
         Ok(StartReadResponse {
             session_id,
             local_addr,
@@ -709,26 +781,33 @@ impl IpcServer {
             expires_at_ns: expires_at.timestamp_nanos_opt().unwrap_or(0) as u64,
         })
     }
-    
+
     /// Handle CompleteRead request
     async fn handle_complete_read(
         req: CompleteReadRequest,
+        rdma_context: &Arc<RdmaContext>,
         session_manager: &Arc<SessionManager>,
+        registered_buffers: &Arc<RegisteredBufferPool>,
     ) -> RdmaResult<CompleteReadResponse> {
         info!("🏁 Completing RDMA read session: {}", req.session_id);
 
-        let data = if req.success {
-            let session = session_manager.get_session(&req.session_id).await?;
-            let session_data = session.read();
+        let session = session_manager.take_session(&req.session_id).await?;
+        let (data, buffer) = {
+            let mut session_data = session.write();
             let bytes = req.bytes_transferred.min(session_data.buffer.len() as u64) as usize;
-            session_data.buffer[..bytes].to_vec()
-        } else {
-            Vec::new()
+            let data = if req.success {
+                session_data.buffer[..bytes].to_vec()
+            } else {
+                Vec::new()
+            };
+            let buffer = RegisteredBuffer {
+                data: std::mem::take(&mut session_data.buffer),
+                region: session_data.memory_region.clone(),
+            };
+            (data, buffer)
         };
+        registered_buffers.release(rdma_context, buffer).await;
 
-        // Clean up session
-        session_manager.remove_session(&req.session_id).await?;
-        
         Ok(CompleteReadResponse {
             success: req.success,
             server_crc: Some(0x12345678), // Mock CRC
@@ -738,46 +817,55 @@ impl IpcServer {
             message: Some("Session completed successfully".to_string()),
         })
     }
-    
+
     /// Handle StartWrite request
     async fn handle_start_write(
         req: StartWriteRequest,
         rdma_context: &Arc<RdmaContext>,
         session_manager: &Arc<SessionManager>,
+        registered_buffers: &Arc<RegisteredBufferPool>,
     ) -> RdmaResult<StartWriteResponse> {
-        info!("📝 Starting RDMA write: volume={}, needle={}, size={}",
-              req.volume_id, req.needle_id, req.data.len());
+        info!(
+            "📝 Starting RDMA write: volume={}, needle={}, size={}",
+            req.volume_id,
+            req.needle_id,
+            req.data.len()
+        );
 
         let session_id = Uuid::new_v4().to_string();
         let data_len = req.data.len();
+        if data_len == 0 {
+            return Err(RdmaError::invalid_request("empty RDMA write payload"));
+        }
+        if session_manager.active_session_count().await >= session_manager.max_sessions() {
+            return Err(RdmaError::TooManySessions {
+                max_sessions: session_manager.max_sessions(),
+            });
+        }
 
-        // Allocate buffer and copy incoming data (mock: inline copy)
-        let mut buffer = vec![0u8; data_len];
-        buffer.copy_from_slice(&req.data);
-        let local_addr = buffer.as_ptr() as u64;
+        let mut buffer = registered_buffers.acquire(rdma_context, data_len).await?;
+        buffer.data[..data_len].copy_from_slice(&req.data);
+        let local_addr = buffer.region.addr;
+        let memory_region = buffer.region.clone();
 
-        let memory_region = rdma_context.register_memory(local_addr, data_len).await?;
-
-        session_manager.create_session(
-            session_id.clone(),
-            req.volume_id,
-            req.needle_id,
-            0,
-            0,
-            data_len as u64,
-            buffer,
-            memory_region.clone(),
-            chrono::Duration::seconds(req.timeout_secs as i64),
-        ).await?;
+        session_manager
+            .create_session(
+                session_id.clone(),
+                req.volume_id,
+                req.needle_id,
+                0,
+                0,
+                data_len as u64,
+                buffer.data,
+                memory_region.clone(),
+                chrono::Duration::seconds(req.timeout_secs as i64),
+            )
+            .await?;
 
         let wr_id = NEXT_WR_ID.fetch_add(1, Ordering::Relaxed);
-        rdma_context.post_write(
-            local_addr,
-            0,
-            0,
-            data_len,
-            wr_id,
-        ).await?;
+        rdma_context
+            .post_write(local_addr, 0, 0, data_len, wr_id)
+            .await?;
 
         let completions = rdma_context.poll_completion(1).await?;
         if completions.is_empty() {
@@ -786,7 +874,10 @@ impl IpcServer {
 
         let completion = &completions[0];
         if completion.status != crate::rdma::CompletionStatus::Success {
-            return Err(RdmaError::operation_failed("RDMA write", completion.status as i32));
+            return Err(RdmaError::operation_failed(
+                "RDMA write",
+                completion.status as i32,
+            ));
         }
 
         info!("✅ RDMA write buffered: {} bytes", data_len);
@@ -807,11 +898,21 @@ impl IpcServer {
     /// Handle CompleteWrite request
     async fn handle_complete_write(
         req: CompleteWriteRequest,
+        rdma_context: &Arc<RdmaContext>,
         session_manager: &Arc<SessionManager>,
+        registered_buffers: &Arc<RegisteredBufferPool>,
     ) -> RdmaResult<CompleteWriteResponse> {
         info!("🏁 Completing RDMA write session: {}", req.session_id);
 
-        session_manager.remove_session(&req.session_id).await?;
+        let session = session_manager.take_session(&req.session_id).await?;
+        let buffer = {
+            let mut session_data = session.write();
+            RegisteredBuffer {
+                data: std::mem::take(&mut session_data.buffer),
+                region: session_data.memory_region.clone(),
+            }
+        };
+        registered_buffers.release(rdma_context, buffer).await;
 
         let file_id = format!("rdma-{}", &req.session_id[..8]);
 
@@ -827,43 +928,42 @@ impl IpcServer {
     pub async fn shutdown(&mut self) -> RdmaResult<()> {
         info!("Shutting down IPC server");
         *self.shutdown_flag.write() = true;
-        
+
         // Remove socket file
         if Path::new(&self.socket_path).exists() {
-            std::fs::remove_file(&self.socket_path)
-                .map_err(|e| RdmaError::ipc_error(format!("Failed to remove socket file: {}", e)))?;
+            std::fs::remove_file(&self.socket_path).map_err(|e| {
+                RdmaError::ipc_error(format!("Failed to remove socket file: {}", e))
+            })?;
         }
-        
+
         Ok(())
     }
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_error_response_conversion() {
         let error = RdmaError::device_not_found("mlx5_0");
         let response = ErrorResponse::from(&error);
-        
+
         assert!(response.message.contains("mlx5_0"));
         assert_eq!(response.category, "hardware");
         assert!(!response.recoverable);
     }
-    
+
     #[test]
     fn test_message_serialization() {
         let request = IpcMessage::Ping(PingRequest {
             timestamp_ns: 12345,
             client_id: Some("test".to_string()),
         });
-        
+
         let serialized = rmp_serde::to_vec(&request).unwrap();
         let deserialized: IpcMessage = rmp_serde::from_slice(&serialized).unwrap();
-        
+
         match deserialized {
             IpcMessage::Ping(ping) => {
                 assert_eq!(ping.timestamp_ns, 12345);

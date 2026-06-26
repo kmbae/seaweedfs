@@ -5,13 +5,10 @@
 //! transferred over a UCX stream after a worker-address handshake.
 
 use crate::{
-    ipc::MAX_IPC_MESSAGE_SIZE,
-    local_volume::LocalVolumeReader,
-    rdma::{MemoryRegion, RdmaContext},
-    RdmaEngineConfig, RdmaError, RdmaResult,
+    buffer_pool::RegisteredBufferPool, ipc::MAX_IPC_MESSAGE_SIZE, local_volume::LocalVolumeReader,
+    rdma::RdmaContext, RdmaEngineConfig, RdmaError, RdmaResult,
 };
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use parking_lot::Mutex;
 use reqwest::header::{CONTENT_RANGE, RANGE};
 use serde::{Deserialize, Serialize};
 use std::collections::hash_map::DefaultHasher;
@@ -24,8 +21,6 @@ use tokio::net::{TcpListener, TcpStream};
 use tracing::{debug, error, info, warn};
 
 static NEXT_NETWORK_WR_ID: AtomicU64 = AtomicU64::new(1_000_000);
-const DEFAULT_REGISTERED_BUFFER_POOL_SIZE: usize = 16;
-const MIN_REGISTERED_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Format SeaweedFS file id: `{volume_id},{needle_id+cookie hex}` (matches Go needle.FileId).
 fn format_seaweed_file_id(volume_id: u32, needle_id: u64, cookie: u32) -> String {
@@ -447,92 +442,6 @@ async fn resolve_write_payload(
     Ok((data, true))
 }
 
-struct RegisteredBufferPool {
-    idle: Mutex<Vec<RegisteredBuffer>>,
-    max_idle: usize,
-}
-
-struct RegisteredBuffer {
-    data: Vec<u8>,
-    region: MemoryRegion,
-}
-
-impl RegisteredBufferPool {
-    fn from_env() -> Self {
-        let max_idle = std::env::var("RDMA_REGISTERED_BUFFER_POOL_SIZE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(DEFAULT_REGISTERED_BUFFER_POOL_SIZE);
-        Self {
-            idle: Mutex::new(Vec::new()),
-            max_idle,
-        }
-    }
-
-    async fn acquire(
-        &self,
-        rdma_context: &Arc<RdmaContext>,
-        size: usize,
-    ) -> RdmaResult<RegisteredBuffer> {
-        let capacity = registered_buffer_capacity(size)?;
-        if let Some(buffer) = self.take_idle(capacity) {
-            debug!(
-                "♻️ Reusing registered RDMA buffer: addr=0x{:x}, capacity={}, requested={}",
-                buffer.region.addr,
-                buffer.data.len(),
-                size
-            );
-            return Ok(buffer);
-        }
-
-        let mut data = vec![0u8; capacity];
-        let local_addr = data.as_mut_ptr() as u64;
-        let region = rdma_context.register_memory(local_addr, capacity).await?;
-        debug!(
-            "📌 Registered new pooled RDMA buffer: addr=0x{:x}, capacity={}, requested={}",
-            region.addr, capacity, size
-        );
-        Ok(RegisteredBuffer { data, region })
-    }
-
-    fn take_idle(&self, capacity: usize) -> Option<RegisteredBuffer> {
-        let mut idle = self.idle.lock();
-        let index = idle
-            .iter()
-            .position(|buffer| buffer.data.len() >= capacity)?;
-        Some(idle.swap_remove(index))
-    }
-
-    async fn release(&self, rdma_context: &Arc<RdmaContext>, buffer: RegisteredBuffer) {
-        let mut discard = Some(buffer);
-        {
-            let mut idle = self.idle.lock();
-            if idle.len() < self.max_idle {
-                idle.push(discard.take().expect("registered buffer"));
-            }
-        }
-        if let Some(buffer) = discard {
-            let _ = rdma_context.deregister_memory(&buffer.region).await;
-        }
-    }
-}
-
-fn registered_buffer_capacity(size: usize) -> RdmaResult<usize> {
-    if size == 0 {
-        return Err(RdmaError::invalid_request("registered buffer size is zero"));
-    }
-    if size > MAX_IPC_MESSAGE_SIZE {
-        return Err(RdmaError::ipc_error(format!(
-            "registered buffer too large: {} bytes",
-            size
-        )));
-    }
-    Ok(size
-        .max(MIN_REGISTERED_BUFFER_SIZE)
-        .next_power_of_two()
-        .min(MAX_IPC_MESSAGE_SIZE))
-}
-
 fn has_rdma_descriptor(worker_address_b64: &str, remote_addr: u64, remote_key_b64: &str) -> bool {
     !worker_address_b64.is_empty() && remote_addr != 0 && !remote_key_b64.is_empty()
 }
@@ -800,22 +709,5 @@ mod tests {
         let read_key = peer_cache_key("read", 7, 42, b"worker-a");
         let write_key = peer_cache_key("write", 7, 42, b"worker-a");
         assert_ne!(read_key, write_key);
-    }
-
-    #[test]
-    fn registered_buffer_capacity_rounds_for_reuse() {
-        assert_eq!(
-            registered_buffer_capacity(1).unwrap(),
-            MIN_REGISTERED_BUFFER_SIZE
-        );
-        assert_eq!(
-            registered_buffer_capacity(MIN_REGISTERED_BUFFER_SIZE + 1).unwrap(),
-            MIN_REGISTERED_BUFFER_SIZE * 2
-        );
-        assert_eq!(
-            registered_buffer_capacity(MAX_IPC_MESSAGE_SIZE).unwrap(),
-            MAX_IPC_MESSAGE_SIZE
-        );
-        assert!(registered_buffer_capacity(MAX_IPC_MESSAGE_SIZE + 1).is_err());
     }
 }
