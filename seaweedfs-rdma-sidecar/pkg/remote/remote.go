@@ -38,6 +38,7 @@ type NeedleReadResponse struct {
 	Size      uint64 `msgpack:"size,omitempty"`
 	Transport string `msgpack:"transport,omitempty"`
 	RealRDMA  bool   `msgpack:"real_rdma,omitempty"`
+	Source    string `msgpack:"source,omitempty"`
 	Message   string `msgpack:"message,omitempty"`
 }
 
@@ -47,6 +48,7 @@ type ReadResult struct {
 	Size      uint64
 	Transport string
 	RealRDMA  bool
+	Source    string
 }
 
 // WorkerAddressInfo is returned by the sidecar /rdma/worker-address endpoint.
@@ -129,6 +131,7 @@ func ReadNeedleResult(ctx context.Context, volumeServer string, port uint16, req
 		Size:      resp.Size,
 		Transport: normalizeTransport(resp.Transport),
 		RealRDMA:  resp.RealRDMA,
+		Source:    strings.TrimSpace(resp.Source),
 	}, nil
 }
 
@@ -159,6 +162,7 @@ type NeedleWriteResponse struct {
 	FileID    string `msgpack:"file_id"`
 	Transport string `msgpack:"transport,omitempty"`
 	RealRDMA  bool   `msgpack:"real_rdma,omitempty"`
+	Source    string `msgpack:"source,omitempty"`
 	Message   string `msgpack:"message,omitempty"`
 }
 
@@ -167,6 +171,7 @@ type WriteResult struct {
 	FileID    string
 	Transport string
 	RealRDMA  bool
+	Source    string
 }
 
 // WriteNeedleResult performs a remote needle write and returns transport metadata.
@@ -208,6 +213,7 @@ func WriteNeedleResult(ctx context.Context, volumeServer string, port uint16, re
 		FileID:    resp.FileID,
 		Transport: normalizeTransport(resp.Transport),
 		RealRDMA:  resp.RealRDMA,
+		Source:    strings.TrimSpace(resp.Source),
 	}, nil
 }
 

@@ -408,7 +408,7 @@ func (c *SeaweedFSRDMAClient) readNeedleViaRemoteRDMA(ctx context.Context, req *
 	if normalizedRemoteTransport(result.Transport) != "rdma" || !result.RealRDMA {
 		completed = true
 		_, _ = c.rdmaClient.CompleteReadSession(ctx, startResp.SessionID, false, 0, nil)
-		return result.Data, remoteReadSource(result.Transport), startResp.SessionID, false, nil
+		return result.Data, remoteReadSourceWithBacking(result.Transport, result.Source), startResp.SessionID, false, nil
 	}
 
 	bytesTransferred := result.Size
@@ -430,7 +430,7 @@ func (c *SeaweedFSRDMAClient) readNeedleViaRemoteRDMA(ctx context.Context, req *
 	if len(completeResp.Data) == 0 && bytesTransferred > 0 {
 		return nil, "", "", false, fmt.Errorf("RDMA read returned empty buffer")
 	}
-	return completeResp.Data, "remote-rdma", startResp.SessionID, true, nil
+	return completeResp.Data, remoteReadSourceWithBacking(result.Transport, result.Source), startResp.SessionID, true, nil
 }
 
 // fetchNeedleData loads actual needle bytes after an RDMA session completes.
@@ -466,7 +466,7 @@ func (c *SeaweedFSRDMAClient) fetchNeedleData(ctx context.Context, req *NeedleRe
 			Size:     size,
 		})
 		if err == nil {
-			return result.Data, remoteReadSource(result.Transport), result.RealRDMA, nil
+			return result.Data, remoteReadSourceWithBacking(result.Transport, result.Source), result.RealRDMA, nil
 		}
 		c.logger.WithError(err).Debug("remote sidecar read failed, trying HTTP fallback")
 	}
@@ -482,8 +482,26 @@ func remoteReadSource(transport string) string {
 	return "remote-" + normalizedRemoteTransport(transport)
 }
 
+func remoteReadSourceWithBacking(transport, backing string) string {
+	source := remoteReadSource(transport)
+	backing = strings.TrimSpace(backing)
+	if backing == "" {
+		return source
+	}
+	return source + ":" + backing
+}
+
 func remoteWriteSource(transport string) string {
 	return remoteReadSource(transport) + "-write"
+}
+
+func remoteWriteSourceWithBacking(transport, backing string) string {
+	source := remoteWriteSource(transport)
+	backing = strings.TrimSpace(backing)
+	if backing == "" {
+		return source
+	}
+	return source + ":" + backing
 }
 
 func normalizedRemoteTransport(transport string) string {
@@ -835,7 +853,7 @@ func (c *SeaweedFSRDMAClient) writeNeedleViaRemoteRDMA(ctx context.Context, req 
 		c.logger.WithError(err).Warn("RDMA write payload persisted but session cleanup failed")
 	}
 	completed = true
-	return result.FileID, "remote-rdma-write", true, nil
+	return result.FileID, remoteWriteSourceWithBacking(result.Transport, result.Source), true, nil
 }
 
 // persistNeedleData submits data to the volume server after RDMA buffering.
@@ -859,7 +877,7 @@ func (c *SeaweedFSRDMAClient) persistNeedleData(ctx context.Context, req *Needle
 			Data:     req.Data,
 		})
 		if err == nil {
-			return result.FileID, remoteWriteSource(result.Transport), result.RealRDMA, nil
+			return result.FileID, remoteWriteSourceWithBacking(result.Transport, result.Source), result.RealRDMA, nil
 		}
 		c.logger.WithError(err).Debug("remote write failed, trying HTTP volume upload")
 	}
