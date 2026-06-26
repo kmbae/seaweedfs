@@ -146,6 +146,35 @@ func (v *Volume) readNeedleDataInto(n *needle.Needle, readOption *ReadOption, wr
 		actualOffset += int64(MaxPossibleVolumeSize)
 	}
 
+	if n.DataSize == 0 {
+		if readOption.HasSlowRead {
+			v.dataFileAccessLock.RLock()
+		}
+		err = n.ReadNeedleMeta(v.DataBackend, actualOffset, readSize, v.Version())
+		if readOption.HasSlowRead {
+			v.dataFileAccessLock.RUnlock()
+		}
+		if err == needle.ErrorSizeMismatch && OffsetSize == 4 {
+			if readOption.HasSlowRead {
+				v.dataFileAccessLock.RLock()
+			}
+			err = n.ReadNeedleMeta(v.DataBackend, actualOffset+int64(MaxPossibleVolumeSize), readSize, v.Version())
+			if readOption.HasSlowRead {
+				v.dataFileAccessLock.RUnlock()
+			}
+			if err == nil {
+				readOption.IsOutOfRange = true
+				actualOffset += int64(MaxPossibleVolumeSize)
+			}
+		}
+		if err != nil {
+			if err != io.EOF {
+				v.checkReadWriteError(err)
+			}
+			return fmt.Errorf("ReadNeedleMeta: %w", err)
+		}
+	}
+
 	buf := mem.Allocate(min(readOption.ReadBufferSize, int(size)))
 	defer mem.Free(buf)
 

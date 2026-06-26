@@ -224,7 +224,7 @@ func (v *Volume) CommitCompact() error {
 	os.Remove(v.FileName(".rdb"))
 
 	glog.V(3).Infof("Loading volume %d commit file...", v.Id)
-	if e = v.load(true, false, v.needleMapKind, 0, v.Version()); e != nil {
+	if e = v.load(true, false, v.needleMapKind, 0, v.Version(), false); e != nil {
 		return e
 	}
 	glog.V(3).Infof("Finish committing volume %d", v.Id)

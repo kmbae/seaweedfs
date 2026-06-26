@@ -133,7 +133,7 @@ func NewVolume(dirname string, dirIdx string, collection string, id needle.Volum
 	v.SuperBlock = super_block.SuperBlock{ReplicaPlacement: replicaPlacement, Ttl: ttl}
 	v.needleMapKind = needleMapKind
 	v.ldbTimeout = ldbTimeout
-	e = v.load(true, true, needleMapKind, preallocate, ver)
+	e = v.load(true, true, needleMapKind, preallocate, ver, false)
 	v.startWorker()
 	return
 }

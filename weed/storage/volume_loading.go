@@ -37,11 +37,19 @@ func loadVolumeWithoutIndex(dirname string, collection string, id needle.VolumeI
 	v = &Volume{dir: dirname, Collection: collection, Id: id}
 	v.SuperBlock = super_block.SuperBlock{}
 	v.needleMapKind = needleMapKind
-	err = v.load(false, false, needleMapKind, 0, ver)
+	err = v.load(false, false, needleMapKind, 0, ver, false)
 	return
 }
 
 func loadVolumeWithoutWorker(dirname string, dirIdx string, collection string, id needle.VolumeId, needleMapKind NeedleMapKind, ldbTimeout int64) (v *Volume, err error) {
+	return loadVolumeWithoutWorkerReadMode(dirname, dirIdx, collection, id, needleMapKind, ldbTimeout, false)
+}
+
+func loadReadonlyVolumeWithoutWorker(dirname string, dirIdx string, collection string, id needle.VolumeId, needleMapKind NeedleMapKind, ldbTimeout int64) (v *Volume, err error) {
+	return loadVolumeWithoutWorkerReadMode(dirname, dirIdx, collection, id, needleMapKind, ldbTimeout, true)
+}
+
+func loadVolumeWithoutWorkerReadMode(dirname string, dirIdx string, collection string, id needle.VolumeId, needleMapKind NeedleMapKind, ldbTimeout int64, forceReadOnly bool) (v *Volume, err error) {
 	v = &Volume{
 		dir:           dirname,
 		dirIdx:        dirIdx,
@@ -51,7 +59,7 @@ func loadVolumeWithoutWorker(dirname string, dirIdx string, collection string, i
 		ldbTimeout:    ldbTimeout,
 	}
 	v.SuperBlock = super_block.SuperBlock{}
-	err = v.load(true, false, needleMapKind, 0, needle.GetCurrentVersion())
+	err = v.load(true, false, needleMapKind, 0, needle.GetCurrentVersion(), forceReadOnly)
 	return
 }
 
@@ -133,7 +141,7 @@ func (v *Volume) reopenIdxForWrite() error {
 	return nil
 }
 
-func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind NeedleMapKind, preallocate int64, ver needle.Version) (err error) {
+func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind NeedleMapKind, preallocate int64, ver needle.Version, forceReadOnly bool) (err error) {
 	alreadyHasSuperBlock := false
 
 	hasLoadedVolume := false
@@ -184,7 +192,11 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 			return fmt.Errorf("cannot read Volume Data file %s", v.FileName(".dat"))
 		}
 		var dataFile *os.File
-		if canWrite {
+		if forceReadOnly {
+			glog.V(0).Infof("opening %s in READONLY mode", v.FileName(".dat"))
+			dataFile, err = os.Open(v.FileName(".dat"))
+			v.noWriteOrDelete = true
+		} else if canWrite {
 			dataFile, err = os.OpenFile(v.FileName(".dat"), os.O_RDWR|os.O_CREATE, 0644)
 		} else {
 			glog.V(0).Infof("opening %s in READONLY mode", v.FileName(".dat"))
@@ -195,7 +207,9 @@ func (v *Volume) load(alsoLoadIndex bool, createDatIfMissing bool, needleMapKind
 		if fileSize >= super_block.SuperBlockSize {
 			alreadyHasSuperBlock = true
 		}
-		v.DataBackend = backend.NewDiskFile(dataFile)
+		if err == nil {
+			v.DataBackend = backend.NewDiskFile(dataFile)
+		}
 	} else {
 		if createDatIfMissing {
 			v.DataBackend, err = backend.CreateVolumeFile(v.FileName(".dat"), preallocate, v.MemoryMapMaxSizeMb)

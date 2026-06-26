@@ -14,7 +14,7 @@ func OpenReadonlyVolume(dataDir, idxDir, collection string, id needle.VolumeId) 
 	if idxDir == "" {
 		idxDir = dataDir
 	}
-	return loadVolumeWithoutWorker(dataDir, idxDir, collection, id, NeedleMapInMemory, 0)
+	return loadReadonlyVolumeWithoutWorker(dataDir, idxDir, collection, id, NeedleMapInMemory, 0)
 }
 
 // ReadNeedleRange reads needle payload bytes at the given offset.
