@@ -26,6 +26,21 @@ RUN CGO_ENABLED=0 GOOS=linux go build -tags "${GO_TAGS}" -a -installsuffix cgo -
 FROM alpine:3.18
 
 RUN apk --no-cache add ca-certificates curl
+ARG INCLUDE_TEST_TOOLS=false
+RUN if [ "${INCLUDE_TEST_TOOLS}" = "true" ]; then \
+      apk add --no-cache \
+        autoconf \
+        automake \
+        fio \
+        gcc \
+        git \
+        make \
+        musl-dev \
+        perl \
+        perl-utils; \
+      git clone --depth 1 https://github.com/pjd/pjdfstest.git /opt/pjdfstest; \
+      cd /opt/pjdfstest && autoreconf -ifs && ./configure && make; \
+    fi
 RUN addgroup -g 1001 appgroup && adduser -D -s /bin/sh -u 1001 -G appgroup appuser
 
 WORKDIR /app
