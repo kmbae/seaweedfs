@@ -126,6 +126,7 @@ func TestReadNeedleUsesNativeVolumeRDMA(t *testing.T) {
 		releasedSession uint64
 	)
 	volumeEndpoint := swvfsdaemon.RDMALocalEndpoint{
+		ConnectionID:  44,
 		ABIVersion:    swvfsproto.RDMAABIVersion,
 		Device:        "mlx5_1",
 		Port:          1,
@@ -142,6 +143,9 @@ func TestReadNeedleUsesNativeVolumeRDMA(t *testing.T) {
 			writeTestJSON(t, w, volumeEndpoint)
 		case swvfsdaemon.VolumeRDMAConnectPath:
 			connects++
+			if r.URL.Query().Get("connection_id") != "44" {
+				t.Errorf("connect connection_id = %q", r.URL.Query().Get("connection_id"))
+			}
 			var local swvfsdaemon.RDMALocalEndpoint
 			if err := json.NewDecoder(r.Body).Decode(&local); err != nil {
 				t.Errorf("decode connect: %v", err)
@@ -159,7 +163,7 @@ func TestReadNeedleUsesNativeVolumeRDMA(t *testing.T) {
 				http.Error(w, err.Error(), http.StatusBadRequest)
 				return
 			}
-			if req.VolumeID != 3 || req.NeedleID != 4 || req.Cookie != 5 || req.Size != 6 {
+			if req.ConnectionID != 44 || req.VolumeID != 3 || req.NeedleID != 4 || req.Cookie != 5 || req.Size != 6 {
 				t.Errorf("unexpected read desc request: %+v", req)
 			}
 			writeTestJSON(t, w, swvfsdaemon.VolumeRDMAReadDescResponse{
@@ -190,7 +194,7 @@ func TestReadNeedleUsesNativeVolumeRDMA(t *testing.T) {
 		logger:           logrus.New(),
 		nativeVolumeRDMA: true,
 		operationTimeout: time.Second,
-		nativePeers:      make(map[string]struct{}),
+		nativePeers:      make(map[string]nativeVolumePeer),
 	}
 	resp, err := client.ReadNeedle(t.Context(), &NeedleReadRequest{
 		VolumeID:     3,
@@ -214,6 +218,9 @@ func TestReadNeedleUsesNativeVolumeRDMA(t *testing.T) {
 	if !native.connected || native.remote.QPN != volumeEndpoint.QPNum {
 		t.Fatalf("native engine was not connected to volume endpoint: %+v", native.remote)
 	}
+	if native.connectConnectionID != 33 || native.readConnectionID != 33 {
+		t.Fatalf("native requester connection IDs connect=%d read=%d", native.connectConnectionID, native.readConnectionID)
+	}
 	if native.readDesc.RemoteAddr != 0xbeef || native.readDesc.RKey != 0 {
 		t.Fatalf("native read desc = %+v", native.readDesc)
 	}
@@ -223,15 +230,27 @@ func TestReadNeedleUsesNativeVolumeRDMA(t *testing.T) {
 }
 
 type fakeNativeVolumeEngine struct {
-	local     swvfsdaemon.RDMALocalEndpoint
-	remote    swvfsproto.RDMARemoteInfo
-	readDesc  swvfsproto.RDMADataDesc
-	data      []byte
-	connected bool
+	local               swvfsdaemon.RDMALocalEndpoint
+	remote              swvfsproto.RDMARemoteInfo
+	readDesc            swvfsproto.RDMADataDesc
+	data                []byte
+	requesterConnection uint64
+	connected           bool
+	readConnectionID    uint64
+	connectConnectionID uint64
 }
 
 func (e *fakeNativeVolumeEngine) RequesterLocal(context.Context) (swvfsdaemon.RDMALocalEndpoint, error) {
 	return e.local, nil
+}
+
+func (e *fakeNativeVolumeEngine) RequesterLocalFor(context.Context, uint64) (swvfsdaemon.RDMALocalEndpoint, uint64, error) {
+	if e.requesterConnection == 0 {
+		e.requesterConnection = 33
+	}
+	local := e.local
+	local.ConnectionID = e.requesterConnection
+	return local, e.requesterConnection, nil
 }
 
 func (e *fakeNativeVolumeEngine) RequesterConnect(_ context.Context, remote swvfsproto.RDMARemoteInfo) error {
@@ -240,9 +259,19 @@ func (e *fakeNativeVolumeEngine) RequesterConnect(_ context.Context, remote swvf
 	return nil
 }
 
+func (e *fakeNativeVolumeEngine) RequesterConnectFor(_ context.Context, connectionID uint64, remote swvfsproto.RDMARemoteInfo) error {
+	e.connectConnectionID = connectionID
+	return e.RequesterConnect(context.Background(), remote)
+}
+
 func (e *fakeNativeVolumeEngine) ReadRemote(_ context.Context, desc swvfsproto.RDMADataDesc, _ time.Duration) ([]byte, error) {
 	e.readDesc = desc
 	return append([]byte(nil), e.data...), nil
+}
+
+func (e *fakeNativeVolumeEngine) ReadRemoteFor(_ context.Context, connectionID uint64, desc swvfsproto.RDMADataDesc, timeout time.Duration) ([]byte, error) {
+	e.readConnectionID = connectionID
+	return e.ReadRemote(context.Background(), desc, timeout)
 }
 
 func writeTestJSON(t *testing.T, w http.ResponseWriter, value interface{}) {

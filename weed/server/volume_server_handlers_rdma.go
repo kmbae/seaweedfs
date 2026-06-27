@@ -14,12 +14,13 @@ type VolumeRdmaReadExporter interface {
 }
 
 type VolumeRdmaReadRequest struct {
-	FileID   string `json:"file_id"`
-	VolumeID uint32 `json:"volume_id"`
-	NeedleID uint64 `json:"needle_id"`
-	Cookie   uint32 `json:"cookie"`
-	Offset   uint64 `json:"offset"`
-	Size     uint64 `json:"size"`
+	ConnectionID uint64 `json:"connection_id,omitempty"`
+	FileID       string `json:"file_id"`
+	VolumeID     uint32 `json:"volume_id"`
+	NeedleID     uint64 `json:"needle_id"`
+	Cookie       uint32 `json:"cookie"`
+	Offset       uint64 `json:"offset"`
+	Size         uint64 `json:"size"`
 }
 
 type VolumeRdmaDataDesc struct {
@@ -30,13 +31,15 @@ type VolumeRdmaDataDesc struct {
 }
 
 type VolumeRdmaReadLease struct {
-	Desc      VolumeRdmaDataDesc
-	SessionID uint64
+	Desc         VolumeRdmaDataDesc
+	ConnectionID uint64
+	SessionID    uint64
 }
 
 type volumeRdmaReadDescResponse struct {
-	Desc      VolumeRdmaDataDesc `json:"desc"`
-	SessionID uint64             `json:"session_id,omitempty"`
+	Desc         VolumeRdmaDataDesc `json:"desc"`
+	ConnectionID uint64             `json:"connection_id,omitempty"`
+	SessionID    uint64             `json:"session_id,omitempty"`
 }
 
 type volumeRdmaReleaseDescRequest struct {
@@ -73,8 +76,9 @@ func (vs *VolumeServer) volumeRdmaReadDescHandler(w http.ResponseWriter, r *http
 		return
 	}
 	writeJsonQuiet(w, r, http.StatusOK, volumeRdmaReadDescResponse{
-		Desc:      lease.Desc,
-		SessionID: lease.SessionID,
+		Desc:         lease.Desc,
+		ConnectionID: lease.ConnectionID,
+		SessionID:    lease.SessionID,
 	})
 }
 

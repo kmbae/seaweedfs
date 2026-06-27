@@ -40,18 +40,20 @@ type NeedleReadDescriptorBackend interface {
 }
 
 type VolumeRDMAReadDescRequest struct {
-	FileID   string `json:"file_id"`
-	VolumeID uint32 `json:"volume_id"`
-	NeedleID uint64 `json:"needle_id"`
-	Cookie   uint32 `json:"cookie"`
-	Offset   uint64 `json:"offset"`
-	Size     uint64 `json:"size"`
+	ConnectionID uint64 `json:"connection_id,omitempty"`
+	FileID       string `json:"file_id"`
+	VolumeID     uint32 `json:"volume_id"`
+	NeedleID     uint64 `json:"needle_id"`
+	Cookie       uint32 `json:"cookie"`
+	Offset       uint64 `json:"offset"`
+	Size         uint64 `json:"size"`
 }
 
 type VolumeRDMAReadDescResponse struct {
-	Desc      swvfsproto.RDMADataDesc `json:"desc"`
-	Attr      *swvfsproto.Attr        `json:"attr,omitempty"`
-	SessionID uint64                  `json:"session_id,omitempty"`
+	Desc         swvfsproto.RDMADataDesc `json:"desc"`
+	Attr         *swvfsproto.Attr        `json:"attr,omitempty"`
+	ConnectionID uint64                  `json:"connection_id,omitempty"`
+	SessionID    uint64                  `json:"session_id,omitempty"`
 }
 
 type VolumeRDMAReleaseDescRequest struct {
@@ -82,13 +84,17 @@ type VolumeNativeRDMAReadDescriptorClient struct {
 	leases      map[uint64]volumeNativeReadLease
 
 	peerMu sync.Mutex
-	peers  map[string]struct{}
+	peers  map[string]volumeNativePeer
 }
 
 type volumeNativeReadLease struct {
 	VolumeServer string
 	SessionID    uint64
 	Created      time.Time
+}
+
+type volumeNativePeer struct {
+	VolumeConnectionID uint64
 }
 
 func MarkNativeReadLease(leaseID uint64) uint64 {
@@ -136,18 +142,20 @@ func (c *VolumeNativeRDMAReadDescriptorClient) ReadNeedleRDMA(ctx context.Contex
 	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	if err := c.ensureVolumeNativePeer(attemptCtx, req.VolumeServer); err != nil {
+	peer, err := c.ensureVolumeNativePeer(attemptCtx, req.VolumeServer)
+	if err != nil {
 		c.Stats.Inc("volume_native_rdma_peer_connect_errors")
 		return nil, nil, volumeNativePeerHandshakeError(err)
 	}
 
 	desc, attr, sessionID, err := PostVolumeNativeReadDesc(attemptCtx, c.Client, req.VolumeServer, VolumeRDMAReadDescRequest{
-		FileID:   req.FileID,
-		VolumeID: req.VolumeID,
-		NeedleID: req.NeedleID,
-		Cookie:   req.Cookie,
-		Offset:   req.Offset,
-		Size:     req.Size,
+		ConnectionID: peer.VolumeConnectionID,
+		FileID:       req.FileID,
+		VolumeID:     req.VolumeID,
+		NeedleID:     req.NeedleID,
+		Cookie:       req.Cookie,
+		Offset:       req.Offset,
+		Size:         req.Size,
 	})
 	if err != nil {
 		c.Stats.Inc("volume_native_rdma_read_desc_errors")
@@ -173,58 +181,59 @@ func (c *VolumeNativeRDMAReadDescriptorClient) ReadNeedleRDMA(ctx context.Contex
 	return desc, attr, nil
 }
 
-func (c *VolumeNativeRDMAReadDescriptorClient) ensureVolumeNativePeer(ctx context.Context, volumeServer string) error {
+func (c *VolumeNativeRDMAReadDescriptorClient) ensureVolumeNativePeer(ctx context.Context, volumeServer string) (volumeNativePeer, error) {
 	if c == nil || c.Control == nil {
-		return nil
+		return volumeNativePeer{}, nil
 	}
 	key := volumeNativeServerKey(volumeServer)
 	c.peerMu.Lock()
 	if c.peers != nil {
-		if _, ok := c.peers[key]; ok {
+		if peer, ok := c.peers[key]; ok {
 			c.peerMu.Unlock()
-			return nil
+			return peer, nil
 		}
 	}
 	c.peerMu.Unlock()
 
 	localInfo, err := c.Control.GetLocal()
 	if err != nil {
-		return err
+		return volumeNativePeer{}, err
 	}
 	local := RDMALocalEndpointFromInfo(localInfo)
 	if !local.ReadyForConnect() {
-		return ErrnoError{Errno: ErrnoNoSys, Msg: fmt.Sprintf("local kernel RDMA endpoint is not ready: qpn=%d lid=%d flags=0x%x", local.QPNum, local.LID, local.Flags)}
+		return volumeNativePeer{}, ErrnoError{Errno: ErrnoNoSys, Msg: fmt.Sprintf("local kernel RDMA endpoint is not ready: qpn=%d lid=%d flags=0x%x", local.QPNum, local.LID, local.Flags)}
 	}
 	remote, err := FetchVolumeNativeEndpoint(ctx, c.Client, volumeServer)
 	if err != nil {
-		return err
+		return volumeNativePeer{}, err
 	}
 	if !remote.ReadyForConnect() {
-		return ErrnoError{Errno: ErrnoNoSys, Msg: fmt.Sprintf("volume RDMA endpoint is not ready: qpn=%d lid=%d flags=0x%x", remote.QPNum, remote.LID, remote.Flags)}
+		return volumeNativePeer{}, ErrnoError{Errno: ErrnoNoSys, Msg: fmt.Sprintf("volume RDMA endpoint is not ready: qpn=%d lid=%d flags=0x%x", remote.QPNum, remote.LID, remote.Flags)}
 	}
 
 	if c.ServiceLevel > 15 {
-		return fmt.Errorf("RDMA service level must be 0..15")
+		return volumeNativePeer{}, fmt.Errorf("RDMA service level must be 0..15")
 	}
 	remoteInfo, err := remote.RemoteInfo(c.ServiceLevel)
 	if err != nil {
-		return err
+		return volumeNativePeer{}, err
 	}
 	if err := c.Control.Connect(remoteInfo); err != nil {
-		return err
+		return volumeNativePeer{}, err
 	}
-	if err := PostVolumeNativeConnect(ctx, c.Client, volumeServer, local, c.ServiceLevel); err != nil {
-		return err
+	if err := PostVolumeNativeConnectFor(ctx, c.Client, volumeServer, remote.ConnectionID, local, c.ServiceLevel); err != nil {
+		return volumeNativePeer{}, err
 	}
 
+	peer := volumeNativePeer{VolumeConnectionID: remote.ConnectionID}
 	c.peerMu.Lock()
 	if c.peers == nil {
-		c.peers = make(map[string]struct{})
+		c.peers = make(map[string]volumeNativePeer)
 	}
-	c.peers[key] = struct{}{}
+	c.peers[key] = peer
 	c.peerMu.Unlock()
 	c.Stats.Inc("volume_native_rdma_peer_connect_success")
-	return nil
+	return peer, nil
 }
 
 func volumeNativePeerHandshakeError(err error) error {
@@ -298,6 +307,10 @@ func FetchVolumeNativeEndpoint(ctx context.Context, client *http.Client, rawURL 
 }
 
 func PostVolumeNativeConnect(ctx context.Context, client *http.Client, rawURL string, local RDMALocalEndpoint, serviceLevel uint32) error {
+	return PostVolumeNativeConnectFor(ctx, client, rawURL, 0, local, serviceLevel)
+}
+
+func PostVolumeNativeConnectFor(ctx context.Context, client *http.Client, rawURL string, connectionID uint64, local RDMALocalEndpoint, serviceLevel uint32) error {
 	reqURL, err := normalizeVolumeNativeURL(rawURL, VolumeRDMAConnectPath)
 	if err != nil {
 		return err
@@ -308,6 +321,9 @@ func PostVolumeNativeConnect(ctx context.Context, client *http.Client, rawURL st
 	}
 	q := u.Query()
 	q.Set("sl", fmt.Sprintf("%d", serviceLevel))
+	if connectionID != 0 {
+		q.Set("connection_id", fmt.Sprintf("%d", connectionID))
+	}
 	u.RawQuery = q.Encode()
 	body, err := json.Marshal(local)
 	if err != nil {

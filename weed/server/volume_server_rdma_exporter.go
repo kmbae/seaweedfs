@@ -31,6 +31,10 @@ type VolumeRdmaReadRegistrar interface {
 	RegisterReadBuffer(context.Context, []byte) (VolumeRdmaRegisteredBuffer, error)
 }
 
+type VolumeRdmaConnectionReadRegistrar interface {
+	RegisterReadBufferFor(context.Context, uint64, []byte) (VolumeRdmaRegisteredBuffer, error)
+}
+
 type VolumeRdmaRegisteredBuffer interface {
 	Descriptor() VolumeRdmaDataDesc
 	Release(context.Context) error
@@ -117,7 +121,12 @@ func (e *VolumeStoreRdmaReadExporter) PrepareRead(ctx context.Context, req Volum
 		return nil, fmt.Errorf("native RDMA read produced no data")
 	}
 
-	registered, err := e.registrar.RegisterReadBuffer(ctx, data)
+	var registered VolumeRdmaRegisteredBuffer
+	if registrar, ok := e.registrar.(VolumeRdmaConnectionReadRegistrar); ok {
+		registered, err = registrar.RegisterReadBufferFor(ctx, req.ConnectionID, data)
+	} else {
+		registered, err = e.registrar.RegisterReadBuffer(ctx, data)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -141,8 +150,9 @@ func (e *VolumeStoreRdmaReadExporter) PrepareRead(ctx context.Context, req Volum
 	desc.Reserved[0] = sessionID
 
 	return &VolumeRdmaReadLease{
-		Desc:      desc,
-		SessionID: sessionID,
+		Desc:         desc,
+		ConnectionID: req.ConnectionID,
+		SessionID:    sessionID,
 	}, nil
 }
 

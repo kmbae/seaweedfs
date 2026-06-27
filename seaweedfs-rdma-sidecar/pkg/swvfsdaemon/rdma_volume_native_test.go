@@ -96,6 +96,7 @@ func TestVolumeNativeRDMAReadDescriptorClientConnectsNativePeer(t *testing.T) {
 		postedLocal     RDMALocalEndpoint
 	)
 	remoteEndpoint := RDMALocalEndpoint{
+		ConnectionID:  55,
 		ABIVersion:    swvfsproto.RDMAABIVersion,
 		KernelEnabled: true,
 		EndpointReady: true,
@@ -116,6 +117,9 @@ func TestVolumeNativeRDMAReadDescriptorClientConnectsNativePeer(t *testing.T) {
 			if r.URL.Query().Get("sl") != "4" {
 				t.Errorf("service level = %q", r.URL.Query().Get("sl"))
 			}
+			if r.URL.Query().Get("connection_id") != "55" {
+				t.Errorf("connection_id = %q", r.URL.Query().Get("connection_id"))
+			}
 			if err := json.NewDecoder(r.Body).Decode(&postedLocal); err != nil {
 				t.Errorf("decode connect request: %v", err)
 				http.Error(w, err.Error(), http.StatusBadRequest)
@@ -124,6 +128,15 @@ func TestVolumeNativeRDMAReadDescriptorClientConnectsNativePeer(t *testing.T) {
 			writeJSON(w, map[string]bool{"connected": true})
 		case VolumeRDMAReadDescPath:
 			readRequests++
+			var req VolumeRDMAReadDescRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode read desc request: %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if req.ConnectionID != 55 {
+				t.Errorf("read desc connection_id = %d", req.ConnectionID)
+			}
 			writeJSON(w, VolumeRDMAReadDescResponse{
 				Desc: swvfsproto.RDMADataDesc{
 					RemoteAddr: 0xbeef,

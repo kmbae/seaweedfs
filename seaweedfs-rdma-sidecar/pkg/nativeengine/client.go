@@ -22,21 +22,23 @@ type Client struct {
 }
 
 type request struct {
-	Op        string          `json:"op"`
-	Remote    *remoteInfo     `json:"remote,omitempty"`
-	Desc      *rdmaDataDesc   `json:"desc,omitempty"`
-	SessionID uint64          `json:"session_id,omitempty"`
-	TimeoutMs uint64          `json:"timeout_ms,omitempty"`
-	Data      json.RawMessage `json:"data,omitempty"`
+	Op           string          `json:"op"`
+	ConnectionID uint64          `json:"connection_id,omitempty"`
+	Remote       *remoteInfo     `json:"remote,omitempty"`
+	Desc         *rdmaDataDesc   `json:"desc,omitempty"`
+	SessionID    uint64          `json:"session_id,omitempty"`
+	TimeoutMs    uint64          `json:"timeout_ms,omitempty"`
+	Data         json.RawMessage `json:"data,omitempty"`
 }
 
 type response struct {
-	OK        bool                           `json:"ok"`
-	Error     string                         `json:"error,omitempty"`
-	Endpoint  *swvfsdaemon.RDMALocalEndpoint `json:"endpoint,omitempty"`
-	Desc      *rdmaDataDesc                  `json:"desc,omitempty"`
-	SessionID uint64                         `json:"session_id,omitempty"`
-	Data      []byte                         `json:"data,omitempty"`
+	OK           bool                           `json:"ok"`
+	Error        string                         `json:"error,omitempty"`
+	Endpoint     *swvfsdaemon.RDMALocalEndpoint `json:"endpoint,omitempty"`
+	Desc         *rdmaDataDesc                  `json:"desc,omitempty"`
+	ConnectionID uint64                         `json:"connection_id,omitempty"`
+	SessionID    uint64                         `json:"session_id,omitempty"`
+	Data         []byte                         `json:"data,omitempty"`
 }
 
 type remoteInfo struct {
@@ -67,34 +69,53 @@ func New(socketPath string, timeout time.Duration) *Client {
 }
 
 func (c *Client) RequesterLocal(ctx context.Context) (swvfsdaemon.RDMALocalEndpoint, error) {
+	endpoint, _, err := c.RequesterLocalFor(ctx, 0)
+	return endpoint, err
+}
+
+func (c *Client) RequesterLocalFor(ctx context.Context, connectionID uint64) (swvfsdaemon.RDMALocalEndpoint, uint64, error) {
 	var endpoint swvfsdaemon.RDMALocalEndpoint
-	resp, err := c.roundTrip(ctx, request{Op: "requester_local"})
+	resp, err := c.roundTrip(ctx, request{Op: "requester_local", ConnectionID: connectionID})
 	if err != nil {
-		return endpoint, err
+		return endpoint, 0, err
 	}
 	if resp.Endpoint == nil {
-		return endpoint, fmt.Errorf("native engine requester_local response missing endpoint")
+		return endpoint, 0, fmt.Errorf("native engine requester_local response missing endpoint")
 	}
-	return *resp.Endpoint, nil
+	endpoint = *resp.Endpoint
+	if resp.ConnectionID != 0 {
+		endpoint.ConnectionID = resp.ConnectionID
+	}
+	return endpoint, endpoint.ConnectionID, nil
 }
 
 func (c *Client) RequesterConnect(ctx context.Context, remote swvfsproto.RDMARemoteInfo) error {
+	return c.RequesterConnectFor(ctx, 0, remote)
+}
+
+func (c *Client) RequesterConnectFor(ctx context.Context, connectionID uint64, remote swvfsproto.RDMARemoteInfo) error {
 	_, err := c.roundTrip(ctx, request{
-		Op:     "requester_connect",
-		Remote: toRemoteInfo(remote),
+		Op:           "requester_connect",
+		ConnectionID: connectionID,
+		Remote:       toRemoteInfo(remote),
 	})
 	return err
 }
 
 func (c *Client) ReadRemote(ctx context.Context, desc swvfsproto.RDMADataDesc, timeout time.Duration) ([]byte, error) {
+	return c.ReadRemoteFor(ctx, 0, desc, timeout)
+}
+
+func (c *Client) ReadRemoteFor(ctx context.Context, connectionID uint64, desc swvfsproto.RDMADataDesc, timeout time.Duration) ([]byte, error) {
 	timeoutMs := uint64(timeout.Milliseconds())
 	if timeoutMs == 0 && timeout > 0 {
 		timeoutMs = 1
 	}
 	resp, err := c.roundTrip(ctx, request{
-		Op:        "read_remote",
-		Desc:      toDataDesc(desc),
-		TimeoutMs: timeoutMs,
+		Op:           "read_remote",
+		ConnectionID: connectionID,
+		Desc:         toDataDesc(desc),
+		TimeoutMs:    timeoutMs,
 	})
 	if err != nil {
 		return nil, err

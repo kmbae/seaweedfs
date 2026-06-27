@@ -49,7 +49,12 @@ type SeaweedFSRDMAClient struct {
 	useZeroCopy bool
 
 	nativeMu    sync.Mutex
-	nativePeers map[string]struct{}
+	nativePeers map[string]nativeVolumePeer
+}
+
+type nativeVolumePeer struct {
+	RequesterConnectionID uint64
+	VolumeConnectionID    uint64
 }
 
 // Config holds configuration for the SeaweedFS RDMA client
@@ -86,6 +91,9 @@ type nativeVolumeEngine interface {
 	RequesterLocal(context.Context) (swvfsdaemon.RDMALocalEndpoint, error)
 	RequesterConnect(context.Context, swvfsproto.RDMARemoteInfo) error
 	ReadRemote(context.Context, swvfsproto.RDMADataDesc, time.Duration) ([]byte, error)
+	RequesterLocalFor(context.Context, uint64) (swvfsdaemon.RDMALocalEndpoint, uint64, error)
+	RequesterConnectFor(context.Context, uint64, swvfsproto.RDMARemoteInfo) error
+	ReadRemoteFor(context.Context, uint64, swvfsproto.RDMADataDesc, time.Duration) ([]byte, error)
 }
 
 // NeedleReadRequest represents a SeaweedFS needle read request
@@ -165,7 +173,7 @@ func NewSeaweedFSRDMAClient(config *Config) (*SeaweedFSRDMAClient, error) {
 		useZeroCopy:        config.UseZeroCopy,
 		remoteReadPort:     config.RemoteReadPort,
 		operationTimeout:   config.DefaultTimeout,
-		nativePeers:        make(map[string]struct{}),
+		nativePeers:        make(map[string]nativeVolumePeer),
 	}
 	if client.remoteReadPort == 0 {
 		client.remoteReadPort = remote.DefaultRemotePort
@@ -427,16 +435,18 @@ func (c *SeaweedFSRDMAClient) readNeedleViaNativeVolumeRDMA(ctx context.Context,
 		return nil, "", false, fmt.Errorf("native volume RDMA read too large: %d > %d", size, swvfsproto.RDMAIOMax)
 	}
 
-	if err := c.ensureNativeVolumePeer(ctx, volumeServer); err != nil {
+	peer, err := c.ensureNativeVolumePeer(ctx, volumeServer)
+	if err != nil {
 		return nil, "", false, err
 	}
 	desc, _, sessionID, err := swvfsdaemon.PostVolumeNativeReadDesc(ctx, nil, volumeServer, swvfsdaemon.VolumeRDMAReadDescRequest{
-		FileID:   reqFileID(req),
-		VolumeID: req.VolumeID,
-		NeedleID: req.NeedleID,
-		Cookie:   req.Cookie,
-		Offset:   req.Offset,
-		Size:     size,
+		ConnectionID: peer.VolumeConnectionID,
+		FileID:       reqFileID(req),
+		VolumeID:     req.VolumeID,
+		NeedleID:     req.NeedleID,
+		Cookie:       req.Cookie,
+		Offset:       req.Offset,
+		Size:         size,
 	})
 	if err != nil {
 		return nil, "", false, err
@@ -458,7 +468,7 @@ func (c *SeaweedFSRDMAClient) readNeedleViaNativeVolumeRDMA(ctx context.Context,
 	}
 
 	timeout := c.nativeOperationTimeout()
-	data, err := c.nativeEngine.ReadRemote(ctx, *desc, timeout)
+	data, err := c.nativeEngine.ReadRemoteFor(ctx, peer.RequesterConnectionID, *desc, timeout)
 	if err != nil {
 		return nil, "", false, err
 	}
@@ -468,44 +478,48 @@ func (c *SeaweedFSRDMAClient) readNeedleViaNativeVolumeRDMA(ctx context.Context,
 	return data[:desc.Length], fmt.Sprintf("%d", sessionID), true, nil
 }
 
-func (c *SeaweedFSRDMAClient) ensureNativeVolumePeer(ctx context.Context, volumeServer string) error {
+func (c *SeaweedFSRDMAClient) ensureNativeVolumePeer(ctx context.Context, volumeServer string) (nativeVolumePeer, error) {
 	key := nativeVolumePeerKey(volumeServer)
 	c.nativeMu.Lock()
-	if _, ok := c.nativePeers[key]; ok {
+	if peer, ok := c.nativePeers[key]; ok {
 		c.nativeMu.Unlock()
-		return nil
+		return peer, nil
 	}
 	c.nativeMu.Unlock()
 
-	local, err := c.nativeEngine.RequesterLocal(ctx)
+	local, requesterConnectionID, err := c.nativeEngine.RequesterLocalFor(ctx, 0)
 	if err != nil {
-		return err
+		return nativeVolumePeer{}, err
 	}
 	if !local.ReadyForConnect() {
-		return fmt.Errorf("native requester endpoint is not ready: qpn=%d lid=%d", local.QPNum, local.LID)
+		return nativeVolumePeer{}, fmt.Errorf("native requester endpoint is not ready: qpn=%d lid=%d", local.QPNum, local.LID)
 	}
 	remoteEndpoint, err := swvfsdaemon.FetchVolumeNativeEndpoint(ctx, nil, volumeServer)
 	if err != nil {
-		return err
+		return nativeVolumePeer{}, err
 	}
 	if !remoteEndpoint.ReadyForConnect() {
-		return fmt.Errorf("native volume endpoint is not ready: qpn=%d lid=%d", remoteEndpoint.QPNum, remoteEndpoint.LID)
+		return nativeVolumePeer{}, fmt.Errorf("native volume endpoint is not ready: qpn=%d lid=%d", remoteEndpoint.QPNum, remoteEndpoint.LID)
 	}
-	if err := swvfsdaemon.PostVolumeNativeConnect(ctx, nil, volumeServer, local, c.nativeServiceLevel); err != nil {
-		return err
+	if err := swvfsdaemon.PostVolumeNativeConnectFor(ctx, nil, volumeServer, remoteEndpoint.ConnectionID, local, c.nativeServiceLevel); err != nil {
+		return nativeVolumePeer{}, err
 	}
 	remoteInfo, err := remoteEndpoint.RemoteInfo(c.nativeServiceLevel)
 	if err != nil {
-		return err
+		return nativeVolumePeer{}, err
 	}
-	if err := c.nativeEngine.RequesterConnect(ctx, remoteInfo); err != nil {
-		return err
+	if err := c.nativeEngine.RequesterConnectFor(ctx, requesterConnectionID, remoteInfo); err != nil {
+		return nativeVolumePeer{}, err
 	}
 
+	peer := nativeVolumePeer{
+		RequesterConnectionID: requesterConnectionID,
+		VolumeConnectionID:    remoteEndpoint.ConnectionID,
+	}
 	c.nativeMu.Lock()
-	c.nativePeers[key] = struct{}{}
+	c.nativePeers[key] = peer
 	c.nativeMu.Unlock()
-	return nil
+	return peer, nil
 }
 
 func (c *SeaweedFSRDMAClient) nativeOperationTimeout() time.Duration {

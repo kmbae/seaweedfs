@@ -6,7 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use libc::{c_char, c_int, c_void, size_t};
 use libloading::Library;
-use std::collections::HashMap;
+use std::collections::{hash_map::Entry, HashMap};
 use std::ffi::CStr;
 use std::fmt;
 use std::mem::MaybeUninit;
@@ -91,40 +91,37 @@ pub struct RealVerbsVolumeRdmaProvider {
 
 impl RealVerbsVolumeRdmaProvider {
     pub fn new(config: VolumeVerbsConfig) -> Result<Self> {
-        let resources = VerbsResources::open(config.clone())?;
-        let endpoint = resources.endpoint.clone();
         Ok(Self {
             config,
             state: Mutex::new(VerbsProviderState {
-                resources,
-                endpoint,
-                connected_remote: None,
-                cached_resources: Vec::new(),
+                next_connection_id: 1,
                 next_session_id: 1,
-                leases: HashMap::new(),
+                connections: HashMap::new(),
             }),
         })
     }
 
-    pub fn local_endpoint_info(&self) -> Result<VolumeRdmaEndpointInfo> {
+    pub fn local_endpoint_info(&self, connection_id: u64) -> Result<(u64, VolumeRdmaEndpointInfo)> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("verbs provider mutex poisoned"))?;
-        if state.connected_remote.is_some() {
-            state.rotate_resources(&self.config)?;
-        }
-        let mut endpoint = state.endpoint.clone();
-        endpoint.qp_connected = state.connected_remote.is_some();
-        Ok(endpoint)
+        let (connection_id, connection) = state.ensure_connection(&self.config, connection_id)?;
+        let mut endpoint = connection.endpoint.clone();
+        endpoint.qp_connected = connection.connected_remote.is_some();
+        Ok((connection_id, endpoint))
     }
 
-    pub fn connect_remote(&self, remote: VolumeRdmaRemoteInfo) -> Result<()> {
+    pub fn connect_remote(&self, connection_id: u64, remote: VolumeRdmaRemoteInfo) -> Result<()> {
+        if connection_id == 0 {
+            return Err(anyhow!("verbs connect requires connection_id"));
+        }
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("verbs provider mutex poisoned"))?;
-        if let Some(existing) = &state.connected_remote {
+        let connection = state.get_connection_mut(connection_id)?;
+        if let Some(existing) = &connection.connected_remote {
             if existing == &remote {
                 return Ok(());
             }
@@ -135,27 +132,35 @@ impl RealVerbsVolumeRdmaProvider {
                 existing.psn
             ));
         }
-        state.resources.connect(&remote)?;
-        state.endpoint = state.resources.endpoint.clone();
-        state.connected_remote = Some(remote);
+        connection.resources.connect(&remote)?;
+        connection.endpoint = connection.resources.endpoint.clone();
+        connection.connected_remote = Some(remote);
         Ok(())
     }
 
-    pub fn register_read_buffer(&self, data: Vec<u8>) -> Result<VolumeRdmaRegisteredRead> {
+    pub fn register_read_buffer(
+        &self,
+        connection_id: u64,
+        data: Vec<u8>,
+    ) -> Result<VolumeRdmaRegisteredRead> {
+        if connection_id == 0 {
+            return Err(anyhow!("verbs register_read requires connection_id"));
+        }
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("verbs provider mutex poisoned"))?;
+        let session_id = state.next_session_id()?;
+        let connection = state.get_connection_mut(connection_id)?;
         validate_register_read_ready(
-            &state.endpoint,
-            state.connected_remote.is_some(),
+            &connection.endpoint,
+            connection.connected_remote.is_some(),
             data.len(),
         )?;
 
-        let session_id = state.next_session_id()?;
-        let lease = state.resources.register_read_lease(session_id, data)?;
+        let lease = connection.resources.register_read_lease(session_id, data)?;
         let desc = lease.desc.clone();
-        state.leases.insert(session_id, lease);
+        connection.leases.insert(session_id, lease);
 
         Ok(VolumeRdmaRegisteredRead { session_id, desc })
     }
@@ -165,8 +170,11 @@ impl RealVerbsVolumeRdmaProvider {
             .state
             .lock()
             .map_err(|_| anyhow!("verbs provider mutex poisoned"))?;
-        if let Some(lease) = state.leases.remove(&session_id) {
-            lease.release()?;
+        for connection in state.connections.values_mut() {
+            if let Some(lease) = connection.leases.remove(&session_id) {
+                lease.release()?;
+                break;
+            }
         }
         Ok(())
     }
@@ -174,16 +182,24 @@ impl RealVerbsVolumeRdmaProvider {
 
 #[async_trait]
 impl VolumeRdmaProvider for RealVerbsVolumeRdmaProvider {
-    async fn local_endpoint(&self) -> Result<VolumeRdmaEndpointInfo> {
-        self.local_endpoint_info()
+    async fn local_endpoint(&self, connection_id: u64) -> Result<(u64, VolumeRdmaEndpointInfo)> {
+        self.local_endpoint_info(connection_id)
     }
 
-    async fn connect_endpoint(&self, remote: VolumeRdmaRemoteInfo) -> Result<()> {
-        self.connect_remote(remote)
+    async fn connect_endpoint(
+        &self,
+        connection_id: u64,
+        remote: VolumeRdmaRemoteInfo,
+    ) -> Result<()> {
+        self.connect_remote(connection_id, remote)
     }
 
-    async fn register_read(&self, data: Vec<u8>) -> Result<VolumeRdmaRegisteredRead> {
-        self.register_read_buffer(data)
+    async fn register_read(
+        &self,
+        connection_id: u64,
+        data: Vec<u8>,
+    ) -> Result<VolumeRdmaRegisteredRead> {
+        self.register_read_buffer(connection_id, data)
     }
 
     async fn release_read(&self, session_id: u64) -> Result<()> {
@@ -199,39 +215,37 @@ pub struct RealVerbsVolumeRdmaRequester {
 
 impl RealVerbsVolumeRdmaRequester {
     pub fn new(config: VolumeVerbsConfig) -> Result<Self> {
-        let resources = VerbsResources::open(config.clone())?;
-        let endpoint = resources.endpoint.clone();
         Ok(Self {
             config,
             state: Mutex::new(VerbsRequesterState {
-                resources,
-                endpoint,
-                connected_remote: None,
-                cached_resources: Vec::new(),
+                next_connection_id: 1,
+                connections: HashMap::new(),
                 next_wr_id: 1,
             }),
         })
     }
 
-    pub fn local_endpoint_info(&self) -> Result<VolumeRdmaEndpointInfo> {
+    pub fn local_endpoint_info(&self, connection_id: u64) -> Result<(u64, VolumeRdmaEndpointInfo)> {
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("verbs requester mutex poisoned"))?;
-        if state.connected_remote.is_some() {
-            state.rotate_resources(&self.config)?;
-        }
-        let mut endpoint = state.endpoint.clone();
-        endpoint.qp_connected = state.connected_remote.is_some();
-        Ok(endpoint)
+        let (connection_id, connection) = state.ensure_connection(&self.config, connection_id)?;
+        let mut endpoint = connection.endpoint.clone();
+        endpoint.qp_connected = connection.connected_remote.is_some();
+        Ok((connection_id, endpoint))
     }
 
-    pub fn connect_remote(&self, remote: VolumeRdmaRemoteInfo) -> Result<()> {
+    pub fn connect_remote(&self, connection_id: u64, remote: VolumeRdmaRemoteInfo) -> Result<()> {
+        if connection_id == 0 {
+            return Err(anyhow!("verbs requester_connect requires connection_id"));
+        }
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("verbs requester mutex poisoned"))?;
-        if let Some(existing) = &state.connected_remote {
+        let connection = state.get_connection_mut(connection_id)?;
+        if let Some(existing) = &connection.connected_remote {
             if existing == &remote {
                 return Ok(());
             }
@@ -242,24 +256,39 @@ impl RealVerbsVolumeRdmaRequester {
                 existing.psn
             ));
         }
-        state.resources.connect(&remote)?;
-        state.endpoint = state.resources.endpoint.clone();
-        state.connected_remote = Some(remote);
+        connection.resources.connect(&remote)?;
+        connection.endpoint = connection.resources.endpoint.clone();
+        connection.connected_remote = Some(remote);
         Ok(())
     }
 
-    pub fn read_remote(&self, desc: &VolumeRdmaDataDesc, timeout: Duration) -> Result<Vec<u8>> {
+    pub fn read_remote(
+        &self,
+        connection_id: u64,
+        desc: &VolumeRdmaDataDesc,
+        timeout: Duration,
+    ) -> Result<Vec<u8>> {
+        if connection_id == 0 {
+            return Err(anyhow!("verbs read_remote requires connection_id"));
+        }
         let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("verbs requester mutex poisoned"))?;
-        validate_requester_ready(&state.endpoint, state.connected_remote.is_some(), desc)?;
         let wr_id = state.next_wr_id()?;
-        let mut local = state
+        let connection = state.get_connection_mut(connection_id)?;
+        validate_requester_ready(
+            &connection.endpoint,
+            connection.connected_remote.is_some(),
+            desc,
+        )?;
+        let mut local = connection
             .resources
             .register_local_buffer(desc.length as usize)?;
-        state.resources.post_rdma_read(&mut local, desc, wr_id)?;
-        state
+        connection
+            .resources
+            .post_rdma_read(&mut local, desc, wr_id)?;
+        connection
             .resources
             .poll_read_completion(wr_id, desc.length, timeout)?;
         local.into_vec()
@@ -268,42 +297,89 @@ impl RealVerbsVolumeRdmaRequester {
 
 #[async_trait]
 impl VolumeRdmaRequester for RealVerbsVolumeRdmaRequester {
-    async fn local_endpoint(&self) -> Result<VolumeRdmaEndpointInfo> {
-        self.local_endpoint_info()
+    async fn local_endpoint(&self, connection_id: u64) -> Result<(u64, VolumeRdmaEndpointInfo)> {
+        self.local_endpoint_info(connection_id)
     }
 
-    async fn connect_endpoint(&self, remote: VolumeRdmaRemoteInfo) -> Result<()> {
-        self.connect_remote(remote)
+    async fn connect_endpoint(
+        &self,
+        connection_id: u64,
+        remote: VolumeRdmaRemoteInfo,
+    ) -> Result<()> {
+        self.connect_remote(connection_id, remote)
     }
 
-    async fn read_remote(&self, desc: VolumeRdmaDataDesc, timeout_ms: u64) -> Result<Vec<u8>> {
+    async fn read_remote(
+        &self,
+        connection_id: u64,
+        desc: VolumeRdmaDataDesc,
+        timeout_ms: u64,
+    ) -> Result<Vec<u8>> {
         let timeout = if timeout_ms == 0 {
             Duration::from_secs(5)
         } else {
             Duration::from_millis(timeout_ms)
         };
-        RealVerbsVolumeRdmaRequester::read_remote(self, &desc, timeout)
+        RealVerbsVolumeRdmaRequester::read_remote(self, connection_id, &desc, timeout)
     }
 }
 
 #[derive(Debug)]
 struct VerbsRequesterState {
-    resources: VerbsResources,
-    endpoint: VolumeRdmaEndpointInfo,
-    connected_remote: Option<VolumeRdmaRemoteInfo>,
-    cached_resources: Vec<VerbsResources>,
+    next_connection_id: u64,
+    connections: HashMap<u64, VerbsRequesterConnection>,
     next_wr_id: u64,
 }
 
+#[derive(Debug)]
+struct VerbsRequesterConnection {
+    resources: VerbsResources,
+    endpoint: VolumeRdmaEndpointInfo,
+    connected_remote: Option<VolumeRdmaRemoteInfo>,
+}
+
 impl VerbsRequesterState {
-    fn rotate_resources(&mut self, config: &VolumeVerbsConfig) -> Result<()> {
-        let new_resources = VerbsResources::open(config.clone())
-            .context("open replacement requester QP for new native RDMA peer")?;
-        let old_resources = std::mem::replace(&mut self.resources, new_resources);
-        self.cached_resources.push(old_resources);
-        self.endpoint = self.resources.endpoint.clone();
-        self.connected_remote = None;
-        Ok(())
+    fn ensure_connection(
+        &mut self,
+        config: &VolumeVerbsConfig,
+        connection_id: u64,
+    ) -> Result<(u64, &mut VerbsRequesterConnection)> {
+        let connection_id = self.allocate_or_use_connection_id(connection_id)?;
+        let connection = match self.connections.entry(connection_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let resources = VerbsResources::open(config.clone()).with_context(|| {
+                    format!("open requester QP for native RDMA connection {connection_id}")
+                })?;
+                let endpoint = resources.endpoint.clone();
+                entry.insert(VerbsRequesterConnection {
+                    resources,
+                    endpoint,
+                    connected_remote: None,
+                })
+            }
+        };
+        Ok((connection_id, connection))
+    }
+
+    fn get_connection_mut(&mut self, connection_id: u64) -> Result<&mut VerbsRequesterConnection> {
+        self.connections.get_mut(&connection_id).ok_or_else(|| {
+            anyhow!("unknown requester native RDMA connection_id {connection_id}; call requester_local first")
+        })
+    }
+
+    fn allocate_or_use_connection_id(&mut self, requested: u64) -> Result<u64> {
+        if requested != 0 {
+            return Ok(requested);
+        }
+        let connection_id = self.next_connection_id;
+        if connection_id == 0 {
+            return Err(anyhow!("verbs requester connection id overflow"));
+        }
+        self.next_connection_id = connection_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("verbs requester connection id overflow"))?;
+        Ok(connection_id)
     }
 
     fn next_wr_id(&mut self) -> Result<u64> {
@@ -344,16 +420,16 @@ pub fn run_verbs_loopback_read_selftest(
     let source = RealVerbsVolumeRdmaProvider::new(config)?;
     let requester = RealVerbsVolumeRdmaRequester::new(requester_config)?;
 
-    let source_endpoint = source.local_endpoint_info()?;
-    let requester_endpoint = requester.local_endpoint_info()?;
+    let (source_connection_id, source_endpoint) = source.local_endpoint_info(0)?;
+    let (requester_connection_id, requester_endpoint) = requester.local_endpoint_info(0)?;
     let source_remote = endpoint_to_remote_info(&source_endpoint, service_level)?;
     let requester_remote = endpoint_to_remote_info(&requester_endpoint, service_level)?;
 
-    source.connect_remote(requester_remote)?;
-    requester.connect_remote(source_remote)?;
+    source.connect_remote(source_connection_id, requester_remote)?;
+    requester.connect_remote(requester_connection_id, source_remote)?;
 
-    let registered = source.register_read_buffer(payload.clone())?;
-    let read = requester.read_remote(&registered.desc, timeout);
+    let registered = source.register_read_buffer(source_connection_id, payload.clone())?;
+    let read = requester.read_remote(requester_connection_id, &registered.desc, timeout);
     let release = source.release_read_session(registered.session_id);
     release?;
 
@@ -442,23 +518,62 @@ pub fn endpoint_to_remote_info(
 
 #[derive(Debug)]
 struct VerbsProviderState {
+    next_connection_id: u64,
+    next_session_id: u64,
+    connections: HashMap<u64, VerbsProviderConnection>,
+}
+
+#[derive(Debug)]
+struct VerbsProviderConnection {
     resources: VerbsResources,
     endpoint: VolumeRdmaEndpointInfo,
     connected_remote: Option<VolumeRdmaRemoteInfo>,
-    cached_resources: Vec<VerbsResources>,
-    next_session_id: u64,
     leases: HashMap<u64, VerbsReadLease>,
 }
 
 impl VerbsProviderState {
-    fn rotate_resources(&mut self, config: &VolumeVerbsConfig) -> Result<()> {
-        let new_resources = VerbsResources::open(config.clone())
-            .context("open replacement provider QP for new native RDMA peer")?;
-        let old_resources = std::mem::replace(&mut self.resources, new_resources);
-        self.cached_resources.push(old_resources);
-        self.endpoint = self.resources.endpoint.clone();
-        self.connected_remote = None;
-        Ok(())
+    fn ensure_connection(
+        &mut self,
+        config: &VolumeVerbsConfig,
+        connection_id: u64,
+    ) -> Result<(u64, &mut VerbsProviderConnection)> {
+        let connection_id = self.allocate_or_use_connection_id(connection_id)?;
+        let connection = match self.connections.entry(connection_id) {
+            Entry::Occupied(entry) => entry.into_mut(),
+            Entry::Vacant(entry) => {
+                let resources = VerbsResources::open(config.clone()).with_context(|| {
+                    format!("open provider QP for native RDMA connection {connection_id}")
+                })?;
+                let endpoint = resources.endpoint.clone();
+                entry.insert(VerbsProviderConnection {
+                    resources,
+                    endpoint,
+                    connected_remote: None,
+                    leases: HashMap::new(),
+                })
+            }
+        };
+        Ok((connection_id, connection))
+    }
+
+    fn get_connection_mut(&mut self, connection_id: u64) -> Result<&mut VerbsProviderConnection> {
+        self.connections.get_mut(&connection_id).ok_or_else(|| {
+            anyhow!("unknown provider native RDMA connection_id {connection_id}; call local first")
+        })
+    }
+
+    fn allocate_or_use_connection_id(&mut self, requested: u64) -> Result<u64> {
+        if requested != 0 {
+            return Ok(requested);
+        }
+        let connection_id = self.next_connection_id;
+        if connection_id == 0 {
+            return Err(anyhow!("verbs provider connection id overflow"));
+        }
+        self.next_connection_id = connection_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("verbs provider connection id overflow"))?;
+        Ok(connection_id)
     }
 
     fn next_session_id(&mut self) -> Result<u64> {
@@ -475,7 +590,9 @@ impl VerbsProviderState {
 
 impl Drop for VerbsProviderState {
     fn drop(&mut self) {
-        self.leases.clear();
+        for connection in self.connections.values_mut() {
+            connection.leases.clear();
+        }
     }
 }
 

@@ -30,7 +30,13 @@ type VolumeRdmaEndpoint interface {
 	ConnectEndpoint(context.Context, VolumeRdmaRemoteInfo) error
 }
 
+type VolumeRdmaConnectionEndpoint interface {
+	LocalEndpointFor(context.Context, uint64) (VolumeRdmaEndpointInfo, uint64, error)
+	ConnectEndpointFor(context.Context, uint64, VolumeRdmaRemoteInfo) error
+}
+
 type VolumeRdmaEndpointInfo struct {
+	ConnectionID    uint64 `json:"connection_id,omitempty"`
 	ABIVersion      uint32 `json:"abi_version"`
 	Flags           uint32 `json:"flags"`
 	Device          string `json:"device"`
@@ -144,7 +150,20 @@ func (vs *VolumeServer) volumeRdmaLocalHandler(w http.ResponseWriter, r *http.Re
 		http.Error(w, "native RDMA endpoint is not configured", http.StatusNotImplemented)
 		return
 	}
-	local, err := vs.rdmaEndpoint.LocalEndpoint(r.Context())
+	connectionID, err := parseVolumeRdmaConnectionID(r)
+	if err != nil {
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	var local VolumeRdmaEndpointInfo
+	if endpoint, ok := vs.rdmaEndpoint.(VolumeRdmaConnectionEndpoint); ok {
+		local, connectionID, err = endpoint.LocalEndpointFor(r.Context(), connectionID)
+		if connectionID != 0 {
+			local.ConnectionID = connectionID
+		}
+	} else {
+		local, err = vs.rdmaEndpoint.LocalEndpoint(r.Context())
+	}
 	if err != nil {
 		writeJsonError(w, r, http.StatusServiceUnavailable, err)
 		return
@@ -180,11 +199,33 @@ func (vs *VolumeServer) volumeRdmaConnectHandler(w http.ResponseWriter, r *http.
 		writeJsonError(w, r, http.StatusBadRequest, err)
 		return
 	}
-	if err := vs.rdmaEndpoint.ConnectEndpoint(r.Context(), remote); err != nil {
+	connectionID, err := parseVolumeRdmaConnectionID(r)
+	if err != nil {
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	if endpoint, ok := vs.rdmaEndpoint.(VolumeRdmaConnectionEndpoint); ok {
+		err = endpoint.ConnectEndpointFor(r.Context(), connectionID, remote)
+	} else {
+		err = vs.rdmaEndpoint.ConnectEndpoint(r.Context(), remote)
+	}
+	if err != nil {
 		writeJsonError(w, r, http.StatusServiceUnavailable, err)
 		return
 	}
 	writeJsonQuiet(w, r, http.StatusOK, map[string]bool{"connected": true})
+}
+
+func parseVolumeRdmaConnectionID(r *http.Request) (uint64, error) {
+	raw := strings.TrimSpace(r.URL.Query().Get("connection_id"))
+	if raw == "" {
+		return 0, nil
+	}
+	connectionID, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("connection_id must be an unsigned integer")
+	}
+	return connectionID, nil
 }
 
 func parseVolumeRdmaServiceLevel(r *http.Request) (uint32, error) {

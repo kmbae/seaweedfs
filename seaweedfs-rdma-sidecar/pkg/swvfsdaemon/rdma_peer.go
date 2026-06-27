@@ -39,6 +39,7 @@ type RDMAPeerConnectorControl interface {
 }
 
 type RDMALocalEndpoint struct {
+	ConnectionID    uint64 `json:"connection_id,omitempty"`
 	ABIVersion      uint32 `json:"abi_version"`
 	Flags           uint32 `json:"flags"`
 	Device          string `json:"device"`

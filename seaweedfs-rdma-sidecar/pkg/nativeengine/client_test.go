@@ -44,13 +44,17 @@ func TestClientRequesterLocalConnectAndReadRemote(t *testing.T) {
 				resp := response{OK: true}
 				switch req.Op {
 				case "requester_local":
+					if req.ConnectionID != 0 {
+						t.Errorf("unexpected requester_local connection_id: %d", req.ConnectionID)
+					}
 					resp.Endpoint = &testEndpoint
+					resp.ConnectionID = 42
 				case "requester_connect":
-					if req.Remote == nil || req.Remote.QPN != 7 {
+					if req.ConnectionID != 42 || req.Remote == nil || req.Remote.QPN != 7 {
 						t.Errorf("unexpected remote: %+v", req.Remote)
 					}
 				case "read_remote":
-					if req.Desc == nil || req.Desc.RemoteAddr != 0xbeef || req.TimeoutMs != 25 {
+					if req.ConnectionID != 42 || req.Desc == nil || req.Desc.RemoteAddr != 0xbeef || req.TimeoutMs != 25 {
 						t.Errorf("unexpected read request: %+v", req)
 					}
 					resp.Data = []byte("needle")
@@ -71,14 +75,17 @@ func TestClientRequesterLocalConnectAndReadRemote(t *testing.T) {
 	}()
 
 	client := New(socketPath, time.Second)
-	local, err := client.RequesterLocal(t.Context())
+	local, connectionID, err := client.RequesterLocalFor(t.Context(), 0)
 	if err != nil {
 		t.Fatalf("RequesterLocal: %v", err)
 	}
 	if local.QPNum != testEndpoint.QPNum {
 		t.Fatalf("local = %+v", local)
 	}
-	if err := client.RequesterConnect(t.Context(), swvfsproto.RDMARemoteInfo{
+	if connectionID != 42 || local.ConnectionID != 42 {
+		t.Fatalf("connectionID = %d local=%+v", connectionID, local)
+	}
+	if err := client.RequesterConnectFor(t.Context(), connectionID, swvfsproto.RDMARemoteInfo{
 		ABIVersion: swvfsproto.RDMAABIVersion,
 		QPN:        7,
 		LID:        8,
@@ -87,7 +94,7 @@ func TestClientRequesterLocalConnectAndReadRemote(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("RequesterConnect: %v", err)
 	}
-	data, err := client.ReadRemote(t.Context(), swvfsproto.RDMADataDesc{
+	data, err := client.ReadRemoteFor(t.Context(), connectionID, swvfsproto.RDMADataDesc{
 		RemoteAddr: 0xbeef,
 		RKey:       0,
 		Length:     6,
