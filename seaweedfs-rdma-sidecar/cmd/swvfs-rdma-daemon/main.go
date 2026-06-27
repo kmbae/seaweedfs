@@ -283,14 +283,14 @@ func connectRDMAPeersOnce(ctx context.Context, control *swvfsdaemon.RDMAControl,
 	if err != nil {
 		return err
 	}
-	if err := control.Connect(remote); err != nil {
-		return err
-	}
 	for _, peer := range fetched {
 		if !peer.Endpoint.SamePeer(selected) {
 			continue
 		}
 		if err := swvfsdaemon.PostRDMAPeerConnect(attemptCtx, client, peer.URL, local, rdmaPeerSL); err != nil {
+			return err
+		}
+		if err := control.Connect(remote); err != nil {
 			return err
 		}
 		logger.WithFields(logrus.Fields{
