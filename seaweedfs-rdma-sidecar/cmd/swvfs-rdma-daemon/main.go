@@ -328,6 +328,15 @@ func connectRDMAPeersOnce(ctx context.Context, control *swvfsdaemon.RDMAControl,
 	if err != nil {
 		return err
 	}
+	if local.QPConnected && selected.QPConnected {
+		logger.WithFields(logrus.Fields{
+			"local_qpn": local.QPNum,
+			"local_lid": local.LID,
+			"peer_qpn":  selected.QPNum,
+			"peer_lid":  selected.LID,
+		}).Debug("kernel RDMA peer handshake already connected")
+		return nil
+	}
 	if !swvfsdaemon.ShouldInitiateRDMAPeerConnect(local, selected) {
 		if local.QPConnected {
 			logger.WithFields(logrus.Fields{
