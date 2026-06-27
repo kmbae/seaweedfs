@@ -59,7 +59,7 @@ func (s *KernelMRReadStager) StageReadRDMA(ctx context.Context, path string, off
 	s.Stats.Add("rdma_stager_file_read_bytes", uint64(len(data)))
 	if len(data) == 0 {
 		s.Stats.Inc("rdma_stager_empty_reads")
-		return &RDMAReadDescriptorLease{Attr: attr}, nil
+		return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma read descriptor has no payload"}
 	}
 	if len(data) > swvfsproto.RDMAIOMax {
 		return nil, ErrnoError{Errno: ErrnoTooLarge, Msg: "rdma read descriptor payload exceeds kernel RDMA IO max"}

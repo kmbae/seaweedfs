@@ -140,3 +140,31 @@ func TestKernelMRWriteStagerCommitsKernelMRData(t *testing.T) {
 		t.Fatalf("session lifecycle mismatch: read=%d free=%d", control.readSession, control.freeSession)
 	}
 }
+
+type fakeFlushFileBackend struct {
+	fakeFileBackend
+	flushedPath string
+}
+
+func (f *fakeFlushFileBackend) FlushFile(ctx context.Context, path string) (*swvfsproto.Attr, error) {
+	f.flushedPath = path
+	return &swvfsproto.Attr{Ino: 7, Size: uint64(len(f.writeData)), Mode: 0100644, Nlink: 1}, nil
+}
+
+func TestKernelMRWriteStagerFlushesRemoteBufferedWrite(t *testing.T) {
+	control := &fakeTestMRControl{readData: []byte("flush-me")}
+	writer := &fakeFlushFileBackend{}
+	stager := &KernelMRWriteStager{Control: control, Writer: writer}
+
+	desc, _, err := stager.PrepareWriteRDMA(context.Background(), "/file", 0, 8)
+	if err != nil {
+		t.Fatalf("PrepareWriteRDMA: %v", err)
+	}
+	attr, err := stager.CommitWriteRDMASession(context.Background(), desc.Reserved[0], "/file", 0, 8)
+	if err != nil {
+		t.Fatalf("CommitWriteRDMASession: %v", err)
+	}
+	if writer.flushedPath != "/file" || attr == nil || attr.Ino != 7 {
+		t.Fatalf("flush mismatch: path=%q attr=%+v", writer.flushedPath, attr)
+	}
+}

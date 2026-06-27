@@ -148,6 +148,19 @@ func (s *KernelMRWriteStager) CommitWriteRDMASession(ctx context.Context, sessio
 		s.Stats.Inc("rdma_write_stager_backend_errors")
 		return nil, err
 	}
+	if flusher, ok := s.Writer.(interface {
+		FlushFile(context.Context, string) (*swvfsproto.Attr, error)
+	}); ok {
+		flushedAttr, err := flusher.FlushFile(ctx, path)
+		if err != nil {
+			s.Stats.Inc("rdma_write_stager_flush_errors")
+			return nil, err
+		}
+		if flushedAttr != nil {
+			attr = flushedAttr
+		}
+		s.Stats.Inc("rdma_write_stager_flush_success")
+	}
 	s.Stats.Inc("rdma_write_stager_commit_success")
 	return attr, nil
 }
