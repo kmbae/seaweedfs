@@ -150,6 +150,10 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 	defer file.Close()
 	rdmaControl := swvfsdaemon.NewRDMAControl(file)
+	mrPool := swvfsdaemon.NewKernelMRPoolFromEnv(rdmaControl, stats)
+	if mrPool != nil {
+		defer mrPool.Close()
+	}
 	peerList := splitCSV(rdmaPeerEndpoints)
 	backend := &swvfsfiler.Backend{
 		Store:  store,
@@ -162,10 +166,24 @@ func run(cmd *cobra.Command, args []string) error {
 			Timeout: rdmaPeerTimeout,
 			Stats:   stats,
 		}
+		backend.WriteDescriptorBackend = &swvfsdaemon.RemoteRDMAWriteDescriptorClient{
+			Control: rdmaControl,
+			Peers:   peerList,
+			Timeout: rdmaPeerTimeout,
+			Stats:   stats,
+		}
 	}
 	readStager := &swvfsdaemon.KernelMRReadStager{
 		Control: rdmaControl,
 		Reader:  backend,
+		Pool:    mrPool,
+		Stats:   stats,
+	}
+	writeStager := &swvfsdaemon.KernelMRWriteStager{
+		Control: rdmaControl,
+		Local:   rdmaControl,
+		Writer:  backend,
+		Pool:    mrPool,
 		Stats:   stats,
 	}
 
@@ -187,7 +205,7 @@ func run(cmd *cobra.Command, args []string) error {
 	if rdmaControlListen != "" {
 		server := &http.Server{
 			Addr:    rdmaControlListen,
-			Handler: (&swvfsdaemon.RDMAPeerControlServer{Control: rdmaControl, ReadStager: readStager, Stats: stats}).Handler(),
+			Handler: (&swvfsdaemon.RDMAPeerControlServer{Control: rdmaControl, ReadStager: readStager, WriteStager: writeStager, Stats: stats}).Handler(),
 		}
 		go func() {
 			logger.WithField("addr", rdmaControlListen).Info("starting RDMA peer-control server")

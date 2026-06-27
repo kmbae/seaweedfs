@@ -26,6 +26,19 @@ type fakeReadStager struct {
 	releaseSession uint64
 }
 
+type fakeWriteStager struct {
+	path          string
+	offset        uint64
+	size          uint64
+	commitPath    string
+	commitOffset  uint64
+	commitSize    uint64
+	commitSession uint64
+	abortSession  uint64
+	desc          swvfsproto.RDMADataDesc
+	attr          *swvfsproto.Attr
+}
+
 func (f *fakeRDMAControl) GetLocal() (swvfsproto.RDMALocalInfo, error) {
 	return f.local, nil
 }
@@ -49,6 +62,30 @@ func (f *fakeReadStager) StageReadRDMA(ctx context.Context, path string, offset,
 
 func (f *fakeReadStager) ReleaseReadRDMA(ctx context.Context, sessionID uint64) error {
 	f.releaseSession = sessionID
+	return nil
+}
+
+func (f *fakeWriteStager) PrepareWriteRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
+	f.path = path
+	f.offset = offset
+	f.size = size
+	return &f.desc, f.attr, nil
+}
+
+func (f *fakeWriteStager) CommitWriteRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.Attr, error) {
+	return f.CommitWriteRDMASession(ctx, 0, path, offset, size)
+}
+
+func (f *fakeWriteStager) CommitWriteRDMASession(ctx context.Context, sessionID uint64, path string, offset, size uint64) (*swvfsproto.Attr, error) {
+	f.commitSession = sessionID
+	f.commitPath = path
+	f.commitOffset = offset
+	f.commitSize = size
+	return f.attr, nil
+}
+
+func (f *fakeWriteStager) AbortWriteRDMASession(ctx context.Context, sessionID uint64) error {
+	f.abortSession = sessionID
 	return nil
 }
 
@@ -134,6 +171,42 @@ func TestRDMAPeerControlServerReadDesc(t *testing.T) {
 	}
 }
 
+func TestRDMAPeerControlServerWritePrepareCommit(t *testing.T) {
+	stager := &fakeWriteStager{
+		desc: swvfsproto.RDMADataDesc{RemoteAddr: 0x2000, RKey: 7, Length: 4096, Reserved: [4]uint64{55}},
+		attr: &swvfsproto.Attr{Ino: 6, Size: 4096, Mode: 0100644, Nlink: 1},
+	}
+	server := httptest.NewServer((&RDMAPeerControlServer{
+		Control:     &fakeRDMAControl{local: readyInfo(7, 11, 13)},
+		WriteStager: stager,
+	}).Handler())
+	defer server.Close()
+
+	desc, attr, sessionID, err := PostRDMAPeerWritePrepare(context.Background(), server.Client(), server.URL, "/file", 16, 4096)
+	if err != nil {
+		t.Fatalf("PostRDMAPeerWritePrepare: %v", err)
+	}
+	if desc.RemoteAddr != 0x2000 || desc.RKey != 7 || desc.Length != 4096 || sessionID != 55 {
+		t.Fatalf("write prepare mismatch: desc=%+v session=%d", desc, sessionID)
+	}
+	if attr == nil || attr.Ino != 6 || stager.path != "/file" || stager.offset != 16 || stager.size != 4096 {
+		t.Fatalf("write prepare delegation mismatch: attr=%+v path=%q off=%d size=%d", attr, stager.path, stager.offset, stager.size)
+	}
+	commitAttr, err := PostRDMAPeerWriteCommit(context.Background(), server.Client(), server.URL, sessionID, "/file", 16, 4096)
+	if err != nil {
+		t.Fatalf("PostRDMAPeerWriteCommit: %v", err)
+	}
+	if commitAttr == nil || stager.commitSession != 55 || stager.commitPath != "/file" || stager.commitOffset != 16 || stager.commitSize != 4096 {
+		t.Fatalf("write commit delegation mismatch: attr=%+v session=%d path=%q off=%d size=%d", commitAttr, stager.commitSession, stager.commitPath, stager.commitOffset, stager.commitSize)
+	}
+	if err := PostRDMAPeerWriteAbort(context.Background(), server.Client(), server.URL, sessionID); err != nil {
+		t.Fatalf("PostRDMAPeerWriteAbort: %v", err)
+	}
+	if stager.abortSession != 55 {
+		t.Fatalf("abort session = %d, want 55", stager.abortSession)
+	}
+}
+
 func TestRemoteRDMAReadDescriptorClient(t *testing.T) {
 	local := readyInfo(1, 10, 100)
 	local.Flags |= swvfsproto.RDMAFQPConnected
@@ -182,6 +255,56 @@ func TestRemoteRDMAReadDescriptorClient(t *testing.T) {
 		default:
 			time.Sleep(time.Millisecond)
 		}
+	}
+}
+
+func TestRemoteRDMAWriteDescriptorClient(t *testing.T) {
+	local := readyInfo(1, 10, 100)
+	local.Flags |= swvfsproto.RDMAFQPConnected
+	remote := RDMALocalEndpointFromInfo(readyInfo(2, 20, 200))
+	stager := &fakeWriteStager{
+		desc: swvfsproto.RDMADataDesc{RemoteAddr: 0xbead, RKey: 88, Length: 512, Reserved: [4]uint64{44}},
+		attr: &swvfsproto.Attr{Ino: 8, Size: 512, Mode: 0100644, Nlink: 1},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case RDMAPeerLocalPath:
+			writeJSON(w, remote)
+		case RDMAPeerWritePrepare:
+			(&RDMAPeerControlServer{WriteStager: stager}).handleWritePrepare(w, r)
+		case RDMAPeerWriteCommit:
+			(&RDMAPeerControlServer{WriteStager: stager}).handleWriteCommit(w, r)
+		case RDMAPeerWriteAbort:
+			(&RDMAPeerControlServer{WriteStager: stager}).handleWriteAbort(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := &RemoteRDMAWriteDescriptorClient{
+		Control:    &fakeRDMAControl{local: local},
+		Peers:      []string{server.URL},
+		Client:     server.Client(),
+		Timeout:    time.Second,
+		AbortDelay: time.Hour,
+	}
+	desc, attr, err := client.PrepareWriteRDMA(context.Background(), "/file", 0, 512)
+	if err != nil {
+		t.Fatalf("PrepareWriteRDMA: %v", err)
+	}
+	if desc.RemoteAddr != 0xbead || desc.RKey != 88 || desc.Length != 512 || desc.Reserved[0] == 0 {
+		t.Fatalf("descriptor mismatch: %+v", desc)
+	}
+	if attr == nil || attr.Ino != 8 || stager.path != "/file" || stager.size != 512 {
+		t.Fatalf("remote write prepare delegation mismatch: attr=%+v path=%q size=%d", attr, stager.path, stager.size)
+	}
+	commitAttr, err := client.CommitWriteRDMA(context.Background(), "/file", 0, 512)
+	if err != nil {
+		t.Fatalf("CommitWriteRDMA: %v", err)
+	}
+	if commitAttr == nil || stager.commitSession != 44 || stager.commitPath != "/file" || stager.commitSize != 512 {
+		t.Fatalf("remote write commit delegation mismatch: attr=%+v session=%d path=%q size=%d", commitAttr, stager.commitSession, stager.commitPath, stager.commitSize)
 	}
 }
 

@@ -12,6 +12,9 @@ import (
 type fakeFileBackend struct {
 	readPreferRDMA  bool
 	writePreferRDMA bool
+	writePath       string
+	writeOffset     uint64
+	writeData       []byte
 	renamedOld      string
 	renamedNew      string
 	linkedOld       string
@@ -57,6 +60,9 @@ func (f *fakeFileBackend) ReadFile(ctx context.Context, path string, offset, siz
 
 func (f *fakeFileBackend) WriteFile(ctx context.Context, path string, offset uint64, data []byte, mode, uid, gid uint32, preferRDMA bool) (*swvfsproto.Attr, error) {
 	f.writePreferRDMA = preferRDMA
+	f.writePath = path
+	f.writeOffset = offset
+	f.writeData = append([]byte(nil), data...)
 	return &swvfsproto.Attr{Ino: 1, Size: uint64(len(data)), Mode: 0100644, Nlink: 1}, nil
 }
 

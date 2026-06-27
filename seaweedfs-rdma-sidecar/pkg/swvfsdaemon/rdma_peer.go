@@ -21,6 +21,9 @@ const (
 	RDMAPeerConnectPath     = "/rdma/connect"
 	RDMAPeerReadDescPath    = "/rdma/read-desc"
 	RDMAPeerReleaseDescPath = "/rdma/release-desc"
+	RDMAPeerWritePrepare    = "/rdma/write-prepare"
+	RDMAPeerWriteCommit     = "/rdma/write-commit"
+	RDMAPeerWriteAbort      = "/rdma/write-abort"
 )
 
 var ErrRDMAPeerUnpaired = errors.New("no deterministic RDMA pair selected")
@@ -127,9 +130,10 @@ func (e RDMALocalEndpoint) RemoteInfo(serviceLevel uint32) (swvfsproto.RDMARemot
 }
 
 type RDMAPeerControlServer struct {
-	Control    RDMAPeerConnectorControl
-	ReadStager RDMAReadDescriptorStager
-	Stats      *Stats
+	Control     RDMAPeerConnectorControl
+	ReadStager  RDMAReadDescriptorStager
+	WriteStager RDMAWriteDescriptorBackend
+	Stats       *Stats
 }
 
 func (s *RDMAPeerControlServer) Handler() http.Handler {
@@ -138,6 +142,9 @@ func (s *RDMAPeerControlServer) Handler() http.Handler {
 	mux.HandleFunc(RDMAPeerConnectPath, s.handleConnect)
 	mux.HandleFunc(RDMAPeerReadDescPath, s.handleReadDesc)
 	mux.HandleFunc(RDMAPeerReleaseDescPath, s.handleReleaseDesc)
+	mux.HandleFunc(RDMAPeerWritePrepare, s.handleWritePrepare)
+	mux.HandleFunc(RDMAPeerWriteCommit, s.handleWriteCommit)
+	mux.HandleFunc(RDMAPeerWriteAbort, s.handleWriteAbort)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -214,6 +221,29 @@ type RDMAPeerReleaseDescRequest struct {
 	SessionID uint64 `json:"session_id"`
 }
 
+type RDMAPeerWritePrepareRequest struct {
+	Path   string `json:"path"`
+	Offset uint64 `json:"offset"`
+	Size   uint64 `json:"size"`
+}
+
+type RDMAPeerWritePrepareResponse struct {
+	Desc      swvfsproto.RDMADataDesc `json:"desc"`
+	Attr      *swvfsproto.Attr        `json:"attr,omitempty"`
+	SessionID uint64                  `json:"session_id,omitempty"`
+}
+
+type RDMAPeerWriteCommitRequest struct {
+	SessionID uint64 `json:"session_id"`
+	Path      string `json:"path"`
+	Offset    uint64 `json:"offset"`
+	Size      uint64 `json:"size"`
+}
+
+type RDMAPeerWriteCommitResponse struct {
+	Attr *swvfsproto.Attr `json:"attr,omitempty"`
+}
+
 func (s *RDMAPeerControlServer) handleReadDesc(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -281,6 +311,122 @@ func (s *RDMAPeerControlServer) handleReleaseDesc(w http.ResponseWriter, r *http
 	}
 	s.Stats.Inc("peer_control_release_desc_success")
 	writeJSON(w, map[string]any{"released": true})
+}
+
+func (s *RDMAPeerControlServer) handleWritePrepare(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.Stats.Inc("peer_control_write_prepare_requests")
+	if s.WriteStager == nil {
+		s.Stats.Inc("peer_control_write_prepare_not_configured")
+		http.Error(w, "rdma write descriptor staging is not configured", http.StatusNotImplemented)
+		return
+	}
+	var req RDMAPeerWritePrepareRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.Stats.Inc("peer_control_write_prepare_bad_request")
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Path == "" || req.Size == 0 {
+		s.Stats.Inc("peer_control_write_prepare_bad_request")
+		http.Error(w, "path and size are required", http.StatusBadRequest)
+		return
+	}
+	desc, attr, err := s.WriteStager.PrepareWriteRDMA(r.Context(), req.Path, req.Offset, req.Size)
+	if err != nil {
+		s.Stats.Inc("peer_control_write_prepare_errors")
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	if desc == nil {
+		s.Stats.Inc("peer_control_write_prepare_errors")
+		http.Error(w, "rdma write descriptor stager returned no descriptor", http.StatusServiceUnavailable)
+		return
+	}
+	s.Stats.Inc("peer_control_write_prepare_success")
+	s.Stats.Add("peer_control_write_prepare_bytes", uint64(desc.Length))
+	writeJSON(w, RDMAPeerWritePrepareResponse{Desc: *desc, Attr: attr, SessionID: desc.Reserved[0]})
+}
+
+func (s *RDMAPeerControlServer) handleWriteCommit(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.Stats.Inc("peer_control_write_commit_requests")
+	if s.WriteStager == nil {
+		s.Stats.Inc("peer_control_write_commit_not_configured")
+		http.Error(w, "rdma write descriptor staging is not configured", http.StatusNotImplemented)
+		return
+	}
+	var req RDMAPeerWriteCommitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.Stats.Inc("peer_control_write_commit_bad_request")
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Path == "" || req.Size == 0 {
+		s.Stats.Inc("peer_control_write_commit_bad_request")
+		http.Error(w, "path and size are required", http.StatusBadRequest)
+		return
+	}
+	var (
+		attr *swvfsproto.Attr
+		err  error
+	)
+	if committer, ok := s.WriteStager.(interface {
+		CommitWriteRDMASession(context.Context, uint64, string, uint64, uint64) (*swvfsproto.Attr, error)
+	}); ok {
+		attr, err = committer.CommitWriteRDMASession(r.Context(), req.SessionID, req.Path, req.Offset, req.Size)
+	} else {
+		attr, err = s.WriteStager.CommitWriteRDMA(r.Context(), req.Path, req.Offset, req.Size)
+	}
+	if err != nil {
+		s.Stats.Inc("peer_control_write_commit_errors")
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	s.Stats.Inc("peer_control_write_commit_success")
+	s.Stats.Add("peer_control_write_commit_bytes", req.Size)
+	writeJSON(w, RDMAPeerWriteCommitResponse{Attr: attr})
+}
+
+func (s *RDMAPeerControlServer) handleWriteAbort(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.Stats.Inc("peer_control_write_abort_requests")
+	if s.WriteStager == nil {
+		s.Stats.Inc("peer_control_write_abort_not_configured")
+		http.Error(w, "rdma write descriptor staging is not configured", http.StatusNotImplemented)
+		return
+	}
+	var req RDMAPeerWriteCommitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.Stats.Inc("peer_control_write_abort_bad_request")
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.SessionID == 0 {
+		s.Stats.Inc("peer_control_write_abort_bad_request")
+		http.Error(w, "session_id is required", http.StatusBadRequest)
+		return
+	}
+	if aborter, ok := s.WriteStager.(interface {
+		AbortWriteRDMASession(context.Context, uint64) error
+	}); ok {
+		if err := aborter.AbortWriteRDMASession(r.Context(), req.SessionID); err != nil {
+			s.Stats.Inc("peer_control_write_abort_errors")
+			http.Error(w, err.Error(), http.StatusServiceUnavailable)
+			return
+		}
+	}
+	s.Stats.Inc("peer_control_write_abort_success")
+	writeJSON(w, map[string]any{"aborted": true})
 }
 
 func FetchRDMAPeerEndpoint(ctx context.Context, client *http.Client, rawURL string) (RDMALocalEndpoint, error) {
@@ -376,6 +522,98 @@ func PostRDMAPeerReleaseDesc(ctx context.Context, client *http.Client, rawURL st
 		return err
 	}
 	body, err := json.Marshal(RDMAPeerReleaseDescRequest{SessionID: sessionID})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient(client).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("POST %s returned %s", reqURL, resp.Status)
+	}
+	return nil
+}
+
+func PostRDMAPeerWritePrepare(ctx context.Context, client *http.Client, rawURL string, path string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, uint64, error) {
+	reqURL, err := normalizeRDMAPeerURL(rawURL, RDMAPeerWritePrepare)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	body, err := json.Marshal(RDMAPeerWritePrepareRequest{
+		Path:   path,
+		Offset: offset,
+		Size:   size,
+	})
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient(client).Do(req)
+	if err != nil {
+		return nil, nil, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, nil, 0, fmt.Errorf("POST %s returned %s", reqURL, resp.Status)
+	}
+	var out RDMAPeerWritePrepareResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, nil, 0, err
+	}
+	return &out.Desc, out.Attr, out.SessionID, nil
+}
+
+func PostRDMAPeerWriteCommit(ctx context.Context, client *http.Client, rawURL string, sessionID uint64, path string, offset, size uint64) (*swvfsproto.Attr, error) {
+	reqURL, err := normalizeRDMAPeerURL(rawURL, RDMAPeerWriteCommit)
+	if err != nil {
+		return nil, err
+	}
+	body, err := json.Marshal(RDMAPeerWriteCommitRequest{
+		SessionID: sessionID,
+		Path:      path,
+		Offset:    offset,
+		Size:      size,
+	})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient(client).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("POST %s returned %s", reqURL, resp.Status)
+	}
+	var out RDMAPeerWriteCommitResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out.Attr, nil
+}
+
+func PostRDMAPeerWriteAbort(ctx context.Context, client *http.Client, rawURL string, sessionID uint64) error {
+	reqURL, err := normalizeRDMAPeerURL(rawURL, RDMAPeerWriteAbort)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(RDMAPeerWriteCommitRequest{SessionID: sessionID})
 	if err != nil {
 		return err
 	}

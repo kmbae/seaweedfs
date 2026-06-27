@@ -13,6 +13,7 @@ import (
 type RDMATestMRControl interface {
 	TestMRAlloc(length uint32, pattern uint32) (swvfsproto.RDMATestMR, error)
 	TestMRInfo(sessionID uint64) (swvfsproto.RDMATestMR, error)
+	TestMRRead(sessionID uint64, length uint32) ([]byte, swvfsproto.RDMATestMR, error)
 	TestMRWrite(sessionID uint64, data []byte) (swvfsproto.RDMATestMR, error)
 	TestMRFree(sessionID uint64) error
 }
@@ -31,6 +32,7 @@ type RDMAReadDescriptorStager interface {
 type KernelMRReadStager struct {
 	Control RDMATestMRControl
 	Reader  FileBackend
+	Pool    *KernelMRPool
 	Stats   *Stats
 }
 
@@ -62,28 +64,28 @@ func (s *KernelMRReadStager) StageReadRDMA(ctx context.Context, path string, off
 	if len(data) > swvfsproto.RDMAIOMax {
 		return nil, ErrnoError{Errno: ErrnoTooLarge, Msg: "rdma read descriptor payload exceeds kernel RDMA IO max"}
 	}
-	alloc, err := s.Control.TestMRAlloc(uint32(len(data)), 0)
+	session, err := s.acquireMR(uint32(len(data)))
 	if err != nil {
 		s.Stats.Inc("rdma_stager_mr_alloc_errors")
 		return nil, err
 	}
-	sessionID := alloc.SessionID
+	sessionID := session.SessionID
 	if sessionID == 0 {
 		return nil, fmt.Errorf("kernel RDMA test MR allocation returned no session id")
 	}
 	if _, err := s.Control.TestMRWrite(sessionID, data); err != nil {
-		_ = s.Control.TestMRFree(sessionID)
+		s.discardMR(sessionID)
 		s.Stats.Inc("rdma_stager_mr_write_errors")
 		return nil, err
 	}
 	mr, err := s.Control.TestMRInfo(sessionID)
 	if err != nil {
-		_ = s.Control.TestMRFree(sessionID)
+		s.discardMR(sessionID)
 		s.Stats.Inc("rdma_stager_mr_info_errors")
 		return nil, err
 	}
 	if !mr.Allocated() || !mr.Registered() || mr.RemoteAddr == 0 || mr.RKey == 0 {
-		_ = s.Control.TestMRFree(sessionID)
+		s.discardMR(sessionID)
 		s.Stats.Inc("rdma_stager_mr_not_exportable")
 		return nil, fmt.Errorf("kernel RDMA test MR is not exportable: flags=0x%x addr=%#x rkey=%#x", mr.Flags, mr.RemoteAddr, mr.RKey)
 	}
@@ -101,6 +103,30 @@ func (s *KernelMRReadStager) StageReadRDMA(ctx context.Context, path string, off
 	}, nil
 }
 
+func (s *KernelMRReadStager) acquireMR(length uint32) (KernelMRPoolSession, error) {
+	if s != nil && s.Pool != nil {
+		return s.Pool.Acquire(length)
+	}
+	alloc, err := s.Control.TestMRAlloc(length, 0)
+	if err != nil {
+		return KernelMRPoolSession{}, err
+	}
+	return KernelMRPoolSession{SessionID: alloc.SessionID, Capacity: alloc.Length}, nil
+}
+
+func (s *KernelMRReadStager) discardMR(sessionID uint64) {
+	if sessionID == 0 || s == nil {
+		return
+	}
+	if s.Pool != nil {
+		_ = s.Pool.Discard(sessionID)
+		return
+	}
+	if s.Control != nil {
+		_ = s.Control.TestMRFree(sessionID)
+	}
+}
+
 func (s *KernelMRReadStager) ReleaseReadRDMA(ctx context.Context, sessionID uint64) error {
 	_ = ctx
 	if sessionID == 0 {
@@ -110,6 +136,15 @@ func (s *KernelMRReadStager) ReleaseReadRDMA(ctx context.Context, sessionID uint
 		return ErrnoError{Errno: ErrnoNoSys, Msg: "rdma read descriptor stager is not configured"}
 	}
 	s.Stats.Inc("rdma_stager_release_requests")
+	if s.Pool != nil {
+		err := s.Pool.Release(sessionID)
+		if err != nil {
+			s.Stats.Inc("rdma_stager_release_errors")
+			return err
+		}
+		s.Stats.Inc("rdma_stager_release_success")
+		return nil
+	}
 	err := s.Control.TestMRFree(sessionID)
 	if err != nil {
 		s.Stats.Inc("rdma_stager_release_errors")

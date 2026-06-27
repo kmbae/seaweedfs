@@ -9,21 +9,25 @@ import (
 
 type fakeTestMRControl struct {
 	allocLength  uint32
+	allocCount   int
 	writeSession uint64
+	readSession  uint64
 	freeSession  uint64
 	written      []byte
+	readData     []byte
 	info         swvfsproto.RDMATestMR
 }
 
 func (f *fakeTestMRControl) TestMRAlloc(length uint32, pattern uint32) (swvfsproto.RDMATestMR, error) {
 	f.allocLength = length
+	f.allocCount++
 	f.info = swvfsproto.RDMATestMR{
 		ABIVersion: swvfsproto.RDMAABIVersion,
 		Flags:      swvfsproto.RDMATestFAllocated | swvfsproto.RDMATestFRegisteredMR,
 		RemoteAddr: 0xfeed,
 		RKey:       77,
 		Length:     length,
-		SessionID:  42,
+		SessionID:  uint64(41 + f.allocCount),
 	}
 	return f.info, nil
 }
@@ -38,6 +42,19 @@ func (f *fakeTestMRControl) TestMRWrite(sessionID uint64, data []byte) (swvfspro
 	f.written = append([]byte(nil), data...)
 	f.info.UserLength = uint32(len(data))
 	return f.info, nil
+}
+
+func (f *fakeTestMRControl) TestMRRead(sessionID uint64, length uint32) ([]byte, swvfsproto.RDMATestMR, error) {
+	f.readSession = sessionID
+	data := f.readData
+	if data == nil {
+		data = f.written
+	}
+	if uint32(len(data)) > length {
+		data = data[:length]
+	}
+	f.info.UserLength = uint32(len(data))
+	return append([]byte(nil), data...), f.info, nil
 }
 
 func (f *fakeTestMRControl) TestMRFree(sessionID uint64) error {
@@ -72,5 +89,54 @@ func TestKernelMRReadStagerStagesDataIntoKernelMR(t *testing.T) {
 	}
 	if control.freeSession != 42 {
 		t.Fatalf("free session = %d, want 42", control.freeSession)
+	}
+}
+
+func TestKernelMRReadStagerReusesPoolSessions(t *testing.T) {
+	control := &fakeTestMRControl{}
+	reader := &fakeFileBackend{}
+	pool := NewKernelMRPool(control, nil, KernelMRPoolConfig{MaxIdle: 2, MaxBytes: 2 << 20, MinBytes: 1024})
+	stager := &KernelMRReadStager{Control: control, Reader: reader, Pool: pool}
+
+	first, err := stager.StageReadRDMA(context.Background(), "/file", 0, 4)
+	if err != nil {
+		t.Fatalf("first StageReadRDMA: %v", err)
+	}
+	if err := stager.ReleaseReadRDMA(context.Background(), first.SessionID); err != nil {
+		t.Fatalf("first ReleaseReadRDMA: %v", err)
+	}
+	second, err := stager.StageReadRDMA(context.Background(), "/file", 0, 4)
+	if err != nil {
+		t.Fatalf("second StageReadRDMA: %v", err)
+	}
+	if second.SessionID != first.SessionID {
+		t.Fatalf("expected pooled session reuse, first=%d second=%d", first.SessionID, second.SessionID)
+	}
+	if control.allocCount != 1 {
+		t.Fatalf("alloc count = %d, want 1", control.allocCount)
+	}
+}
+
+func TestKernelMRWriteStagerCommitsKernelMRData(t *testing.T) {
+	control := &fakeTestMRControl{readData: []byte("wxyz")}
+	writer := &fakeFileBackend{}
+	stager := &KernelMRWriteStager{Control: control, Writer: writer}
+
+	desc, _, err := stager.PrepareWriteRDMA(context.Background(), "/file", 8, 4)
+	if err != nil {
+		t.Fatalf("PrepareWriteRDMA: %v", err)
+	}
+	if desc.RemoteAddr != 0xfeed || desc.RKey != 77 || desc.Length != 4 || desc.Reserved[0] != 42 {
+		t.Fatalf("descriptor mismatch: %+v", desc)
+	}
+	attr, err := stager.CommitWriteRDMASession(context.Background(), desc.Reserved[0], "/file", 8, 4)
+	if err != nil {
+		t.Fatalf("CommitWriteRDMASession: %v", err)
+	}
+	if attr == nil || writer.writePath != "/file" || writer.writeOffset != 8 || string(writer.writeData) != "wxyz" || !writer.writePreferRDMA {
+		t.Fatalf("write backend mismatch: attr=%+v path=%q off=%d data=%q prefer=%v", attr, writer.writePath, writer.writeOffset, writer.writeData, writer.writePreferRDMA)
+	}
+	if control.readSession != 42 || control.freeSession != 42 {
+		t.Fatalf("session lifecycle mismatch: read=%d free=%d", control.readSession, control.freeSession)
 	}
 }

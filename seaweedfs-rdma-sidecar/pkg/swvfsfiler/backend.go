@@ -36,9 +36,10 @@ type MetadataStore interface {
 }
 
 type Backend struct {
-	Store                 MetadataStore
-	Router                *swvfsdaemon.Router
-	ReadDescriptorBackend swvfsdaemon.RDMAReadDescriptorBackend
+	Store                  MetadataStore
+	Router                 *swvfsdaemon.Router
+	ReadDescriptorBackend  swvfsdaemon.RDMAReadDescriptorBackend
+	WriteDescriptorBackend swvfsdaemon.RDMAWriteDescriptorBackend
 
 	mu      sync.Mutex
 	pending map[string]*pendingWrite
@@ -741,6 +742,20 @@ func (b *Backend) ReleaseReadDescriptor(ctx context.Context, leaseID uint64, sta
 		return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma read descriptor release backend is not configured"}
 	}
 	return releaser.ReleaseReadDescriptor(ctx, leaseID, status, bytes)
+}
+
+func (b *Backend) PrepareWriteRDMA(ctx context.Context, fullPath string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
+	if b == nil || b.WriteDescriptorBackend == nil {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma write descriptor backend is not configured"}
+	}
+	return b.WriteDescriptorBackend.PrepareWriteRDMA(ctx, cleanFullPath(fullPath), offset, size)
+}
+
+func (b *Backend) CommitWriteRDMA(ctx context.Context, fullPath string, offset, size uint64) (*swvfsproto.Attr, error) {
+	if b == nil || b.WriteDescriptorBackend == nil {
+		return nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma write descriptor backend is not configured"}
+	}
+	return b.WriteDescriptorBackend.CommitWriteRDMA(ctx, cleanFullPath(fullPath), offset, size)
 }
 
 func (b *Backend) WriteFile(ctx context.Context, fullPath string, offset uint64, data []byte, mode, uid, gid uint32, preferRDMA bool) (*swvfsproto.Attr, error) {
