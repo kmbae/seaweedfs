@@ -73,6 +73,8 @@ service VolumeServer {
 
     rpc ReadNeedleBlob (ReadNeedleBlobRequest) returns (ReadNeedleBlobResponse) {
     }
+    rpc ReadNeedleRange (ReadNeedleRangeRequest) returns (ReadNeedleRangeResponse) {
+    }
     rpc ReadNeedleMeta (ReadNeedleMetaRequest) returns (ReadNeedleMetaResponse) {
     }
     rpc WriteNeedleBlob (WriteNeedleBlobRequest) returns (WriteNeedleBlobResponse) {
@@ -357,6 +359,17 @@ message ReadNeedleBlobRequest {
 }
 message ReadNeedleBlobResponse {
     bytes needle_blob = 1;
+}
+
+message ReadNeedleRangeRequest {
+    uint32 volume_id = 1;
+    uint64 needle_id = 2;
+    uint32 cookie = 3;
+    uint64 offset = 4;
+    uint64 size = 5;
+}
+message ReadNeedleRangeResponse {
+    bytes data = 1;
 }
 
 message ReadNeedleMetaRequest {

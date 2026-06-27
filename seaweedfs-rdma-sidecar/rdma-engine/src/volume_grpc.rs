@@ -1,7 +1,7 @@
 use crate::{
     local_volume::LocalVolumeReader,
     needle_blob::encode_payload_blob,
-    network::{format_seaweed_file_id, RemoteNeedleWriteRequest},
+    network::{format_seaweed_file_id, RemoteNeedleReadRequest, RemoteNeedleWriteRequest},
     RdmaError, RdmaResult,
 };
 use std::time::Duration;
@@ -11,7 +11,34 @@ pub mod volume_server_pb {
     tonic::include_proto!("volume_server_pb");
 }
 
-use volume_server_pb::{volume_server_client::VolumeServerClient, WriteNeedleBlobRequest};
+use volume_server_pb::{
+    volume_server_client::VolumeServerClient, ReadNeedleRangeRequest, WriteNeedleBlobRequest,
+};
+
+pub async fn read_needle_range(
+    volume_server_url: &str,
+    req: &RemoteNeedleReadRequest,
+) -> RdmaResult<Vec<u8>> {
+    let endpoint = grpc_endpoint(volume_server_url)?;
+    let channel = connect(endpoint).await?;
+    let mut client = VolumeServerClient::new(channel);
+    let mut data = client
+        .read_needle_range(tonic::Request::new(ReadNeedleRangeRequest {
+            volume_id: req.volume_id,
+            needle_id: req.needle_id,
+            cookie: req.cookie,
+            offset: req.offset,
+            size: req.size,
+        }))
+        .await
+        .map_err(|e| RdmaError::ipc_error(format!("volume ReadNeedleRange gRPC: {}", e)))?
+        .into_inner()
+        .data;
+    if req.size > 0 && data.len() > req.size as usize {
+        data.truncate(req.size as usize);
+    }
+    Ok(data)
+}
 
 pub async fn write_needle_blob(
     volume_server_url: &str,

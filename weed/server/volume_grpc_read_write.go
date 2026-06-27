@@ -32,6 +32,39 @@ func (vs *VolumeServer) ReadNeedleBlob(ctx context.Context, req *volume_server_p
 	return resp, nil
 }
 
+func (vs *VolumeServer) ReadNeedleRange(ctx context.Context, req *volume_server_pb.ReadNeedleRangeRequest) (resp *volume_server_pb.ReadNeedleRangeResponse, err error) {
+	if err := func() error {
+		const maxInt64AsUint = uint64(1<<63 - 1)
+
+		resp = &volume_server_pb.ReadNeedleRangeResponse{}
+		if req.Offset > maxInt64AsUint || req.Size > maxInt64AsUint {
+			return fmt.Errorf("read needle range too large offset %d size %d", req.Offset, req.Size)
+		}
+
+		v := vs.store.GetVolume(needle.VolumeId(req.VolumeId))
+		if v == nil {
+			return fmt.Errorf("not found volume id %d", req.VolumeId)
+		}
+
+		resp.Data, err = v.ReadNeedleRange(
+			types.NeedleId(req.NeedleId),
+			types.Cookie(req.Cookie),
+			int64(req.Offset),
+			int64(req.Size),
+		)
+		if err != nil {
+			return fmt.Errorf("read needle range volume %d needle %d offset %d size %d: %v", req.VolumeId, req.NeedleId, req.Offset, req.Size, err)
+		}
+
+		return nil
+	}(); err != nil {
+		stats.VolumeServerFileReadFailures.Inc()
+		return nil, err
+	}
+
+	return resp, nil
+}
+
 func (vs *VolumeServer) ReadNeedleMeta(ctx context.Context, req *volume_server_pb.ReadNeedleMetaRequest) (resp *volume_server_pb.ReadNeedleMetaResponse, err error) {
 	resp = &volume_server_pb.ReadNeedleMetaResponse{}
 	volumeId := needle.VolumeId(req.VolumeId)

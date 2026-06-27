@@ -104,6 +104,15 @@ fn default_transport() -> String {
     "tcp".to_string()
 }
 
+fn volume_grpc_read_enabled() -> bool {
+    std::env::var("SEAWEEDFS_RDMA_VOLUME_GRPC_READ")
+        .map(|value| {
+            let value = value.trim().to_ascii_lowercase();
+            !matches!(value.as_str(), "0" | "false" | "no" | "off")
+        })
+        .unwrap_or(true)
+}
+
 fn peer_cache_key(prefix: &str, volume_id: u32, needle_id: u64, worker_address: &[u8]) -> String {
     let mut hasher = DefaultHasher::new();
     worker_address.hash(&mut hasher);
@@ -494,6 +503,20 @@ async fn fetch_needle_data(
     local_reader: Option<&LocalVolumeReader>,
     req: &RemoteNeedleReadRequest,
 ) -> RdmaResult<(Vec<u8>, String)> {
+    if volume_grpc_read_enabled() {
+        match volume_grpc::read_needle_range(volume_server_url, req).await {
+            Ok(data) => return Ok((data, "volume-grpc-range".to_string())),
+            Err(e) => {
+                warn!(
+                    volume_id = req.volume_id,
+                    needle_id = req.needle_id,
+                    error = %e,
+                    "volume ReadNeedleRange gRPC failed, falling back to local volume read"
+                );
+            }
+        }
+    }
+
     if let Some(reader) = local_reader {
         match reader.read_needle(
             req.volume_id,

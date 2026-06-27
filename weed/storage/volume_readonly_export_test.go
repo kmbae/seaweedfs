@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
@@ -44,5 +45,18 @@ func TestOpenReadonlyVolumeForcesReadOnlyDataAndIndex(t *testing.T) {
 	}
 	if !bytes.Equal(data, payload) {
 		t.Fatalf("read payload mismatch: got %d bytes, want %d", len(data), len(payload))
+	}
+
+	tail, err := readonly.ReadNeedleRange(n.Id, n.Cookie, 3, 0)
+	if err != nil {
+		t.Fatalf("read full tail range: %v", err)
+	}
+	if !bytes.Equal(tail, payload[3:]) {
+		t.Fatalf("tail payload mismatch: got %q, want %q", tail, payload[3:])
+	}
+
+	_, err = readonly.ReadNeedleRange(n.Id, n.Cookie+1, 0, int64(len(payload)))
+	if err == nil || !strings.Contains(err.Error(), "cookie mismatch") {
+		t.Fatalf("expected cookie mismatch, got %v", err)
 	}
 }
