@@ -15,13 +15,15 @@ use volume_server_pb::{
     volume_server_client::VolumeServerClient, ReadNeedleRangeRequest, WriteNeedleBlobRequest,
 };
 
+const DEFAULT_VOLUME_GRPC_MAX_MESSAGE_BYTES: usize = 128 * 1024 * 1024;
+
 pub async fn read_needle_range(
     volume_server_url: &str,
     req: &RemoteNeedleReadRequest,
 ) -> RdmaResult<Vec<u8>> {
     let endpoint = grpc_endpoint(volume_server_url)?;
     let channel = connect(endpoint).await?;
-    let mut client = VolumeServerClient::new(channel);
+    let mut client = volume_client(channel);
     let mut data = client
         .read_needle_range(tonic::Request::new(ReadNeedleRangeRequest {
             volume_id: req.volume_id,
@@ -53,7 +55,7 @@ pub async fn write_needle_blob(
     let encoded = encode_payload_blob(req.needle_id, req.cookie, &data, version)?;
     let endpoint = grpc_endpoint(volume_server_url)?;
     let channel = connect(endpoint).await?;
-    let mut client = VolumeServerClient::new(channel);
+    let mut client = volume_client(channel);
     client
         .write_needle_blob(tonic::Request::new(WriteNeedleBlobRequest {
             volume_id: req.volume_id,
@@ -64,7 +66,11 @@ pub async fn write_needle_blob(
         .await
         .map_err(|e| RdmaError::ipc_error(format!("volume WriteNeedleBlob gRPC: {}", e)))?;
 
-    Ok(format_seaweed_file_id(req.volume_id, req.needle_id, req.cookie))
+    Ok(format_seaweed_file_id(
+        req.volume_id,
+        req.needle_id,
+        req.cookie,
+    ))
 }
 
 async fn connect(endpoint: String) -> RdmaResult<Channel> {
@@ -75,6 +81,21 @@ async fn connect(endpoint: String) -> RdmaResult<Channel> {
         .connect()
         .await
         .map_err(|e| RdmaError::ipc_error(format!("connect volume gRPC: {}", e)))
+}
+
+fn volume_client(channel: Channel) -> VolumeServerClient<Channel> {
+    let max_message_bytes = volume_grpc_max_message_bytes();
+    VolumeServerClient::new(channel)
+        .max_decoding_message_size(max_message_bytes)
+        .max_encoding_message_size(max_message_bytes)
+}
+
+fn volume_grpc_max_message_bytes() -> usize {
+    std::env::var("SEAWEEDFS_RDMA_VOLUME_GRPC_MAX_MESSAGE_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_VOLUME_GRPC_MAX_MESSAGE_BYTES)
 }
 
 fn grpc_endpoint(volume_server_url: &str) -> RdmaResult<String> {
