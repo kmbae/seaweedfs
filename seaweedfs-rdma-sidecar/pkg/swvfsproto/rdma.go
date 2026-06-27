@@ -10,7 +10,7 @@ import (
 const (
 	RDMAABIVersion     uint32 = 1
 	RDMADeviceNameMax         = 64
-	RDMAIOMax                 = 4 << 20
+	RDMAIOMax                 = 16 << 20
 	RDMALinkUnknown    uint32 = 0
 	RDMALinkInfiniBand uint32 = 1
 	RDMALinkEthernet   uint32 = 2
