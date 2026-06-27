@@ -4,8 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -33,6 +35,11 @@ var (
 	writeRDMAMinSize  uint64
 	forceRDMA         bool
 	fallbackOnError   bool
+	rdmaControlListen string
+	rdmaPeerEndpoints string
+	rdmaPeerSL        uint32
+	rdmaPeerInterval  time.Duration
+	rdmaPeerTimeout   time.Duration
 	maxConnections    int
 	timeout           time.Duration
 	collection        string
@@ -62,6 +69,11 @@ carries RDMA preference hints.`,
 	root.Flags().Uint64Var(&writeRDMAMinSize, "rdma-write-min-size", defaultRDMAMinSize, "minimum WRITE size in bytes before RDMA is considered; set 0 to allow all hinted writes")
 	root.Flags().BoolVar(&forceRDMA, "force-rdma", false, "prefer RDMA for READ and WRITE even when the kernel request has no RDMA hint")
 	root.Flags().BoolVar(&fallbackOnError, "fallback-on-error", true, "fall back to TCP/HTTP when RDMA is unavailable")
+	root.Flags().StringVar(&rdmaControlListen, "rdma-control-listen", "", "listen address for kernel RDMA peer-control HTTP API; empty disables it")
+	root.Flags().StringVar(&rdmaPeerEndpoints, "rdma-peer-endpoints", "", "comma-separated peer-control URLs used for automatic kernel RDMA QP handshake")
+	root.Flags().Uint32Var(&rdmaPeerSL, "rdma-peer-service-level", 0, "InfiniBand service level for automatic peer connections")
+	root.Flags().DurationVar(&rdmaPeerInterval, "rdma-peer-connect-interval", 5*time.Second, "retry interval for automatic kernel RDMA peer connection")
+	root.Flags().DurationVar(&rdmaPeerTimeout, "rdma-peer-connect-timeout", 5*time.Second, "per-attempt timeout for automatic kernel RDMA peer connection")
 	root.Flags().IntVar(&maxConnections, "max-connections", 8, "maximum RDMA engine IPC connections")
 	root.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "SeaweedFS/RDMA operation timeout")
 	root.Flags().StringVar(&collection, "collection", "", "SeaweedFS collection for new writes")
@@ -131,6 +143,7 @@ func run(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("open %s: %w", devPath, err)
 	}
 	defer file.Close()
+	rdmaControl := swvfsdaemon.NewRDMAControl(file)
 
 	logger.WithFields(logrus.Fields{
 		"dev":               devPath,
@@ -142,7 +155,32 @@ func run(cmd *cobra.Command, args []string) error {
 		"rdma_write_min":    writeRDMAMinSize,
 		"force_rdma":        forceRDMA,
 		"fallback_on_error": fallbackOnError,
+		"rdma_control":      rdmaControlListen,
+		"rdma_peers":        rdmaPeerEndpoints,
 	}).Info("starting swvfs RDMA daemon")
+
+	if rdmaControlListen != "" {
+		server := &http.Server{
+			Addr:    rdmaControlListen,
+			Handler: (&swvfsdaemon.RDMAPeerControlServer{Control: rdmaControl}).Handler(),
+		}
+		go func() {
+			logger.WithField("addr", rdmaControlListen).Info("starting RDMA peer-control server")
+			if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.WithError(err).Warn("RDMA peer-control server stopped")
+			}
+		}()
+		defer func() {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			_ = server.Shutdown(shutdownCtx)
+		}()
+	}
+
+	peerList := splitCSV(rdmaPeerEndpoints)
+	if len(peerList) > 0 {
+		go runRDMAPeerConnector(ctx, rdmaControl, peerList, logger)
+	}
 
 	handler := &swvfsdaemon.Handler{
 		ForceReadRDMA:  forceRDMA,
@@ -158,6 +196,110 @@ func run(cmd *cobra.Command, args []string) error {
 		return nil
 	}
 	return err
+}
+
+func splitCSV(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if part != "" {
+			out = append(out, part)
+		}
+	}
+	return out
+}
+
+func runRDMAPeerConnector(ctx context.Context, control *swvfsdaemon.RDMAControl, peers []string, logger *logrus.Logger) {
+	if rdmaPeerInterval <= 0 {
+		rdmaPeerInterval = 5 * time.Second
+	}
+	for {
+		err := connectRDMAPeersOnce(ctx, control, peers, logger)
+		if err == nil {
+			return
+		}
+		logger.WithError(err).Warn("RDMA peer handshake not ready; retrying")
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(rdmaPeerInterval):
+		}
+	}
+}
+
+func connectRDMAPeersOnce(ctx context.Context, control *swvfsdaemon.RDMAControl, peers []string, logger *logrus.Logger) error {
+	timeout := rdmaPeerTimeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	localInfo, err := control.GetLocal()
+	if err != nil {
+		return err
+	}
+	local := swvfsdaemon.RDMALocalEndpointFromInfo(localInfo)
+	if !local.ReadyForConnect() {
+		return fmt.Errorf("local RDMA endpoint is not ready: qpn=%d lid=%d flags=0x%x", local.QPNum, local.LID, local.Flags)
+	}
+
+	client := &http.Client{Timeout: timeout}
+	urls := swvfsdaemon.ExpandRDMAPeerURLs(attemptCtx, peers)
+	type fetchedPeer struct {
+		URL      string
+		Endpoint swvfsdaemon.RDMALocalEndpoint
+	}
+	fetched := make([]fetchedPeer, 0, len(urls))
+	for _, peerURL := range urls {
+		endpoint, err := swvfsdaemon.FetchRDMAPeerEndpoint(attemptCtx, client, peerURL)
+		if err != nil {
+			logger.WithError(err).WithField("peer", peerURL).Debug("RDMA peer endpoint fetch failed")
+			continue
+		}
+		if endpoint.SamePeer(local) {
+			continue
+		}
+		fetched = append(fetched, fetchedPeer{URL: peerURL, Endpoint: endpoint})
+	}
+	if len(fetched) == 0 {
+		return fmt.Errorf("no RDMA peer endpoints were reachable")
+	}
+
+	endpoints := make([]swvfsdaemon.RDMALocalEndpoint, 0, len(fetched))
+	for _, peer := range fetched {
+		endpoints = append(endpoints, peer.Endpoint)
+	}
+	selected, ok := swvfsdaemon.SelectRDMAPairedPeer(local, endpoints)
+	if !ok {
+		return fmt.Errorf("no deterministic RDMA pair selected for local qpn=%d lid=%d", local.QPNum, local.LID)
+	}
+	remote, err := selected.RemoteInfo(rdmaPeerSL)
+	if err != nil {
+		return err
+	}
+	if err := control.Connect(remote); err != nil {
+		return err
+	}
+	for _, peer := range fetched {
+		if !peer.Endpoint.SamePeer(selected) {
+			continue
+		}
+		if err := swvfsdaemon.PostRDMAPeerConnect(attemptCtx, client, peer.URL, local, rdmaPeerSL); err != nil {
+			return err
+		}
+		logger.WithFields(logrus.Fields{
+			"local_qpn":  local.QPNum,
+			"local_lid":  local.LID,
+			"peer_qpn":   selected.QPNum,
+			"peer_lid":   selected.LID,
+			"peer_url":   peer.URL,
+			"service_lv": rdmaPeerSL,
+		}).Info("kernel RDMA peer handshake completed")
+		return nil
+	}
+	return fmt.Errorf("selected RDMA peer disappeared before connect post")
 }
 
 func newSeaweedClient(logger *logrus.Logger, enabled bool) (*seaweedfs.SeaweedFSRDMAClient, error) {
