@@ -207,10 +207,12 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	handler := &swvfsdaemon.Handler{
-		ForceReadRDMA:  forceRDMA,
-		ForceWriteRDMA: forceRDMA,
-		Backend:        backend,
-		Stats:          stats,
+		ForceReadRDMA:    forceRDMA,
+		ForceWriteRDMA:   forceRDMA,
+		ReadRDMAMinSize:  readRDMAMinSize,
+		WriteRDMAMinSize: writeRDMAMinSize,
+		Backend:          backend,
+		Stats:            stats,
 	}
 	device := &swvfsdaemon.LegacyDevice{
 		RW:         file,

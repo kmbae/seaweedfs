@@ -72,10 +72,12 @@ type MetadataBackend interface {
 }
 
 type Handler struct {
-	Backend        FileBackend
-	ForceReadRDMA  bool
-	ForceWriteRDMA bool
-	Stats          *Stats
+	Backend          FileBackend
+	ForceReadRDMA    bool
+	ForceWriteRDMA   bool
+	ReadRDMAMinSize  uint64
+	WriteRDMAMinSize uint64
+	Stats            *Stats
 }
 
 func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfsproto.Reply, error) {
@@ -179,7 +181,9 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 		h.Stats.Add("handler_read_requested_bytes", req.Header.Size)
 		if preferRDMA {
 			h.Stats.Inc("handler_read_prefer_rdma")
-			if rdmaBackend, ok := h.Backend.(RDMAReadDescriptorBackend); ok {
+			if !h.shouldUseRDMAReadDescriptor(req.Header.Size) {
+				h.Stats.Inc("handler_read_rdma_desc_policy_too_small")
+			} else if rdmaBackend, ok := h.Backend.(RDMAReadDescriptorBackend); ok {
 				desc, attr, err := rdmaBackend.ReadFileRDMA(ctx, req.Path1, req.Header.Offset, req.Header.Size)
 				if err == nil && desc != nil {
 					h.Stats.Inc("handler_read_rdma_desc_replies")
@@ -239,6 +243,10 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 		}
 		h.Stats.Inc("handler_write_rdma_prepare_requests")
 		h.Stats.Add("handler_write_rdma_prepare_bytes", req.Header.Size)
+		if !h.shouldUseRDMAWriteDescriptor(req.Header.Size) {
+			h.Stats.Inc("handler_write_rdma_prepare_policy_too_small")
+			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma write prepare below minimum size"}
+		}
 		desc, attr, err := backend.PrepareWriteRDMA(ctx, req.Path1, req.Header.Offset, req.Header.Size)
 		if err != nil {
 			h.Stats.Inc("handler_write_rdma_prepare_errors")
@@ -439,6 +447,14 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 	default:
 		return nil, ErrnoError{Errno: ErrnoNoSys, Msg: fmt.Sprintf("swvfs op %d not implemented by RDMA daemon", req.Header.Op)}
 	}
+}
+
+func (h *Handler) shouldUseRDMAReadDescriptor(size uint64) bool {
+	return h == nil || h.ReadRDMAMinSize == 0 || size >= h.ReadRDMAMinSize
+}
+
+func (h *Handler) shouldUseRDMAWriteDescriptor(size uint64) bool {
+	return h == nil || h.WriteRDMAMinSize == 0 || size >= h.WriteRDMAMinSize
 }
 
 func isNoSys(err error) bool {

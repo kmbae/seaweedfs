@@ -206,6 +206,31 @@ func TestHandlerReturnsRDMAReadDescriptor(t *testing.T) {
 	}
 }
 
+func TestHandlerSkipsRDMAReadDescriptorBelowMinSize(t *testing.T) {
+	backend := &fakeRDMAFileBackend{
+		readDesc: &swvfsproto.RDMADataDesc{RemoteAddr: 0x1000, RKey: 7, Length: 4096},
+	}
+	h := &Handler{Backend: backend, ReadRDMAMinSize: 8192}
+	req := &swvfsproto.Request{
+		Header: swvfsproto.RequestHeader{Tag: 3, Op: swvfsproto.OpRead, Offset: 128, Size: 4096, Valid: swvfsproto.ReadFRDMAPreferred},
+		Path1:  "/small-file",
+	}
+
+	reply, err := h.Handle(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if reply.EOF&swvfsproto.ReplyFRDMAReadDesc != 0 {
+		t.Fatalf("unexpected RDMA desc flag: eof=0x%x", reply.EOF)
+	}
+	if backend.readDescPath != "" {
+		t.Fatalf("read descriptor backend was called for a small read: %q", backend.readDescPath)
+	}
+	if string(reply.Data) != "data" || !backend.readPreferRDMA {
+		t.Fatalf("fallback read mismatch: data=%q prefer=%v", reply.Data, backend.readPreferRDMA)
+	}
+}
+
 func TestHandlerFallsBackWhenRDMAReadDescriptorUnsupported(t *testing.T) {
 	backend := &fakeRDMAFileBackend{readDescFallback: true}
 	h := &Handler{Backend: backend}
@@ -284,6 +309,28 @@ func TestHandlerRDMAWritePrepareCommit(t *testing.T) {
 	}
 	if commit.Attr.Size != 8704 || backend.commitPath != "/write-file" || backend.commitOffset != 512 || backend.commitSize != 8192 {
 		t.Fatalf("commit mismatch: attr=%+v path=%q off=%d size=%d", commit.Attr, backend.commitPath, backend.commitOffset, backend.commitSize)
+	}
+}
+
+func TestHandlerSkipsRDMAWritePrepareBelowMinSize(t *testing.T) {
+	backend := &fakeRDMAFileBackend{
+		writeDesc: &swvfsproto.RDMADataDesc{RemoteAddr: 0x2000, RKey: 11, Length: 4096},
+	}
+	h := &Handler{Backend: backend, WriteRDMAMinSize: 8192}
+
+	_, err := h.Handle(context.Background(), &swvfsproto.Request{
+		Header: swvfsproto.RequestHeader{Tag: 4, Op: swvfsproto.OpWriteRDMAPrepare, Offset: 512, Size: 4096},
+		Path1:  "/small-write",
+	})
+	if err == nil {
+		t.Fatal("expected a fallback-capable error")
+	}
+	var errno ErrnoError
+	if !errors.As(err, &errno) || errno.Errno != ErrnoNoSys {
+		t.Fatalf("expected ENOSYS fallback error, got %v", err)
+	}
+	if backend.preparePath != "" {
+		t.Fatalf("write descriptor backend was called for a small write: %q", backend.preparePath)
 	}
 }
 
