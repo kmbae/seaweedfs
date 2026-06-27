@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+use async_trait::async_trait;
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -103,6 +104,20 @@ pub struct VolumeRdmaDataDesc {
     pub reserved: [u64; 4],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VolumeRdmaRegisteredRead {
+    pub session_id: u64,
+    pub desc: VolumeRdmaDataDesc,
+}
+
+#[async_trait]
+pub trait VolumeRdmaProvider: std::fmt::Debug + Send + Sync {
+    async fn local_endpoint(&self) -> Result<VolumeRdmaEndpointInfo>;
+    async fn connect_endpoint(&self, remote: VolumeRdmaRemoteInfo) -> Result<()>;
+    async fn register_read(&self, data: Vec<u8>) -> Result<VolumeRdmaRegisteredRead>;
+    async fn release_read(&self, session_id: u64) -> Result<()>;
+}
+
 #[derive(Debug, Deserialize)]
 pub struct EngineRequest {
     pub op: String,
@@ -128,38 +143,30 @@ pub struct EngineResponse {
 }
 
 #[derive(Debug)]
-struct ReadLease {
-    data: Vec<u8>,
-    desc: VolumeRdmaDataDesc,
-}
-
-#[derive(Debug)]
-struct EngineState {
-    connected_remote: Option<VolumeRdmaRemoteInfo>,
-    leases: HashMap<u64, ReadLease>,
-}
-
-#[derive(Debug)]
 pub struct VolumeNativeEngine {
-    config: VolumeEngineConfig,
-    next_session_id: AtomicU64,
-    state: Mutex<EngineState>,
+    socket_path: String,
+    provider: Arc<dyn VolumeRdmaProvider>,
 }
 
 impl VolumeNativeEngine {
     pub fn new(config: VolumeEngineConfig) -> Self {
+        let socket_path = config.socket_path.clone();
+        let provider = Arc::new(MockVolumeRdmaProvider::new(config));
+        Self::with_provider(socket_path, provider)
+    }
+
+    pub fn with_provider(
+        socket_path: impl Into<String>,
+        provider: Arc<dyn VolumeRdmaProvider>,
+    ) -> Self {
         Self {
-            config,
-            next_session_id: AtomicU64::new(1),
-            state: Mutex::new(EngineState {
-                connected_remote: None,
-                leases: HashMap::new(),
-            }),
+            socket_path: socket_path.into(),
+            provider,
         }
     }
 
     pub async fn run(self: Arc<Self>) -> Result<()> {
-        let socket_path = self.config.socket_path.clone();
+        let socket_path = self.socket_path.clone();
         if Path::new(&socket_path).exists() {
             std::fs::remove_file(&socket_path)
                 .with_context(|| format!("remove existing socket {}", socket_path))?;
@@ -198,86 +205,110 @@ impl VolumeNativeEngine {
 
     pub async fn process_request(&self, request: EngineRequest) -> EngineResponse {
         match request.op.as_str() {
-            "local" => EngineResponse::ok_endpoint(self.local_endpoint().await),
+            "local" => match self.provider.local_endpoint().await {
+                Ok(endpoint) => EngineResponse::ok_endpoint(endpoint),
+                Err(err) => EngineResponse::error(format!("local endpoint failed: {err:#}")),
+            },
             "connect" => match request.remote {
-                Some(remote) => {
-                    self.state.lock().await.connected_remote = Some(remote);
-                    EngineResponse::ok()
-                }
+                Some(remote) => match self.provider.connect_endpoint(remote).await {
+                    Ok(()) => EngineResponse::ok(),
+                    Err(err) => EngineResponse::error(format!("connect failed: {err:#}")),
+                },
                 None => EngineResponse::error("connect requires remote"),
             },
             "register_read" => {
                 if request.data.is_empty() {
                     return EngineResponse::error("register_read requires data");
                 }
-                self.register_read(request.data).await
+                match self.provider.register_read(request.data).await {
+                    Ok(read) => EngineResponse::ok_registered_read(read),
+                    Err(err) => EngineResponse::error(format!("register_read failed: {err:#}")),
+                }
             }
             "release" => {
                 if request.session_id == 0 {
                     return EngineResponse::error("release requires session_id");
                 }
-                let mut state = self.state.lock().await;
-                state.leases.remove(&request.session_id);
-                EngineResponse::ok()
+                match self.provider.release_read(request.session_id).await {
+                    Ok(()) => EngineResponse::ok(),
+                    Err(err) => EngineResponse::error(format!("release failed: {err:#}")),
+                }
             }
             other => EngineResponse::error(format!("unknown op {other}")),
         }
     }
+}
 
-    async fn local_endpoint(&self) -> VolumeRdmaEndpointInfo {
-        VolumeRdmaEndpointInfo {
-            abi_version: ABI_VERSION,
-            flags: 0,
-            device: self.config.device.clone(),
-            port: self.config.port,
-            qp_num: self.config.qpn,
-            psn: self.config.psn,
-            qp_state: 0,
-            lid: self.config.lid,
-            sm_lid: 0,
-            port_state: 0,
-            active_mtu: 0,
-            gid_index: self.config.gid_index,
-            link_layer: self.config.link_layer,
-            gid: self.config.gid.clone(),
-            kernel_enabled: true,
-            endpoint_ready: true,
-            qp_connected: self.state.lock().await.connected_remote.is_some(),
-            unsafe_global_rkey: false,
-        }
-    }
-
-    async fn register_read(&self, data: Vec<u8>) -> EngineResponse {
-        if data.len() > u32::MAX as usize {
-            return EngineResponse::error("register_read data too large");
-        }
-        let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
-        if session_id == 0 {
-            return EngineResponse::error("session id overflow");
-        }
-        let remote_addr = self
-            .config
-            .mock_base_addr
-            .saturating_add(session_id.saturating_mul(self.config.mock_addr_stride));
-        let desc = VolumeRdmaDataDesc {
-            remote_addr,
-            rkey: self.config.mock_rkey,
-            length: data.len() as u32,
-            reserved: [0; 4],
-        };
-        self.state.lock().await.leases.insert(
-            session_id,
-            ReadLease {
-                data,
-                desc: desc.clone(),
-            },
-        );
-        EngineResponse {
+impl EngineResponse {
+    fn ok() -> Self {
+        Self {
             ok: true,
             error: None,
             endpoint: None,
-            desc: Some(desc),
-            session_id,
+            desc: None,
+            session_id: 0,
+        }
+    }
+
+    fn ok_endpoint(endpoint: VolumeRdmaEndpointInfo) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            endpoint: Some(endpoint),
+            desc: None,
+            session_id: 0,
+        }
+    }
+
+    fn ok_registered_read(read: VolumeRdmaRegisteredRead) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            endpoint: None,
+            desc: Some(read.desc),
+            session_id: read.session_id,
+        }
+    }
+
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            ok: false,
+            error: Some(message.into()),
+            endpoint: None,
+            desc: None,
+            session_id: 0,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ReadLease {
+    data: Vec<u8>,
+    desc: VolumeRdmaDataDesc,
+}
+
+#[derive(Debug)]
+struct MockProviderState {
+    connected_remote: Option<VolumeRdmaRemoteInfo>,
+    leases: HashMap<u64, ReadLease>,
+}
+
+#[derive(Debug)]
+pub struct MockVolumeRdmaProvider {
+    config: VolumeEngineConfig,
+    next_session_id: AtomicU64,
+    state: Mutex<MockProviderState>,
+}
+
+impl MockVolumeRdmaProvider {
+    pub fn new(config: VolumeEngineConfig) -> Self {
+        Self {
+            config,
+            next_session_id: AtomicU64::new(1),
+            state: Mutex::new(MockProviderState {
+                connected_remote: None,
+                leases: HashMap::new(),
+            }),
         }
     }
 
@@ -304,35 +335,74 @@ impl VolumeNativeEngine {
     }
 }
 
-impl EngineResponse {
-    fn ok() -> Self {
-        Self {
-            ok: true,
-            error: None,
-            endpoint: None,
-            desc: None,
-            session_id: 0,
-        }
+#[async_trait]
+impl VolumeRdmaProvider for MockVolumeRdmaProvider {
+    async fn local_endpoint(&self) -> Result<VolumeRdmaEndpointInfo> {
+        Ok(VolumeRdmaEndpointInfo {
+            abi_version: ABI_VERSION,
+            flags: 0,
+            device: self.config.device.clone(),
+            port: self.config.port,
+            qp_num: self.config.qpn,
+            psn: self.config.psn,
+            qp_state: 0,
+            lid: self.config.lid,
+            sm_lid: 0,
+            port_state: 0,
+            active_mtu: 0,
+            gid_index: self.config.gid_index,
+            link_layer: self.config.link_layer,
+            gid: self.config.gid.clone(),
+            kernel_enabled: true,
+            endpoint_ready: true,
+            qp_connected: self.state.lock().await.connected_remote.is_some(),
+            unsafe_global_rkey: false,
+        })
     }
 
-    fn ok_endpoint(endpoint: VolumeRdmaEndpointInfo) -> Self {
-        Self {
-            ok: true,
-            error: None,
-            endpoint: Some(endpoint),
-            desc: None,
-            session_id: 0,
-        }
+    async fn connect_endpoint(&self, remote: VolumeRdmaRemoteInfo) -> Result<()> {
+        self.state.lock().await.connected_remote = Some(remote);
+        Ok(())
     }
 
-    fn error(message: impl Into<String>) -> Self {
-        Self {
-            ok: false,
-            error: Some(message.into()),
-            endpoint: None,
-            desc: None,
-            session_id: 0,
+    async fn register_read(&self, data: Vec<u8>) -> Result<VolumeRdmaRegisteredRead> {
+        if data.is_empty() {
+            return Err(anyhow!("register_read requires data"));
         }
+        if data.len() > u32::MAX as usize {
+            return Err(anyhow!("register_read data too large"));
+        }
+
+        let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
+        if session_id == 0 {
+            return Err(anyhow!("session id overflow"));
+        }
+
+        let remote_addr = self
+            .config
+            .mock_base_addr
+            .saturating_add(session_id.saturating_mul(self.config.mock_addr_stride));
+        let desc = VolumeRdmaDataDesc {
+            remote_addr,
+            rkey: self.config.mock_rkey,
+            length: data.len() as u32,
+            reserved: [0; 4],
+        };
+
+        self.state.lock().await.leases.insert(
+            session_id,
+            ReadLease {
+                data,
+                desc: desc.clone(),
+            },
+        );
+
+        Ok(VolumeRdmaRegisteredRead { session_id, desc })
+    }
+
+    async fn release_read(&self, session_id: u64) -> Result<()> {
+        self.state.lock().await.leases.remove(&session_id);
+        Ok(())
     }
 }
 
@@ -434,9 +504,16 @@ fn is_zero(value: &u64) -> bool {
 mod tests {
     use super::*;
 
+    fn mock_engine() -> (VolumeNativeEngine, Arc<MockVolumeRdmaProvider>) {
+        let config = VolumeEngineConfig::mock("/tmp/test.sock");
+        let provider = Arc::new(MockVolumeRdmaProvider::new(config));
+        let engine = VolumeNativeEngine::with_provider("/tmp/test.sock", provider.clone());
+        (engine, provider)
+    }
+
     #[tokio::test]
     async fn process_local_and_connect() {
-        let engine = VolumeNativeEngine::new(VolumeEngineConfig::mock("/tmp/test.sock"));
+        let (engine, provider) = mock_engine();
         let local = engine
             .process_request(EngineRequest {
                 op: "local".to_string(),
@@ -468,12 +545,12 @@ mod tests {
             })
             .await;
         assert!(connect.ok);
-        assert!(engine.local_endpoint().await.qp_connected);
+        assert!(provider.local_endpoint().await.unwrap().qp_connected);
     }
 
     #[tokio::test]
     async fn register_read_and_release() {
-        let engine = VolumeNativeEngine::new(VolumeEngineConfig::mock("/tmp/test.sock"));
+        let (engine, provider) = mock_engine();
         let response = engine
             .process_request(EngineRequest {
                 op: "register_read".to_string(),
@@ -489,9 +566,12 @@ mod tests {
         assert_ne!(desc.remote_addr, 0);
         assert_ne!(desc.rkey, 0);
         assert_eq!(desc.length, 11);
-        assert_eq!(engine.lease_count().await, 1);
-        assert_eq!(engine.lease_data(session_id).await.unwrap(), b"needle-data");
-        assert_eq!(engine.lease_desc(session_id).await.unwrap(), desc);
+        assert_eq!(provider.lease_count().await, 1);
+        assert_eq!(
+            provider.lease_data(session_id).await.unwrap(),
+            b"needle-data"
+        );
+        assert_eq!(provider.lease_desc(session_id).await.unwrap(), desc);
 
         let release = engine
             .process_request(EngineRequest {
@@ -502,7 +582,22 @@ mod tests {
             })
             .await;
         assert!(release.ok);
-        assert_eq!(engine.lease_count().await, 0);
+        assert_eq!(provider.lease_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn engine_new_uses_mock_provider() {
+        let engine = VolumeNativeEngine::new(VolumeEngineConfig::mock("/tmp/test.sock"));
+        let local = engine
+            .process_request(EngineRequest {
+                op: "local".to_string(),
+                remote: None,
+                session_id: 0,
+                data: Vec::new(),
+            })
+            .await;
+        assert!(local.ok);
+        assert_eq!(local.endpoint.unwrap().device, "mock-volume-rdma");
     }
 
     #[test]
