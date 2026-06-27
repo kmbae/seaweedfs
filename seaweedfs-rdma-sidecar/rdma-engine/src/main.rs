@@ -12,7 +12,7 @@ use clap::Parser;
 use rdma_engine::{RdmaEngine, RdmaEngineConfig};
 use std::path::PathBuf;
 use tracing::{error, info, warn};
-use tracing_subscriber::{EnvFilter, fmt::layer, prelude::*};
+use tracing_subscriber::{fmt::layer, prelude::*, EnvFilter};
 
 #[derive(Parser)]
 #[command(
@@ -24,27 +24,27 @@ struct Args {
     /// UCX device name preference (e.g., mlx5_0, or 'auto' for UCX auto-selection)
     #[arg(short, long, default_value = "auto")]
     device: String,
-    
+
     /// RDMA port number
     #[arg(short, long, default_value_t = 18515)]
     port: u16,
-    
+
     /// Maximum number of concurrent sessions
     #[arg(long, default_value_t = 1000)]
     max_sessions: usize,
-    
+
     /// Session timeout in seconds
     #[arg(long, default_value_t = 300)]
     session_timeout: u64,
-    
+
     /// Memory buffer size in bytes
     #[arg(long, default_value_t = 1024 * 1024 * 1024)]
     buffer_size: usize,
-    
+
     /// IPC socket path
     #[arg(long, default_value = "/tmp/rdma-engine.sock")]
     ipc_socket: PathBuf,
-    
+
     /// Enable debug logging
     #[arg(long)]
     debug: bool,
@@ -56,7 +56,7 @@ struct Args {
     /// Delay between real RDMA initialization retries in milliseconds
     #[arg(long, default_value_t = 1000)]
     real_init_retry_interval_ms: u64,
-    
+
     /// Configuration file path
     #[arg(short, long)]
     config: Option<PathBuf>,
@@ -65,7 +65,7 @@ struct Args {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    
+
     // Initialize tracing
     let filter = if args.debug {
         EnvFilter::try_from_default_env()
@@ -76,14 +76,14 @@ async fn main() -> anyhow::Result<()> {
             .or_else(|_| EnvFilter::try_new("info"))
             .unwrap()
     };
-    
+
     tracing_subscriber::registry()
         .with(layer().with_target(false))
         .with(filter)
         .init();
 
     raise_memlock_limit();
-    
+
     info!("🚀 Starting SeaweedFS UCX RDMA Engine Server");
     info!("   Version: {}", env!("CARGO_PKG_VERSION"));
     info!("   UCX Device Preference: {}", args.device);
@@ -93,8 +93,11 @@ async fn main() -> anyhow::Result<()> {
     info!("   IPC Socket: {}", args.ipc_socket.display());
     info!("   Debug Mode: {}", args.debug);
     info!("   Real RDMA Init Retries: {}", args.real_init_retries);
-    info!("   Real RDMA Init Retry Interval: {}ms", args.real_init_retry_interval_ms);
-    
+    info!(
+        "   Real RDMA Init Retry Interval: {}ms",
+        args.real_init_retry_interval_ms
+    );
+
     // Load configuration
     let config = RdmaEngineConfig {
         device_name: args.device,
@@ -107,13 +110,13 @@ async fn main() -> anyhow::Result<()> {
         real_init_retries: args.real_init_retries,
         real_init_retry_interval_ms: args.real_init_retry_interval_ms,
     };
-    
+
     // Override with config file if provided
     if let Some(config_path) = args.config {
         info!("Loading configuration from: {}", config_path.display());
         // TODO: Implement configuration file loading
     }
-    
+
     // Create and run RDMA engine
     let mut engine = match RdmaEngine::new(config).await {
         Ok(engine) => {
@@ -125,11 +128,11 @@ async fn main() -> anyhow::Result<()> {
             return Err(e);
         }
     };
-    
+
     // Set up signal handlers for graceful shutdown
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())?;
-    
+
     // Run engine in background
     let engine_handle = tokio::spawn(async move {
         if let Err(e) = engine.run().await {
@@ -138,10 +141,10 @@ async fn main() -> anyhow::Result<()> {
         }
         Ok(())
     });
-    
+
     info!("🎯 RDMA engine is running and ready to accept connections");
     info!("   Send SIGTERM or SIGINT to shutdown gracefully");
-    
+
     // Wait for shutdown signal
     tokio::select! {
         _ = sigterm.recv() => {
@@ -164,7 +167,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
     }
-    
+
     info!("🛑 RDMA engine server shut down complete");
     Ok(())
 }
@@ -192,16 +195,19 @@ fn raise_memlock_limit() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_args_parsing() {
         let args = Args::try_parse_from(&[
             "rdma-engine-server",
-            "--device", "mlx5_0",
-            "--port", "18515",
-            "--debug"
-        ]).unwrap();
-        
+            "--device",
+            "mlx5_0",
+            "--port",
+            "18515",
+            "--debug",
+        ])
+        .unwrap();
+
         assert_eq!(args.device, "mlx5_0");
         assert_eq!(args.port, 18515);
         assert!(args.debug);

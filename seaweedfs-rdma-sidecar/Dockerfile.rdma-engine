@@ -53,8 +53,9 @@ RUN useradd -m -u 1001 appuser
 # Set work directory
 WORKDIR /app
 
-# Copy binary from builder stage
+# Copy binaries from builder stage
 COPY --from=builder /app/target/release/rdma-engine-server .
+COPY --from=builder /app/target/release/volume-rdma-engine .
 
 # Change ownership
 RUN chown -R appuser:appuser /app

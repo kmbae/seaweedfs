@@ -37,6 +37,7 @@ pub mod rdma;
 pub mod session;
 pub mod ucx;
 pub mod volume_grpc;
+pub mod volume_native;
 
 pub use error::{RdmaError, RdmaResult};
 

@@ -10,6 +10,10 @@ license = "Apache-2.0"
 name = "rdma-engine-server"
 path = "src/main.rs"
 
+[[bin]]
+name = "volume-rdma-engine"
+path = "src/bin/volume-rdma-engine.rs"
+
 [lib]
 name = "rdma_engine"
 path = "src/lib.rs"
