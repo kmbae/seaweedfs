@@ -175,6 +175,8 @@ pub struct EngineResponse {
     pub connection_id: u64,
     #[serde(skip_serializing_if = "is_zero")]
     pub session_id: u64,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub data_sideband: bool,
     #[serde(
         default,
         skip_serializing_if = "Vec::is_empty",
@@ -258,10 +260,20 @@ impl VolumeNativeEngine {
                 .context("read volume RDMA engine data sideband")?;
         }
         debug!("volume RDMA engine request: {:?}", request);
-        let response = self.process_request(request).await;
+        let mut response = self.process_request(request).await;
+        let sideband = if response.data_sideband {
+            Some(std::mem::take(&mut response.data))
+        } else {
+            None
+        };
         let payload =
             serde_json::to_vec(&response).context("encode volume RDMA engine response")?;
         write_frame(&mut stream, &payload).await?;
+        if let Some(data) = sideband {
+            write_frame(&mut stream, &data)
+                .await
+                .context("write volume RDMA engine response data sideband")?;
+        }
         Ok(())
     }
 
@@ -359,6 +371,7 @@ impl EngineResponse {
             desc: None,
             connection_id: 0,
             session_id: 0,
+            data_sideband: false,
             data: Vec::new(),
         }
     }
@@ -371,6 +384,7 @@ impl EngineResponse {
             desc: None,
             connection_id,
             session_id: 0,
+            data_sideband: false,
             data: Vec::new(),
         }
     }
@@ -383,6 +397,7 @@ impl EngineResponse {
             desc: Some(read.desc),
             connection_id: 0,
             session_id: read.session_id,
+            data_sideband: false,
             data: Vec::new(),
         }
     }
@@ -395,6 +410,7 @@ impl EngineResponse {
             desc: None,
             connection_id: 0,
             session_id: 0,
+            data_sideband: true,
             data,
         }
     }
@@ -407,6 +423,7 @@ impl EngineResponse {
             desc: None,
             connection_id: 0,
             session_id: 0,
+            data_sideband: false,
             data: Vec::new(),
         }
     }
@@ -782,6 +799,10 @@ fn is_zero(value: &u64) -> bool {
     *value == 0
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1111,6 +1132,77 @@ mod tests {
             provider.lease_data(session_id).await.unwrap(),
             b"sideband-data"
         );
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_stream_emits_read_remote_data_sideband() {
+        let (engine, _, _) = mock_engine();
+        let local = engine
+            .process_request(EngineRequest {
+                op: "requester_local".to_string(),
+                connection_id: 0,
+                remote: None,
+                desc: None,
+                session_id: 0,
+                timeout_ms: 0,
+                data_sideband: false,
+                data: Vec::new(),
+            })
+            .await;
+        assert!(local.ok);
+        let connection_id = local.connection_id;
+        let connect = engine
+            .process_request(EngineRequest {
+                op: "requester_connect".to_string(),
+                connection_id,
+                remote: Some(VolumeRdmaRemoteInfo {
+                    abi_version: ABI_VERSION,
+                    flags: 0,
+                    qpn: 10,
+                    lid: 1,
+                    psn: 2,
+                    port: 1,
+                    gid_index: 0,
+                    sl: 0,
+                    gid: [0; 16],
+                    reserved: [0; 8],
+                }),
+                desc: None,
+                session_id: 0,
+                timeout_ms: 0,
+                data_sideband: false,
+                data: Vec::new(),
+            })
+            .await;
+        assert!(connect.ok);
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let engine = Arc::new(engine);
+        let server_task = tokio::spawn(async move { engine.handle_stream(server).await });
+        let request = serde_json::json!({
+            "op": "read_remote",
+            "connection_id": connection_id,
+            "desc": {
+                "RemoteAddr": 0xbeef,
+                "RKey": 1,
+                "Length": 4,
+                "Reserved": [0, 0, 0, 0],
+            },
+        });
+        write_frame(
+            &mut client,
+            serde_json::to_string(&request).unwrap().as_bytes(),
+        )
+        .await
+        .unwrap();
+        let response_payload = read_frame(&mut client).await.unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&response_payload).unwrap();
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["data_sideband"], true);
+        assert!(response.get("data").is_none());
+        let data_sideband = read_frame(&mut client).await.unwrap();
+        assert_eq!(data_sideband, vec![0, 1, 2, 3]);
         server_task.await.unwrap().unwrap();
     }
 

@@ -42,6 +42,7 @@ func TestClientRequesterLocalConnectAndReadRemote(t *testing.T) {
 				requests <- req
 
 				resp := response{OK: true}
+				var sideband []byte
 				switch req.Op {
 				case "requester_local":
 					if req.ConnectionID != 0 {
@@ -57,7 +58,8 @@ func TestClientRequesterLocalConnectAndReadRemote(t *testing.T) {
 					if req.ConnectionID != 42 || req.Desc == nil || req.Desc.RemoteAddr != 0xbeef || req.TimeoutMs != 25 {
 						t.Errorf("unexpected read request: %+v", req)
 					}
-					resp.Data = []byte("needle")
+					resp.DataSideband = true
+					sideband = []byte("needle")
 				default:
 					resp.OK = false
 					resp.Error = "unknown op"
@@ -69,6 +71,12 @@ func TestClientRequesterLocalConnectAndReadRemote(t *testing.T) {
 				}
 				if err := writeFrame(conn, payload); err != nil {
 					t.Errorf("write response: %v", err)
+					return
+				}
+				if sideband != nil {
+					if err := writeFrame(conn, sideband); err != nil {
+						t.Errorf("write sideband: %v", err)
+					}
 				}
 			}(conn)
 		}

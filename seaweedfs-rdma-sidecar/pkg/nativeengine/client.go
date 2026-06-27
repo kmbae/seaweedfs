@@ -38,6 +38,7 @@ type response struct {
 	Desc         *rdmaDataDesc                  `json:"desc,omitempty"`
 	ConnectionID uint64                         `json:"connection_id,omitempty"`
 	SessionID    uint64                         `json:"session_id,omitempty"`
+	DataSideband bool                           `json:"data_sideband,omitempty"`
 	Data         []byte                         `json:"data,omitempty"`
 }
 
@@ -173,6 +174,15 @@ func (c *Client) roundTrip(ctx context.Context, req request) (*response, error) 
 			resp.Error = "native engine request failed"
 		}
 		return nil, fmt.Errorf("%s", resp.Error)
+	}
+	if resp.DataSideband {
+		if len(resp.Data) != 0 {
+			return nil, fmt.Errorf("native engine response must not include JSON data with data_sideband")
+		}
+		resp.Data, err = readFrame(conn)
+		if err != nil {
+			return nil, err
+		}
 	}
 	return &resp, nil
 }
