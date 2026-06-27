@@ -34,6 +34,7 @@ const (
 	OpWriteRDMAPrepare uint32 = 23
 	OpWriteRDMACommit  uint32 = 24
 	OpRDMAReleaseRead  uint32 = 25
+	OpRDMAReadPrepare  uint32 = 26
 )
 
 const (

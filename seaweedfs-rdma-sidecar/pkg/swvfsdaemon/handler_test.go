@@ -39,6 +39,8 @@ type fakeRDMAFileBackend struct {
 	fakeFileBackend
 	readDesc         *swvfsproto.RDMADataDesc
 	readDescPath     string
+	readDescOffset   uint64
+	readDescSize     uint64
 	writeDesc        *swvfsproto.RDMADataDesc
 	preparePath      string
 	prepareOffset    uint64
@@ -68,6 +70,8 @@ func (f *fakeFileBackend) WriteFile(ctx context.Context, path string, offset uin
 
 func (f *fakeRDMAFileBackend) ReadFileRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
 	f.readDescPath = path
+	f.readDescOffset = offset
+	f.readDescSize = size
 	if f.readDescErr != nil {
 		return nil, nil, f.readDescErr
 	}
@@ -209,6 +213,57 @@ func TestHandlerReturnsRDMAReadDescriptor(t *testing.T) {
 	}
 	if backend.readDescPath != "/rdma-file" || reply.Attr.Ino != 9 {
 		t.Fatalf("read desc backend/attr mismatch: path=%q attr=%+v", backend.readDescPath, reply.Attr)
+	}
+}
+
+func TestHandlerRDMAReadPrepareReturnsDescriptorOnly(t *testing.T) {
+	backend := &fakeRDMAFileBackend{
+		readDesc: &swvfsproto.RDMADataDesc{RemoteAddr: 0x3000, RKey: 17, Length: 8192},
+	}
+	h := &Handler{Backend: backend}
+	req := &swvfsproto.Request{
+		Header: swvfsproto.RequestHeader{Tag: 7, Op: swvfsproto.OpRDMAReadPrepare, Offset: 256, Size: 8192},
+		Path1:  "/direct-rdma-file",
+	}
+
+	reply, err := h.Handle(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if reply.EOF&swvfsproto.ReplyFRDMAReadDesc == 0 {
+		t.Fatalf("RDMA read desc flag not set: eof=0x%x", reply.EOF)
+	}
+	desc, err := swvfsproto.DecodeRDMADataDesc(reply.Data)
+	if err != nil {
+		t.Fatalf("DecodeRDMADataDesc: %v", err)
+	}
+	if desc.RemoteAddr != 0x3000 || desc.RKey != 17 || desc.Length != 8192 {
+		t.Fatalf("descriptor mismatch: %+v", desc)
+	}
+	if len(reply.Data) != swvfsproto.RDMADataDescSize {
+		t.Fatalf("direct read prepare returned payload bytes: len=%d", len(reply.Data))
+	}
+	if backend.readDescPath != "/direct-rdma-file" || backend.readDescOffset != 256 || backend.readDescSize != 8192 {
+		t.Fatalf("read desc backend mismatch: path=%q off=%d size=%d", backend.readDescPath, backend.readDescOffset, backend.readDescSize)
+	}
+}
+
+func TestHandlerRDMAReadPrepareDoesNotFallbackToPayload(t *testing.T) {
+	backend := &fakeRDMAFileBackend{readDescFallback: true}
+	h := &Handler{Backend: backend}
+	_, err := h.Handle(context.Background(), &swvfsproto.Request{
+		Header: swvfsproto.RequestHeader{Tag: 8, Op: swvfsproto.OpRDMAReadPrepare, Size: 4096},
+		Path1:  "/plain-file",
+	})
+	if err == nil {
+		t.Fatal("expected direct RDMA read prepare to fail without payload fallback")
+	}
+	var errno ErrnoError
+	if !errors.As(err, &errno) || errno.Errno != ErrnoNoSys {
+		t.Fatalf("expected ENOSYS fallback signal, got %v", err)
+	}
+	if backend.readPreferRDMA {
+		t.Fatal("direct RDMA read prepare unexpectedly fell back to payload read")
 	}
 }
 

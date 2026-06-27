@@ -238,6 +238,38 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 			reply.Attr = *attr
 		}
 		return reply, nil
+	case swvfsproto.OpRDMAReadPrepare:
+		backend, ok := h.Backend.(RDMAReadDescriptorBackend)
+		if !ok {
+			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma read prepare is not implemented"}
+		}
+		h.Stats.Inc("handler_read_rdma_prepare_requests")
+		h.Stats.Add("handler_read_rdma_prepare_bytes", req.Header.Size)
+		if !h.shouldUseRDMAReadDescriptor(req.Header.Size) {
+			h.Stats.Inc("handler_read_rdma_prepare_policy_too_small")
+			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma read prepare below minimum size"}
+		}
+		prepareStart := time.Now()
+		desc, attr, err := backend.ReadFileRDMA(ctx, req.Path1, req.Header.Offset, req.Header.Size)
+		h.Stats.Observe("handler_read_rdma_prepare", time.Since(prepareStart))
+		if err != nil {
+			h.Stats.Inc("handler_read_rdma_prepare_errors")
+			return nil, err
+		}
+		if desc == nil {
+			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma read prepare returned no descriptor"}
+		}
+		h.Stats.Inc("handler_read_rdma_prepare_replies")
+		h.Stats.Add("handler_read_rdma_prepare_desc_bytes", uint64(desc.Length))
+		reply := &swvfsproto.Reply{
+			Tag:  req.Header.Tag,
+			EOF:  swvfsproto.ReplyFRDMAReadDesc,
+			Data: swvfsproto.EncodeRDMADataDesc(*desc),
+		}
+		if attr != nil {
+			reply.Attr = *attr
+		}
+		return reply, nil
 	case swvfsproto.OpWriteRDMAPrepare:
 		backend, ok := h.Backend.(RDMAWriteDescriptorBackend)
 		if !ok {
