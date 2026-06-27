@@ -10,10 +10,14 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
+	"seaweedfs-rdma-sidecar/pkg/nativeengine"
 	"seaweedfs-rdma-sidecar/pkg/rdma"
 	"seaweedfs-rdma-sidecar/pkg/remote"
+	"seaweedfs-rdma-sidecar/pkg/swvfsdaemon"
+	"seaweedfs-rdma-sidecar/pkg/swvfsproto"
 	"seaweedfs-rdma-sidecar/pkg/volumeread"
 
 	"github.com/seaweedfs/seaweedfs/weed/operation"
@@ -28,27 +32,37 @@ import (
 
 // SeaweedFSRDMAClient provides SeaweedFS-specific RDMA operations
 type SeaweedFSRDMAClient struct {
-	rdmaClient      *rdma.Client
-	localReader     *volumeread.Reader
-	logger          *logrus.Logger
-	volumeServerURL string
-	enabled         bool
-	payloadRDMA     bool
-	remoteReadPort  uint16
+	rdmaClient         *rdma.Client
+	nativeEngine       nativeVolumeEngine
+	localReader        *volumeread.Reader
+	logger             *logrus.Logger
+	volumeServerURL    string
+	enabled            bool
+	payloadRDMA        bool
+	nativeVolumeRDMA   bool
+	nativeServiceLevel uint32
+	remoteReadPort     uint16
+	operationTimeout   time.Duration
 
 	// Zero-copy optimization
 	tempDir     string
 	useZeroCopy bool
+
+	nativeMu    sync.Mutex
+	nativePeers map[string]struct{}
 }
 
 // Config holds configuration for the SeaweedFS RDMA client
 type Config struct {
-	RDMASocketPath    string
-	VolumeServerURL   string
-	Enabled           bool
-	EnablePayloadRDMA bool
-	DefaultTimeout    time.Duration
-	Logger            *logrus.Logger
+	RDMASocketPath         string
+	NativeEngineSocketPath string
+	VolumeServerURL        string
+	Enabled                bool
+	EnablePayloadRDMA      bool
+	EnableNativeVolumeRDMA bool
+	NativeRDMAServiceLevel uint32
+	DefaultTimeout         time.Duration
+	Logger                 *logrus.Logger
 
 	// Zero-copy optimization
 	TempDir     string // Directory for temp files (default: /tmp/rdma-cache)
@@ -66,6 +80,12 @@ type Config struct {
 
 	// RemoteReadPort is the TCP port for remote needle reads (default 18515).
 	RemoteReadPort uint16
+}
+
+type nativeVolumeEngine interface {
+	RequesterLocal(context.Context) (swvfsdaemon.RDMALocalEndpoint, error)
+	RequesterConnect(context.Context, swvfsproto.RDMARemoteInfo) error
+	ReadRemote(context.Context, swvfsproto.RDMADataDesc, time.Duration) ([]byte, error)
 }
 
 // NeedleReadRequest represents a SeaweedFS needle read request
@@ -114,6 +134,10 @@ func NewSeaweedFSRDMAClient(config *Config) (*SeaweedFSRDMAClient, error) {
 		}
 		rdmaClient = rdma.NewClient(rdmaConfig)
 	}
+	var nativeEngine nativeVolumeEngine
+	if config.EnableNativeVolumeRDMA && config.NativeEngineSocketPath != "" {
+		nativeEngine = nativeengine.New(config.NativeEngineSocketPath, config.DefaultTimeout)
+	}
 
 	// Setup temp directory for zero-copy optimization
 	tempDir := config.TempDir
@@ -129,14 +153,19 @@ func NewSeaweedFSRDMAClient(config *Config) (*SeaweedFSRDMAClient, error) {
 	}
 
 	client := &SeaweedFSRDMAClient{
-		rdmaClient:      rdmaClient,
-		logger:          config.Logger,
-		volumeServerURL: config.VolumeServerURL,
-		enabled:         config.Enabled,
-		payloadRDMA:     config.EnablePayloadRDMA,
-		tempDir:         tempDir,
-		useZeroCopy:     config.UseZeroCopy,
-		remoteReadPort:  config.RemoteReadPort,
+		rdmaClient:         rdmaClient,
+		nativeEngine:       nativeEngine,
+		logger:             config.Logger,
+		volumeServerURL:    config.VolumeServerURL,
+		enabled:            config.Enabled,
+		payloadRDMA:        config.EnablePayloadRDMA,
+		nativeVolumeRDMA:   config.EnableNativeVolumeRDMA,
+		nativeServiceLevel: config.NativeRDMAServiceLevel,
+		tempDir:            tempDir,
+		useZeroCopy:        config.UseZeroCopy,
+		remoteReadPort:     config.RemoteReadPort,
+		operationTimeout:   config.DefaultTimeout,
+		nativePeers:        make(map[string]struct{}),
 	}
 	if client.remoteReadPort == 0 {
 		client.remoteReadPort = remote.DefaultRemotePort
@@ -190,6 +219,33 @@ func (c *SeaweedFSRDMAClient) RDMAClient() *rdma.Client {
 func (c *SeaweedFSRDMAClient) ReadNeedle(ctx context.Context, req *NeedleReadRequest) (*NeedleReadResponse, error) {
 	start := time.Now()
 	var rdmaErr error
+
+	if c.nativeVolumeRDMA && c.nativeEngine != nil {
+		if data, sessionID, ok, err := c.readNeedleViaNativeVolumeRDMA(ctx, req); err == nil && ok {
+			c.logger.WithFields(logrus.Fields{
+				"volume_id":   req.VolumeID,
+				"needle_id":   req.NeedleID,
+				"source":      "native-volume-rdma",
+				"real_rdma":   true,
+				"data_source": "volume-native",
+				"latency":     time.Since(start),
+				"bytes_read":  len(data),
+			}).Info("🚀 Native volume RDMA read path completed")
+			return &NeedleReadResponse{
+				Data:        data,
+				IsRDMA:      true,
+				Latency:     time.Since(start),
+				Source:      "native-volume-rdma",
+				SessionID:   sessionID,
+				SessionRDMA: true,
+				RealRDMA:    true,
+				DataSource:  "volume-native",
+			}, nil
+		} else if err != nil {
+			c.logger.WithError(err).Debug("native volume RDMA read path unavailable, trying configured RDMA path")
+			rdmaErr = err
+		}
+	}
 
 	// Try RDMA fast path first
 	if c.IsEnabled() {
@@ -350,6 +406,124 @@ func (c *SeaweedFSRDMAClient) ReadLocalNeedle(ctx context.Context, req *NeedleRe
 		return nil, fmt.Errorf("local volume reader is not configured")
 	}
 	return c.localReader.ReadNeedle(req.VolumeID, req.NeedleID, req.Cookie, req.Offset, req.Size)
+}
+
+func (c *SeaweedFSRDMAClient) readNeedleViaNativeVolumeRDMA(ctx context.Context, req *NeedleReadRequest) ([]byte, string, bool, error) {
+	if c == nil || c.nativeEngine == nil {
+		return nil, "", false, nil
+	}
+	volumeServer := req.VolumeServer
+	if volumeServer == "" {
+		volumeServer = c.volumeServerURL
+	}
+	if volumeServer == "" {
+		return nil, "", false, nil
+	}
+	size := req.Size
+	if size == 0 {
+		size = 4096
+	}
+	if size > swvfsproto.RDMAIOMax {
+		return nil, "", false, fmt.Errorf("native volume RDMA read too large: %d > %d", size, swvfsproto.RDMAIOMax)
+	}
+
+	if err := c.ensureNativeVolumePeer(ctx, volumeServer); err != nil {
+		return nil, "", false, err
+	}
+	desc, _, sessionID, err := swvfsdaemon.PostVolumeNativeReadDesc(ctx, nil, volumeServer, swvfsdaemon.VolumeRDMAReadDescRequest{
+		FileID:   reqFileID(req),
+		VolumeID: req.VolumeID,
+		NeedleID: req.NeedleID,
+		Cookie:   req.Cookie,
+		Offset:   req.Offset,
+		Size:     size,
+	})
+	if err != nil {
+		return nil, "", false, err
+	}
+	if sessionID != 0 {
+		defer func() {
+			releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := swvfsdaemon.PostVolumeNativeReleaseDesc(releaseCtx, nil, volumeServer, sessionID); err != nil {
+				c.logger.WithError(err).Warn("native volume RDMA read descriptor release failed")
+			}
+		}()
+	}
+	if desc == nil || desc.RemoteAddr == 0 || desc.Length == 0 {
+		return nil, "", false, fmt.Errorf("native volume RDMA descriptor is not exportable")
+	}
+	if uint64(desc.Length) > size {
+		return nil, "", false, fmt.Errorf("native volume RDMA descriptor length %d exceeds requested size %d", desc.Length, size)
+	}
+
+	timeout := c.nativeOperationTimeout()
+	data, err := c.nativeEngine.ReadRemote(ctx, *desc, timeout)
+	if err != nil {
+		return nil, "", false, err
+	}
+	if uint64(len(data)) < uint64(desc.Length) {
+		return nil, "", false, fmt.Errorf("native volume RDMA read returned %d bytes for descriptor length %d", len(data), desc.Length)
+	}
+	return data[:desc.Length], fmt.Sprintf("%d", sessionID), true, nil
+}
+
+func (c *SeaweedFSRDMAClient) ensureNativeVolumePeer(ctx context.Context, volumeServer string) error {
+	key := nativeVolumePeerKey(volumeServer)
+	c.nativeMu.Lock()
+	if _, ok := c.nativePeers[key]; ok {
+		c.nativeMu.Unlock()
+		return nil
+	}
+	c.nativeMu.Unlock()
+
+	local, err := c.nativeEngine.RequesterLocal(ctx)
+	if err != nil {
+		return err
+	}
+	if !local.ReadyForConnect() {
+		return fmt.Errorf("native requester endpoint is not ready: qpn=%d lid=%d", local.QPNum, local.LID)
+	}
+	remoteEndpoint, err := swvfsdaemon.FetchVolumeNativeEndpoint(ctx, nil, volumeServer)
+	if err != nil {
+		return err
+	}
+	if !remoteEndpoint.ReadyForConnect() {
+		return fmt.Errorf("native volume endpoint is not ready: qpn=%d lid=%d", remoteEndpoint.QPNum, remoteEndpoint.LID)
+	}
+	if err := swvfsdaemon.PostVolumeNativeConnect(ctx, nil, volumeServer, local, c.nativeServiceLevel); err != nil {
+		return err
+	}
+	remoteInfo, err := remoteEndpoint.RemoteInfo(c.nativeServiceLevel)
+	if err != nil {
+		return err
+	}
+	if err := c.nativeEngine.RequesterConnect(ctx, remoteInfo); err != nil {
+		return err
+	}
+
+	c.nativeMu.Lock()
+	c.nativePeers[key] = struct{}{}
+	c.nativeMu.Unlock()
+	return nil
+}
+
+func (c *SeaweedFSRDMAClient) nativeOperationTimeout() time.Duration {
+	if c != nil && c.operationTimeout > 0 {
+		return c.operationTimeout
+	}
+	return 5 * time.Second
+}
+
+func nativeVolumePeerKey(volumeServer string) string {
+	return strings.TrimRight(strings.TrimSpace(volumeServer), "/")
+}
+
+func reqFileID(req *NeedleReadRequest) string {
+	if req == nil || req.VolumeID == 0 || req.NeedleID == 0 {
+		return ""
+	}
+	return needle.NewFileId(needle.VolumeId(req.VolumeID), req.NeedleID, req.Cookie).String()
 }
 
 func (c *SeaweedFSRDMAClient) readNeedleViaRemoteRDMA(ctx context.Context, req *NeedleReadRequest, rdmaReq *rdma.ReadRequest) ([]byte, string, string, bool, error) {

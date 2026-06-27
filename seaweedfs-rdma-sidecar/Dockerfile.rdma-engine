@@ -12,6 +12,8 @@ RUN apt-get update && apt-get install -y \
     libc6-dev \
     linux-libc-dev \
     protobuf-compiler \
+    rdma-core \
+    libibverbs-dev \
     libucx-dev \
     && rm -rf /var/lib/apt/lists/*
 
@@ -42,6 +44,10 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     libssl3 \
     curl \
+    procps \
+    rdma-core \
+    libibverbs1 \
+    ibverbs-providers \
     && if echo "$CARGO_FEATURES" | grep -q real-ucx; then \
       apt-get install -y libucx0; \
     fi \
@@ -56,12 +62,19 @@ WORKDIR /app
 # Copy binaries from builder stage
 COPY --from=builder /app/target/release/rdma-engine-server .
 COPY --from=builder /app/target/release/volume-rdma-engine .
+COPY --from=builder /app/target/release/volume-rdma-read-selftest .
 
 # Change ownership
 RUN chown -R appuser:appuser /app
 
 # Set default socket path (can be overridden)
 ENV RDMA_SOCKET_PATH=/tmp/rdma/rdma-engine.sock
+ENV VOLUME_RDMA_SOCKET_PATH=/tmp/rdma/volume-rdma-engine.sock
+ENV ENABLE_VOLUME_RDMA_ENGINE=false
+ENV VOLUME_RDMA_PROVIDER=verbs
+ENV RDMA_DEVICE=auto
+ENV RDMA_HCA_PORT=1
+ENV RDMA_GID_INDEX=0
 
 # Create socket directory with proper permissions (before switching user)
 RUN mkdir -p /tmp/rdma && chown -R appuser:appuser /tmp/rdma
@@ -76,4 +89,4 @@ HEALTHCHECK --interval=5s --timeout=3s --start-period=10s --retries=3 \
     CMD pgrep rdma-engine-server >/dev/null && test -S "$RDMA_SOCKET_PATH"
 
 # Default command using environment variable
-CMD sh -c "./rdma-engine-server --debug --ipc-socket \"$RDMA_SOCKET_PATH\""
+CMD sh -c "if [ \"$ENABLE_VOLUME_RDMA_ENGINE\" = \"true\" ]; then ./volume-rdma-engine --socket \"$VOLUME_RDMA_SOCKET_PATH\" --provider \"$VOLUME_RDMA_PROVIDER\" --device \"$RDMA_DEVICE\" --port \"$RDMA_HCA_PORT\" --gid-index \"$RDMA_GID_INDEX\" ${VOLUME_RDMA_FALLBACK_MOCK:+--fallback-mock} --debug & fi; exec ./rdma-engine-server --debug --ipc-socket \"$RDMA_SOCKET_PATH\""

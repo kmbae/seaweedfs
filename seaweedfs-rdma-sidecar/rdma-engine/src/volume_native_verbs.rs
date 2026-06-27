@@ -1,6 +1,6 @@
 use crate::volume_native::{
     VolumeRdmaDataDesc, VolumeRdmaEndpointInfo, VolumeRdmaProvider, VolumeRdmaRegisteredRead,
-    VolumeRdmaRemoteInfo, ABI_VERSION, LINK_ETHERNET, LINK_INFINIBAND,
+    VolumeRdmaRemoteInfo, VolumeRdmaRequester, ABI_VERSION, LINK_ETHERNET, LINK_INFINIBAND,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -251,6 +251,26 @@ impl RealVerbsVolumeRdmaRequester {
             .resources
             .poll_read_completion(wr_id, desc.length, timeout)?;
         local.into_vec()
+    }
+}
+
+#[async_trait]
+impl VolumeRdmaRequester for RealVerbsVolumeRdmaRequester {
+    async fn local_endpoint(&self) -> Result<VolumeRdmaEndpointInfo> {
+        self.local_endpoint_info()
+    }
+
+    async fn connect_endpoint(&self, remote: VolumeRdmaRemoteInfo) -> Result<()> {
+        self.connect_remote(remote)
+    }
+
+    async fn read_remote(&self, desc: VolumeRdmaDataDesc, timeout_ms: u64) -> Result<Vec<u8>> {
+        let timeout = if timeout_ms == 0 {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_millis(timeout_ms)
+        };
+        RealVerbsVolumeRdmaRequester::read_remote(self, &desc, timeout)
     }
 }
 

@@ -1,9 +1,11 @@
 use clap::{Parser, ValueEnum};
 use rdma_engine::volume_native::{
-    MockVolumeRdmaProvider, VolumeEngineConfig, VolumeNativeEngine, VolumeRdmaProvider,
-    LINK_INFINIBAND,
+    MockVolumeRdmaProvider, MockVolumeRdmaRequester, VolumeEngineConfig, VolumeNativeEngine,
+    VolumeRdmaProvider, VolumeRdmaRequester, LINK_INFINIBAND,
 };
-use rdma_engine::volume_native_verbs::{RealVerbsVolumeRdmaProvider, VolumeVerbsConfig};
+use rdma_engine::volume_native_verbs::{
+    RealVerbsVolumeRdmaProvider, RealVerbsVolumeRdmaRequester, VolumeVerbsConfig,
+};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt::layer, prelude::*, EnvFilter};
@@ -97,15 +99,16 @@ async fn main() -> anyhow::Result<()> {
         mock_addr_stride: args.mock_addr_stride,
         mock_rkey: args.mock_rkey,
     };
-    let provider = build_provider(&args, config)?;
+    let (provider, requester) = build_provider_and_requester(&args, config)?;
 
     info!(
         "starting volume RDMA engine on {} with {:?} provider",
         args.socket, args.provider
     );
-    let engine = Arc::new(VolumeNativeEngine::with_provider(
+    let engine = Arc::new(VolumeNativeEngine::with_provider_and_requester(
         args.socket.clone(),
         provider,
+        Some(requester),
     ));
     let engine_task = {
         let engine = engine.clone();
@@ -140,14 +143,17 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn build_provider(
+fn build_provider_and_requester(
     args: &Args,
     mock_config: VolumeEngineConfig,
-) -> anyhow::Result<Arc<dyn VolumeRdmaProvider>> {
+) -> anyhow::Result<(Arc<dyn VolumeRdmaProvider>, Arc<dyn VolumeRdmaRequester>)> {
     match args.provider {
         ProviderMode::Mock => {
             warn!("volume-rdma-engine mock provider validates IPC flow, not hardware RDMA performance");
-            Ok(Arc::new(MockVolumeRdmaProvider::new(mock_config)))
+            Ok((
+                Arc::new(MockVolumeRdmaProvider::new(mock_config.clone())),
+                Arc::new(MockVolumeRdmaRequester::new(mock_config)),
+            ))
         }
         ProviderMode::Verbs => {
             let port = u8::try_from(args.port)
@@ -159,17 +165,42 @@ fn build_provider(
                 psn: args.psn,
                 ..VolumeVerbsConfig::default()
             });
-            match provider {
-                Ok(provider) => Ok(Arc::new(provider)),
-                Err(err) if args.fallback_mock => {
-                    warn!("verbs provider initialization failed, falling back to mock: {err:#}");
-                    Ok(Arc::new(MockVolumeRdmaProvider::new(mock_config)))
+            let requester = RealVerbsVolumeRdmaRequester::new(VolumeVerbsConfig {
+                device: args.device.clone(),
+                port,
+                gid_index: args.gid_index as libc::c_int,
+                psn: next_psn(args.psn),
+                ..VolumeVerbsConfig::default()
+            });
+            match (provider, requester) {
+                (Ok(provider), Ok(requester)) => Ok((Arc::new(provider), Arc::new(requester))),
+                (provider_result, requester_result) if args.fallback_mock => {
+                    warn!(
+                        "verbs provider/requester initialization failed, falling back to mock: provider={:?} requester={:?}",
+                        provider_result.err(),
+                        requester_result.err()
+                    );
+                    Ok((
+                        Arc::new(MockVolumeRdmaProvider::new(mock_config.clone())),
+                        Arc::new(MockVolumeRdmaRequester::new(mock_config)),
+                    ))
                 }
-                Err(err) => Err(anyhow::anyhow!(
-                    "verbs provider initialization failed; use --fallback-mock only for IPC tests: {err:#}"
+                (provider_result, requester_result) => Err(anyhow::anyhow!(
+                    "verbs provider/requester initialization failed; use --fallback-mock only for IPC tests: provider={:?} requester={:?}",
+                    provider_result.err(),
+                    requester_result.err()
                 )),
             }
         }
+    }
+}
+
+fn next_psn(psn: u32) -> u32 {
+    let next = (psn.wrapping_add(1)) & 0x00ff_ffff;
+    if next == 0 {
+        1
+    } else {
+        next
     }
 }
 
@@ -223,5 +254,11 @@ mod tests {
     fn auto_device_maps_to_mock_name_for_mock_provider() {
         assert_eq!(mock_device_name("auto"), "mock-volume-rdma");
         assert_eq!(mock_device_name("mlx5_0"), "mlx5_0");
+    }
+
+    #[test]
+    fn requester_psn_wraps_without_zero() {
+        assert_eq!(next_psn(0x00ff_ffff), 1);
+        assert_eq!(next_psn(0x00ab_cdef), 0x00ab_cdf0);
     }
 }

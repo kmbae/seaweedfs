@@ -21,19 +21,22 @@ import (
 )
 
 var (
-	port              int
-	engineSocket      string
-	volumeServerURL   string
-	volumeDataDir     string
-	volumeIdxDir      string
-	volumeCollection  string
-	enableRDMA        bool
-	enablePayloadRDMA bool
-	enableZeroCopy    bool
-	tempDir           string
-	maxConnections    int
-	debug             bool
-	timeout           time.Duration
+	port                   int
+	engineSocket           string
+	nativeEngineSocket     string
+	volumeServerURL        string
+	volumeDataDir          string
+	volumeIdxDir           string
+	volumeCollection       string
+	enableRDMA             bool
+	enablePayloadRDMA      bool
+	enableNativeVolumeRDMA bool
+	enableZeroCopy         bool
+	tempDir                string
+	maxConnections         int
+	nativeServiceLevel     uint32
+	debug                  bool
+	timeout                time.Duration
 )
 
 func main() {
@@ -51,15 +54,18 @@ When the engine runs in mock mode, needle data is loaded from the local volume d
 
 	rootCmd.Flags().IntVarP(&port, "port", "p", 8081, "HTTP server port")
 	rootCmd.Flags().StringVarP(&engineSocket, "engine-socket", "e", "/tmp/rdma-engine.sock", "Path to RDMA engine Unix socket")
+	rootCmd.Flags().StringVar(&nativeEngineSocket, "native-engine-socket", "/tmp/volume-rdma-engine.sock", "Path to native verbs volume RDMA engine Unix socket")
 	rootCmd.Flags().StringVarP(&volumeServerURL, "volume-server", "v", "http://127.0.0.1:8444", "Default SeaweedFS volume server URL for HTTP fallback")
 	rootCmd.Flags().StringVar(&volumeDataDir, "volume-data-dir", "", "Local volume data directory shared with the volume server (e.g. /data)")
 	rootCmd.Flags().StringVar(&volumeIdxDir, "volume-idx-dir", "", "Local volume index directory (defaults to volume-data-dir)")
 	rootCmd.Flags().StringVar(&volumeCollection, "volume-collection", "", "Volume collection name when using local reads")
 	rootCmd.Flags().BoolVar(&enableRDMA, "enable-rdma", true, "Enable RDMA engine session coordination")
 	rootCmd.Flags().BoolVar(&enablePayloadRDMA, "enable-payload-rdma", false, "Enable experimental RDMA payload transfer")
+	rootCmd.Flags().BoolVar(&enableNativeVolumeRDMA, "enable-native-volume-rdma", false, "Enable native verbs volume-server RDMA READ path")
 	rootCmd.Flags().BoolVar(&enableZeroCopy, "enable-zerocopy", true, "Enable zero-copy temp file optimization")
 	rootCmd.Flags().StringVar(&tempDir, "temp-dir", "/tmp/rdma-cache", "Temp directory for zero-copy files")
 	rootCmd.Flags().IntVar(&maxConnections, "max-connections", 8, "Maximum RDMA engine IPC connections")
+	rootCmd.Flags().Uint32Var(&nativeServiceLevel, "native-rdma-service-level", 0, "RDMA service level for native volume RDMA QP handshakes")
 	rootCmd.Flags().BoolVarP(&debug, "debug", "d", false, "Enable debug logging")
 	rootCmd.Flags().DurationVarP(&timeout, "timeout", "t", 30*time.Second, "RDMA operation timeout")
 
@@ -78,29 +84,34 @@ func runSidecar(cmd *cobra.Command, args []string) error {
 	}
 
 	logger.WithFields(logrus.Fields{
-		"port":                port,
-		"engine_socket":       engineSocket,
-		"volume_server_url":   volumeServerURL,
-		"volume_data_dir":     volumeDataDir,
-		"enable_rdma":         enableRDMA,
-		"enable_payload_rdma": enablePayloadRDMA,
-		"max_connections":     maxConnections,
+		"port":                      port,
+		"engine_socket":             engineSocket,
+		"native_engine_socket":      nativeEngineSocket,
+		"volume_server_url":         volumeServerURL,
+		"volume_data_dir":           volumeDataDir,
+		"enable_rdma":               enableRDMA,
+		"enable_payload_rdma":       enablePayloadRDMA,
+		"enable_native_volume_rdma": enableNativeVolumeRDMA,
+		"max_connections":           maxConnections,
 	}).Info("Starting SeaweedFS RDMA sidecar")
 
 	sfClient, err := seaweedfs.NewSeaweedFSRDMAClient(&seaweedfs.Config{
-		RDMASocketPath:    engineSocket,
-		VolumeServerURL:   volumeServerURL,
-		Enabled:           enableRDMA,
-		EnablePayloadRDMA: enablePayloadRDMA,
-		DefaultTimeout:    timeout,
-		Logger:            logger,
-		UseZeroCopy:       enableZeroCopy,
-		TempDir:           tempDir,
-		EnablePooling:     true,
-		MaxConnections:    maxConnections,
-		VolumeDataDir:     volumeDataDir,
-		VolumeIdxDir:      volumeIdxDir,
-		VolumeCollection:  volumeCollection,
+		RDMASocketPath:         engineSocket,
+		NativeEngineSocketPath: nativeEngineSocket,
+		VolumeServerURL:        volumeServerURL,
+		Enabled:                enableRDMA,
+		EnablePayloadRDMA:      enablePayloadRDMA,
+		EnableNativeVolumeRDMA: enableNativeVolumeRDMA,
+		NativeRDMAServiceLevel: nativeServiceLevel,
+		DefaultTimeout:         timeout,
+		Logger:                 logger,
+		UseZeroCopy:            enableZeroCopy,
+		TempDir:                tempDir,
+		EnablePooling:          true,
+		MaxConnections:         maxConnections,
+		VolumeDataDir:          volumeDataDir,
+		VolumeIdxDir:           volumeIdxDir,
+		VolumeCollection:       volumeCollection,
 	})
 	if err != nil {
 		return fmt.Errorf("create seaweedfs client: %w", err)
