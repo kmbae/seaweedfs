@@ -25,30 +25,31 @@ import (
 const defaultRDMAMinSize = 8 << 20
 
 var (
-	devPath           string
-	filerAddresses    string
-	engineSocket      string
-	enableReadRDMA    bool
-	enableWriteRDMA   bool
-	enablePayloadRDMA bool
-	readRDMAMinSize   uint64
-	writeRDMAMinSize  uint64
-	forceRDMA         bool
-	fallbackOnError   bool
-	rdmaControlListen string
-	rdmaPeerEndpoints string
-	rdmaPeerMinCount  int
-	rdmaPeerSL        uint32
-	rdmaPeerInterval  time.Duration
-	rdmaPeerTimeout   time.Duration
-	maxConnections    int
-	deviceBufferPool  int
-	timeout           time.Duration
-	collection        string
-	replication       string
-	dataCenter        string
-	diskType          string
-	debug             bool
+	devPath                string
+	filerAddresses         string
+	engineSocket           string
+	enableReadRDMA         bool
+	enableWriteRDMA        bool
+	enablePayloadRDMA      bool
+	enableVolumeNativeRDMA bool
+	readRDMAMinSize        uint64
+	writeRDMAMinSize       uint64
+	forceRDMA              bool
+	fallbackOnError        bool
+	rdmaControlListen      string
+	rdmaPeerEndpoints      string
+	rdmaPeerMinCount       int
+	rdmaPeerSL             uint32
+	rdmaPeerInterval       time.Duration
+	rdmaPeerTimeout        time.Duration
+	maxConnections         int
+	deviceBufferPool       int
+	timeout                time.Duration
+	collection             string
+	replication            string
+	dataCenter             string
+	diskType               string
+	debug                  bool
 )
 
 func main() {
@@ -67,6 +68,7 @@ carries RDMA preference hints.`,
 	root.Flags().BoolVar(&enableReadRDMA, "enable-read-rdma", false, "prefer RDMA for READ requests carrying the kernel RDMA hint")
 	root.Flags().BoolVar(&enableWriteRDMA, "enable-write-rdma", false, "prefer RDMA for WRITE requests carrying the kernel RDMA hint")
 	root.Flags().BoolVar(&enablePayloadRDMA, "enable-payload-rdma", false, "enable real payload RDMA in the SeaweedFS data plane")
+	root.Flags().BoolVar(&enableVolumeNativeRDMA, "enable-volume-native-rdma", false, "try volume-server-native RDMA read descriptors before sidecar/kernel-MR staging")
 	root.Flags().Uint64Var(&readRDMAMinSize, "rdma-read-min-size", defaultRDMAMinSize, "minimum READ size in bytes before RDMA is considered; set 0 to allow all hinted reads")
 	root.Flags().Uint64Var(&writeRDMAMinSize, "rdma-write-min-size", defaultRDMAMinSize, "minimum WRITE size in bytes before RDMA is considered; set 0 to allow all hinted writes")
 	root.Flags().BoolVar(&forceRDMA, "force-rdma", false, "prefer RDMA for READ and WRITE even when the kernel request has no RDMA hint")
@@ -159,6 +161,12 @@ func run(cmd *cobra.Command, args []string) error {
 		Store:  store,
 		Router: router,
 	}
+	if enableVolumeNativeRDMA {
+		backend.NativeReadDescriptor = &swvfsdaemon.VolumeNativeRDMAReadDescriptorClient{
+			Timeout: rdmaPeerTimeout,
+			Stats:   stats,
+		}
+	}
 	if len(peerList) > 0 {
 		backend.ReadDescriptorBackend = &swvfsdaemon.RemoteRDMAReadDescriptorClient{
 			Control: rdmaControl,
@@ -188,18 +196,19 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 
 	logger.WithFields(logrus.Fields{
-		"dev":               devPath,
-		"filers":            filerAddresses,
-		"read_rdma":         enableReadRDMA,
-		"write_rdma":        enableWriteRDMA,
-		"payload_rdma":      enablePayloadRDMA,
-		"rdma_read_min":     readRDMAMinSize,
-		"rdma_write_min":    writeRDMAMinSize,
-		"force_rdma":        forceRDMA,
-		"fallback_on_error": fallbackOnError,
-		"rdma_control":      rdmaControlListen,
-		"rdma_peers":        rdmaPeerEndpoints,
-		"device_buf_pool":   deviceBufferPool,
+		"dev":                devPath,
+		"filers":             filerAddresses,
+		"read_rdma":          enableReadRDMA,
+		"write_rdma":         enableWriteRDMA,
+		"payload_rdma":       enablePayloadRDMA,
+		"volume_native_rdma": enableVolumeNativeRDMA,
+		"rdma_read_min":      readRDMAMinSize,
+		"rdma_write_min":     writeRDMAMinSize,
+		"force_rdma":         forceRDMA,
+		"fallback_on_error":  fallbackOnError,
+		"rdma_control":       rdmaControlListen,
+		"rdma_peers":         rdmaPeerEndpoints,
+		"device_buf_pool":    deviceBufferPool,
 	}).Info("starting swvfs RDMA daemon")
 
 	if rdmaControlListen != "" {

@@ -143,6 +143,44 @@ func (p *capturePlane) WriteNeedle(ctx context.Context, req swvfsdaemon.NeedleWr
 	return &swvfsdaemon.NeedleWriteResult{FileID: req.FileID, Source: "rdma", UsedRDMA: req.PreferRDMA}, nil
 }
 
+type captureNativeReadDescriptor struct {
+	calls int
+	req   swvfsdaemon.NeedleReadDescriptorRequest
+	desc  swvfsproto.RDMADataDesc
+	err   error
+}
+
+func (c *captureNativeReadDescriptor) ReadNeedleRDMA(ctx context.Context, req swvfsdaemon.NeedleReadDescriptorRequest) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
+	c.calls++
+	c.req = req
+	if c.err != nil {
+		return nil, nil, c.err
+	}
+	return &c.desc, nil, nil
+}
+
+func (c *captureNativeReadDescriptor) ReleaseReadDescriptor(ctx context.Context, leaseID uint64, status int32, bytes uint64) error {
+	c.calls++
+	return nil
+}
+
+type captureReadDescriptor struct {
+	calls int
+	path  string
+	desc  swvfsproto.RDMADataDesc
+}
+
+func (c *captureReadDescriptor) ReadFileRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
+	c.calls++
+	c.path = path
+	return &c.desc, nil, nil
+}
+
+func (c *captureReadDescriptor) ReleaseReadDescriptor(ctx context.Context, leaseID uint64, status int32, bytes uint64) error {
+	c.calls++
+	return nil
+}
+
 func TestBackendReadUsesRDMAHint(t *testing.T) {
 	store := &fakeStore{entries: map[string]*filer_pb.Entry{
 		"/file": {
@@ -181,6 +219,85 @@ func TestBackendReadUsesRDMAHint(t *testing.T) {
 	}
 	if attr.Size != 10 {
 		t.Fatalf("attr size = %d", attr.Size)
+	}
+}
+
+func TestBackendReadFileRDMAPrefersNativeSingleChunk(t *testing.T) {
+	store := &fakeStore{entries: map[string]*filer_pb.Entry{
+		"/file": {
+			Name: "file",
+			Attributes: &filer_pb.FuseAttributes{
+				FileMode: 0644,
+				FileSize: 1024,
+			},
+			Chunks: []*filer_pb.FileChunk{{
+				FileId:       "3,01637037d6",
+				Offset:       0,
+				Size:         1024,
+				ModifiedTsNs: 1,
+			}},
+		},
+	}}
+	native := &captureNativeReadDescriptor{desc: swvfsproto.RDMADataDesc{RemoteAddr: 0xbeef, RKey: 99, Length: 512}}
+	staging := &captureReadDescriptor{desc: swvfsproto.RDMADataDesc{RemoteAddr: 0xdead, RKey: 7, Length: 512}}
+	backend := &Backend{
+		Store:                 store,
+		NativeReadDescriptor:  native,
+		ReadDescriptorBackend: staging,
+	}
+
+	desc, attr, err := backend.ReadFileRDMA(context.Background(), "/file", 128, 512)
+	if err != nil {
+		t.Fatalf("ReadFileRDMA: %v", err)
+	}
+	if native.calls != 1 || staging.calls != 0 {
+		t.Fatalf("native/staging calls = %d/%d", native.calls, staging.calls)
+	}
+	if native.req.VolumeID != 3 || native.req.NeedleID == 0 || native.req.VolumeServer != "http://vol:8080" {
+		t.Fatalf("unexpected native request: %+v", native.req)
+	}
+	if native.req.Offset != 128 || native.req.Size != 512 {
+		t.Fatalf("unexpected native range: %+v", native.req)
+	}
+	if desc.RemoteAddr != 0xbeef || attr == nil || attr.Size != 1024 {
+		t.Fatalf("desc=%+v attr=%+v", desc, attr)
+	}
+}
+
+func TestBackendReadFileRDMAFallsBackForMultiChunk(t *testing.T) {
+	store := &fakeStore{entries: map[string]*filer_pb.Entry{
+		"/file": {
+			Name: "file",
+			Attributes: &filer_pb.FuseAttributes{
+				FileMode: 0644,
+				FileSize: 2048,
+			},
+			Chunks: []*filer_pb.FileChunk{
+				{FileId: "3,01637037d6", Offset: 0, Size: 1024, ModifiedTsNs: 1},
+				{FileId: "4,01637037d7", Offset: 1024, Size: 1024, ModifiedTsNs: 2},
+			},
+		},
+	}}
+	native := &captureNativeReadDescriptor{desc: swvfsproto.RDMADataDesc{RemoteAddr: 0xbeef, RKey: 99, Length: 2048}}
+	staging := &captureReadDescriptor{desc: swvfsproto.RDMADataDesc{RemoteAddr: 0xdead, RKey: 7, Length: 2048}}
+	backend := &Backend{
+		Store:                 store,
+		NativeReadDescriptor:  native,
+		ReadDescriptorBackend: staging,
+	}
+
+	desc, _, err := backend.ReadFileRDMA(context.Background(), "/file", 0, 2048)
+	if err != nil {
+		t.Fatalf("ReadFileRDMA: %v", err)
+	}
+	if native.calls != 0 || staging.calls != 1 {
+		t.Fatalf("native/staging calls = %d/%d", native.calls, staging.calls)
+	}
+	if staging.path != "/file" {
+		t.Fatalf("staging path = %q", staging.path)
+	}
+	if desc.RemoteAddr != 0xdead {
+		t.Fatalf("desc = %+v", desc)
 	}
 }
 

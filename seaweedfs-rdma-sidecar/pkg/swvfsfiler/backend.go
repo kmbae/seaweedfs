@@ -38,6 +38,7 @@ type MetadataStore interface {
 type Backend struct {
 	Store                  MetadataStore
 	Router                 *swvfsdaemon.Router
+	NativeReadDescriptor   swvfsdaemon.NeedleReadDescriptorBackend
 	ReadDescriptorBackend  swvfsdaemon.RDMAReadDescriptorBackend
 	WriteDescriptorBackend swvfsdaemon.RDMAWriteDescriptorBackend
 
@@ -727,14 +728,34 @@ func (b *Backend) ReadFile(ctx context.Context, fullPath string, offset, size ui
 }
 
 func (b *Backend) ReadFileRDMA(ctx context.Context, fullPath string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
-	if b == nil || b.ReadDescriptorBackend == nil {
+	if b == nil {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma read descriptor backend is not configured"}
+	}
+	if b.NativeReadDescriptor != nil {
+		if desc, attr, err := b.readFileNativeRDMA(ctx, fullPath, offset, size); err == nil && desc != nil {
+			return desc, attr, nil
+		} else if err != nil && !isDescriptorFallback(err) {
+			return nil, nil, err
+		}
+	}
+	if b.ReadDescriptorBackend == nil {
 		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma read descriptor backend is not configured"}
 	}
 	return b.ReadDescriptorBackend.ReadFileRDMA(ctx, cleanFullPath(fullPath), offset, size)
 }
 
 func (b *Backend) ReleaseReadDescriptor(ctx context.Context, leaseID uint64, status int32, bytes uint64) error {
-	if b == nil || b.ReadDescriptorBackend == nil {
+	if b == nil {
+		return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma read descriptor backend is not configured"}
+	}
+	if swvfsdaemon.IsNativeReadLease(leaseID) {
+		releaser, ok := b.NativeReadDescriptor.(swvfsdaemon.RDMAReadDescriptorReleaseBackend)
+		if !ok {
+			return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native rdma read descriptor release backend is not configured"}
+		}
+		return releaser.ReleaseReadDescriptor(ctx, leaseID, status, bytes)
+	}
+	if b.ReadDescriptorBackend == nil {
 		return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma read descriptor backend is not configured"}
 	}
 	releaser, ok := b.ReadDescriptorBackend.(swvfsdaemon.RDMAReadDescriptorReleaseBackend)
@@ -742,6 +763,84 @@ func (b *Backend) ReleaseReadDescriptor(ctx context.Context, leaseID uint64, sta
 		return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma read descriptor release backend is not configured"}
 	}
 	return releaser.ReleaseReadDescriptor(ctx, leaseID, status, bytes)
+}
+
+func (b *Backend) readFileNativeRDMA(ctx context.Context, fullPath string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
+	if b == nil || b.Store == nil || b.NativeReadDescriptor == nil {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native rdma read descriptor backend is not configured"}
+	}
+	fullPath = cleanFullPath(fullPath)
+	pending := b.pendingSnapshot(fullPath)
+	if pending != nil {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native rdma read descriptor does not support pending writes"}
+	}
+	entry, err := b.Store.LookupEntry(ctx, fullPath)
+	if err != nil {
+		return nil, nil, mapLookupErr(err)
+	}
+	if entry.IsDirectory {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoInval, Msg: "cannot read a directory"}
+	}
+	if len(entry.Content) > 0 {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native rdma read descriptor does not support inline filer content"}
+	}
+	attr := AttrFromEntry(fullPath, entry)
+	if offset >= attr.Size || size == 0 {
+		return nil, attr, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native rdma read descriptor requires a non-empty file range"}
+	}
+	readSize := minUint64(size, attr.Size-offset)
+	views, err := visibleChunkViews(entry.GetChunks(), int64(offset), int64(readSize))
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(views) != 1 {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native rdma read descriptor supports one chunk per request"}
+	}
+	view := views[0]
+	if view.size == 0 {
+		return nil, attr, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native rdma read descriptor got an empty chunk view"}
+	}
+	if len(view.cipherKey) > 0 || view.isGzipped {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native rdma read descriptor does not support encrypted or compressed chunks"}
+	}
+	volumeID, needleID, cookie, err := ParseFileID(view.fileID)
+	if err != nil {
+		return nil, nil, err
+	}
+	volumeServer, err := b.volumeServerForFileID(ctx, view.fileID)
+	if err != nil {
+		return nil, nil, err
+	}
+	desc, _, err := b.NativeReadDescriptor.ReadNeedleRDMA(ctx, swvfsdaemon.NeedleReadDescriptorRequest{
+		FileID:       view.fileID,
+		VolumeID:     volumeID,
+		NeedleID:     needleID,
+		Cookie:       cookie,
+		VolumeServer: volumeServer,
+		RDMAServer:   volumeServer,
+		Offset:       uint64(view.offsetInChunk),
+		Size:         uint64(view.size),
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	if desc == nil {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native rdma read descriptor returned no descriptor"}
+	}
+	return desc, attr, nil
+}
+
+func isDescriptorFallback(err error) bool {
+	var errno swvfsdaemon.ErrnoError
+	if !errors.As(err, &errno) {
+		return false
+	}
+	switch errno.Errno {
+	case swvfsdaemon.ErrnoNoSys, swvfsdaemon.ErrnoTooLarge:
+		return true
+	default:
+		return false
+	}
 }
 
 func (b *Backend) PrepareWriteRDMA(ctx context.Context, fullPath string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
