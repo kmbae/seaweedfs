@@ -42,11 +42,11 @@ type VolumeServer struct {
 	currentMaster     pb.ServerAddress
 	currentMasterLock sync.RWMutex
 	pulsePeriod       time.Duration
-	dataCenter      string
-	rack            string
-	store           *storage.Store
-	guard           *security.Guard
-	grpcDialOption  grpc.DialOption
+	dataCenter        string
+	rack              string
+	store             *storage.Store
+	guard             *security.Guard
+	grpcDialOption    grpc.DialOption
 
 	needleMapKind                 storage.NeedleMapKind
 	ldbTimout                     int64
@@ -58,6 +58,7 @@ type VolumeServer struct {
 	metricsAddress                string
 	metricsIntervalSec            int
 	fileSizeLimitBytes            int64
+	rdmaReadExporter              VolumeRdmaReadExporter
 	isHeartbeating                bool
 	stopChan                      chan bool
 }
@@ -149,6 +150,8 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 			adminMux.HandleFunc("/stats/disk", vs.guard.WhiteList(vs.statsDiskHandler))
 		*/
 	}
+	adminMux.HandleFunc("/rdma/native/read-desc", requestIDMiddleware(vs.guard.WhiteList(vs.volumeRdmaReadDescHandler)))
+	adminMux.HandleFunc("/rdma/native/release-desc", requestIDMiddleware(vs.guard.WhiteList(vs.volumeRdmaReleaseDescHandler)))
 	adminMux.HandleFunc("/", requestIDMiddleware(vs.privateStoreHandler))
 	if publicMux != adminMux {
 		// separated admin and public port
