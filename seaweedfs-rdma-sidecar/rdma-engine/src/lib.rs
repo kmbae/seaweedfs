@@ -38,6 +38,7 @@ pub mod session;
 pub mod ucx;
 pub mod volume_grpc;
 pub mod volume_native;
+pub mod volume_native_verbs;
 
 pub use error::{RdmaError, RdmaResult};
 

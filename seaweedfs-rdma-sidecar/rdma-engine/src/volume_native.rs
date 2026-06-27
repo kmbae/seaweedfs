@@ -15,6 +15,7 @@ use tracing::{debug, info, warn};
 
 pub const ABI_VERSION: u32 = 1;
 pub const LINK_INFINIBAND: u32 = 1;
+pub const LINK_ETHERNET: u32 = 2;
 pub const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 
 const DEFAULT_MOCK_BASE_ADDR: u64 = 0x7f00_0000_0000;

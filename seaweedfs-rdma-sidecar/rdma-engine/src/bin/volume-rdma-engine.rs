@@ -1,8 +1,18 @@
-use clap::Parser;
-use rdma_engine::volume_native::{VolumeEngineConfig, VolumeNativeEngine, LINK_INFINIBAND};
+use clap::{Parser, ValueEnum};
+use rdma_engine::volume_native::{
+    MockVolumeRdmaProvider, VolumeEngineConfig, VolumeNativeEngine, VolumeRdmaProvider,
+    LINK_INFINIBAND,
+};
+use rdma_engine::volume_native_verbs::{RealVerbsVolumeRdmaProvider, VolumeVerbsConfig};
 use std::sync::Arc;
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt::layer, prelude::*, EnvFilter};
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq, ValueEnum)]
+enum ProviderMode {
+    Mock,
+    Verbs,
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -15,11 +25,15 @@ struct Args {
     #[arg(long, default_value = "/tmp/volume-rdma-engine.sock")]
     socket: String,
 
-    /// RDMA device name reported to SeaweedFS. Mock mode does not open it.
-    #[arg(long, default_value = "mock-volume-rdma")]
+    /// Provider backend for endpoint and memory registration.
+    #[arg(long, value_enum, default_value_t = ProviderMode::Mock)]
+    provider: ProviderMode,
+
+    /// RDMA device name. Use 'auto' to select the first verbs device.
+    #[arg(long, default_value = "auto")]
     device: String,
 
-    /// RDMA port number reported to SeaweedFS.
+    /// RDMA HCA port number.
     #[arg(long, default_value_t = 1)]
     port: u32,
 
@@ -55,6 +69,10 @@ struct Args {
     #[arg(long, default_value_t = 0x5eed_0001)]
     mock_rkey: u32,
 
+    /// Fall back to mock provider if verbs initialization fails.
+    #[arg(long)]
+    fallback_mock: bool,
+
     /// Enable debug logging.
     #[arg(long)]
     debug: bool,
@@ -65,24 +83,30 @@ async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
     init_tracing(args.debug);
 
-    warn!("volume-rdma-engine currently runs a mock provider; descriptors validate IPC flow, not hardware RDMA performance");
-    info!("starting volume RDMA engine on {}", args.socket);
-
     let config = VolumeEngineConfig {
         socket_path: args.socket.clone(),
-        device: args.device,
+        device: mock_device_name(&args.device),
         port: args.port,
         qpn: args.qpn,
         psn: args.psn,
         lid: args.lid,
         gid_index: args.gid_index,
-        gid: args.gid,
+        gid: args.gid.clone(),
         link_layer: LINK_INFINIBAND,
         mock_base_addr: args.mock_base_addr,
         mock_addr_stride: args.mock_addr_stride,
         mock_rkey: args.mock_rkey,
     };
-    let engine = Arc::new(VolumeNativeEngine::new(config));
+    let provider = build_provider(&args, config)?;
+
+    info!(
+        "starting volume RDMA engine on {} with {:?} provider",
+        args.socket, args.provider
+    );
+    let engine = Arc::new(VolumeNativeEngine::with_provider(
+        args.socket.clone(),
+        provider,
+    ));
     let engine_task = {
         let engine = engine.clone();
         tokio::spawn(async move { engine.run().await })
@@ -116,6 +140,47 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+fn build_provider(
+    args: &Args,
+    mock_config: VolumeEngineConfig,
+) -> anyhow::Result<Arc<dyn VolumeRdmaProvider>> {
+    match args.provider {
+        ProviderMode::Mock => {
+            warn!("volume-rdma-engine mock provider validates IPC flow, not hardware RDMA performance");
+            Ok(Arc::new(MockVolumeRdmaProvider::new(mock_config)))
+        }
+        ProviderMode::Verbs => {
+            let port = u8::try_from(args.port)
+                .map_err(|_| anyhow::anyhow!("verbs port must fit in u8: {}", args.port))?;
+            let provider = RealVerbsVolumeRdmaProvider::new(VolumeVerbsConfig {
+                device: args.device.clone(),
+                port,
+                gid_index: args.gid_index as libc::c_int,
+                psn: args.psn,
+                ..VolumeVerbsConfig::default()
+            });
+            match provider {
+                Ok(provider) => Ok(Arc::new(provider)),
+                Err(err) if args.fallback_mock => {
+                    warn!("verbs provider initialization failed, falling back to mock: {err:#}");
+                    Ok(Arc::new(MockVolumeRdmaProvider::new(mock_config)))
+                }
+                Err(err) => Err(anyhow::anyhow!(
+                    "verbs provider initialization failed; use --fallback-mock only for IPC tests: {err:#}"
+                )),
+            }
+        }
+    }
+}
+
+fn mock_device_name(raw: &str) -> String {
+    if raw.trim().is_empty() || raw.trim() == "auto" {
+        "mock-volume-rdma".to_string()
+    } else {
+        raw.to_string()
+    }
+}
+
 fn init_tracing(debug: bool) {
     let filter = if debug {
         EnvFilter::try_from_default_env()
@@ -146,5 +211,17 @@ mod tests {
     fn parses_socket() {
         let args = Args::try_parse_from(["volume-rdma-engine", "--socket", "/tmp/v.sock"]).unwrap();
         assert_eq!(args.socket, "/tmp/v.sock");
+    }
+
+    #[test]
+    fn parses_provider_verbs() {
+        let args = Args::try_parse_from(["volume-rdma-engine", "--provider", "verbs"]).unwrap();
+        assert_eq!(args.provider, ProviderMode::Verbs);
+    }
+
+    #[test]
+    fn auto_device_maps_to_mock_name_for_mock_provider() {
+        assert_eq!(mock_device_name("auto"), "mock-volume-rdma");
+        assert_eq!(mock_device_name("mlx5_0"), "mlx5_0");
     }
 }
