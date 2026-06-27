@@ -81,7 +81,7 @@ func TestKernelMRReadStagerStagesDataIntoKernelMR(t *testing.T) {
 	if string(control.written) != "data" || control.allocLength != 4 {
 		t.Fatalf("staged data mismatch: data=%q alloc=%d", control.written, control.allocLength)
 	}
-	if lease.Attr == nil || lease.Attr.Ino != 1 || reader.readPreferRDMA {
+	if lease.Attr == nil || lease.Attr.Ino != 1 || !reader.readPreferRDMA {
 		t.Fatalf("reader contract mismatch: attr=%+v prefer=%v", lease.Attr, reader.readPreferRDMA)
 	}
 	if err := stager.ReleaseReadRDMA(context.Background(), lease.SessionID); err != nil {

@@ -51,7 +51,7 @@ func (s *KernelMRReadStager) StageReadRDMA(ctx context.Context, path string, off
 	if size > swvfsproto.RDMAIOMax {
 		return nil, ErrnoError{Errno: ErrnoTooLarge, Msg: "rdma read descriptor request exceeds kernel RDMA IO max"}
 	}
-	data, attr, err := s.Reader.ReadFile(ctx, path, offset, size, false)
+	data, attr, err := s.Reader.ReadFile(ctx, path, offset, size, true)
 	if err != nil {
 		s.Stats.Inc("rdma_stager_file_read_errors")
 		return nil, err
