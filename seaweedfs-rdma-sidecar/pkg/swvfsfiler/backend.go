@@ -732,6 +732,17 @@ func (b *Backend) ReadFileRDMA(ctx context.Context, fullPath string, offset, siz
 	return b.ReadDescriptorBackend.ReadFileRDMA(ctx, cleanFullPath(fullPath), offset, size)
 }
 
+func (b *Backend) ReleaseReadDescriptor(ctx context.Context, leaseID uint64, status int32, bytes uint64) error {
+	if b == nil || b.ReadDescriptorBackend == nil {
+		return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma read descriptor backend is not configured"}
+	}
+	releaser, ok := b.ReadDescriptorBackend.(swvfsdaemon.RDMAReadDescriptorReleaseBackend)
+	if !ok {
+		return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma read descriptor release backend is not configured"}
+	}
+	return releaser.ReleaseReadDescriptor(ctx, leaseID, status, bytes)
+}
+
 func (b *Backend) WriteFile(ctx context.Context, fullPath string, offset uint64, data []byte, mode, uid, gid uint32, preferRDMA bool) (*swvfsproto.Attr, error) {
 	if b == nil || b.Store == nil || b.Router == nil {
 		return nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "swvfs filer backend is not configured"}

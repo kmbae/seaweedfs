@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sync"
 	"time"
 
 	"seaweedfs-rdma-sidecar/pkg/swvfsproto"
@@ -99,6 +100,16 @@ type RemoteRDMAReadDescriptorClient struct {
 	Client       *http.Client
 	Timeout      time.Duration
 	ReleaseDelay time.Duration
+
+	mu          sync.Mutex
+	nextLeaseID uint64
+	leases      map[uint64]remoteRDMAReadLease
+}
+
+type remoteRDMAReadLease struct {
+	PeerURL   string
+	SessionID uint64
+	Created   time.Time
 }
 
 func (c *RemoteRDMAReadDescriptorClient) ReadFileRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
@@ -147,26 +158,76 @@ func (c *RemoteRDMAReadDescriptorClient) ReadFileRDMA(ctx context.Context, path 
 	if err != nil {
 		return nil, nil, ErrnoError{Errno: ErrnoNoSys, Msg: "remote rdma read descriptor unavailable: " + err.Error()}
 	}
-	c.scheduleRelease(peerURL, sessionID)
+	leaseID := c.trackLease(peerURL, sessionID)
+	if leaseID != 0 {
+		desc.Reserved[0] = leaseID
+		c.scheduleRelease(leaseID)
+	}
 	return desc, attr, nil
 }
 
-func (c *RemoteRDMAReadDescriptorClient) scheduleRelease(peerURL string, sessionID uint64) {
-	if sessionID == 0 || peerURL == "" {
-		return
+func (c *RemoteRDMAReadDescriptorClient) trackLease(peerURL string, sessionID uint64) uint64 {
+	if c == nil || sessionID == 0 || peerURL == "" {
+		return 0
 	}
-	delay := c.ReleaseDelay
-	if delay <= 0 {
-		delay = 2 * time.Second
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.leases == nil {
+		c.leases = make(map[uint64]remoteRDMAReadLease)
+	}
+	c.nextLeaseID++
+	if c.nextLeaseID == 0 {
+		c.nextLeaseID++
+	}
+	leaseID := c.nextLeaseID
+	c.leases[leaseID] = remoteRDMAReadLease{
+		PeerURL:   peerURL,
+		SessionID: sessionID,
+		Created:   time.Now(),
+	}
+	return leaseID
+}
+
+func (c *RemoteRDMAReadDescriptorClient) popLease(leaseID uint64) (remoteRDMAReadLease, bool) {
+	if c == nil || leaseID == 0 {
+		return remoteRDMAReadLease{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	lease, ok := c.leases[leaseID]
+	if ok {
+		delete(c.leases, leaseID)
+	}
+	return lease, ok
+}
+
+func (c *RemoteRDMAReadDescriptorClient) ReleaseReadDescriptor(ctx context.Context, leaseID uint64, status int32, bytes uint64) error {
+	_ = status
+	_ = bytes
+	lease, ok := c.popLease(leaseID)
+	if !ok {
+		return nil
 	}
 	timeout := c.Timeout
 	if timeout <= 0 {
 		timeout = 5 * time.Second
 	}
-	client := c.Client
+	releaseCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	return PostRDMAPeerReleaseDesc(releaseCtx, c.Client, lease.PeerURL, lease.SessionID)
+}
+
+func (c *RemoteRDMAReadDescriptorClient) scheduleRelease(leaseID uint64) {
+	if leaseID == 0 {
+		return
+	}
+	delay := c.ReleaseDelay
+	if delay <= 0 {
+		delay = 30 * time.Second
+	}
 	time.AfterFunc(delay, func() {
-		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_ = PostRDMAPeerReleaseDesc(ctx, client, peerURL, sessionID)
+		_ = c.ReleaseReadDescriptor(ctx, leaseID, 0, 0)
 	})
 }

@@ -43,6 +43,9 @@ type fakeRDMAFileBackend struct {
 	commitPath       string
 	commitOffset     uint64
 	commitSize       uint64
+	releaseLeaseID   uint64
+	releaseStatus    int32
+	releaseBytes     uint64
 	readDescFallback bool
 }
 
@@ -76,6 +79,13 @@ func (f *fakeRDMAFileBackend) CommitWriteRDMA(ctx context.Context, path string, 
 	f.commitOffset = offset
 	f.commitSize = size
 	return &swvfsproto.Attr{Ino: 10, Size: offset + size, Mode: 0100644, Nlink: 1}, nil
+}
+
+func (f *fakeRDMAFileBackend) ReleaseReadDescriptor(ctx context.Context, leaseID uint64, status int32, bytes uint64) error {
+	f.releaseLeaseID = leaseID
+	f.releaseStatus = status
+	f.releaseBytes = bytes
+	return nil
 }
 
 func (f *fakeFileBackend) StatFS(ctx context.Context, path string) (*swvfsproto.StatFS, error) {
@@ -248,6 +258,27 @@ func TestHandlerRDMAWritePrepareCommit(t *testing.T) {
 	}
 	if commit.Attr.Size != 8704 || backend.commitPath != "/write-file" || backend.commitOffset != 512 || backend.commitSize != 8192 {
 		t.Fatalf("commit mismatch: attr=%+v path=%q off=%d size=%d", commit.Attr, backend.commitPath, backend.commitOffset, backend.commitSize)
+	}
+}
+
+func TestHandlerReleasesRDMAReadDescriptor(t *testing.T) {
+	backend := &fakeRDMAFileBackend{}
+	h := &Handler{Backend: backend}
+
+	reply, err := h.Handle(context.Background(), &swvfsproto.Request{
+		Header: swvfsproto.RequestHeader{
+			Tag:    6,
+			Op:     swvfsproto.OpRDMAReleaseRead,
+			Offset: 99,
+			Size:   4096,
+			Valid:  0xfffffffb,
+		},
+	})
+	if err != nil {
+		t.Fatalf("release Handle: %v", err)
+	}
+	if reply.Tag != 6 || backend.releaseLeaseID != 99 || backend.releaseStatus != -5 || backend.releaseBytes != 4096 {
+		t.Fatalf("release mismatch: reply=%+v lease=%d status=%d bytes=%d", reply, backend.releaseLeaseID, backend.releaseStatus, backend.releaseBytes)
 	}
 }
 

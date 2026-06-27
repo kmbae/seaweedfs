@@ -43,6 +43,10 @@ type RDMAReadDescriptorBackend interface {
 	ReadFileRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error)
 }
 
+type RDMAReadDescriptorReleaseBackend interface {
+	ReleaseReadDescriptor(ctx context.Context, leaseID uint64, status int32, bytes uint64) error
+}
+
 type RDMAWriteDescriptorBackend interface {
 	PrepareWriteRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error)
 	CommitWriteRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.Attr, error)
@@ -236,6 +240,18 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 			reply.Attr = *attr
 		}
 		return reply, nil
+	case swvfsproto.OpRDMAReleaseRead:
+		backend, ok := h.Backend.(RDMAReadDescriptorReleaseBackend)
+		if !ok {
+			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma read descriptor release is not implemented"}
+		}
+		if req.Header.Offset == 0 {
+			return nil, ErrnoError{Errno: ErrnoInval, Msg: "rdma read descriptor release missing lease id"}
+		}
+		if err := backend.ReleaseReadDescriptor(ctx, req.Header.Offset, int32(req.Header.Valid), req.Header.Size); err != nil {
+			return nil, err
+		}
+		return &swvfsproto.Reply{Tag: req.Header.Tag}, nil
 	case swvfsproto.OpUnlink, swvfsproto.OpRmdir:
 		backend, ok := h.Backend.(interface {
 			DeleteFile(context.Context, string, bool) error
