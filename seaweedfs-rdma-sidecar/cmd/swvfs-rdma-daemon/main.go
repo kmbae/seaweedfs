@@ -243,16 +243,29 @@ func runRDMAPeerConnector(ctx context.Context, control *swvfsdaemon.RDMAControl,
 	if rdmaPeerInterval <= 0 {
 		rdmaPeerInterval = 5 * time.Second
 	}
+	ready := false
 	for {
 		err := connectRDMAPeersOnce(ctx, control, peers, logger)
 		if err == nil {
-			return
+			if !ready {
+				logger.Info("RDMA peer handshake ready")
+			}
+			ready = true
+		} else if errors.Is(err, swvfsdaemon.ErrRDMAPeerUnpaired) {
+			if ready {
+				logger.WithError(err).Warn("RDMA peer handshake lost deterministic pair")
+			} else {
+				logger.WithError(err).Info("RDMA peer handshake skipped; retrying")
+			}
+			ready = false
+		} else {
+			if ready {
+				logger.WithError(err).Warn("RDMA peer handshake lost; retrying")
+			} else {
+				logger.WithError(err).Warn("RDMA peer handshake not ready; retrying")
+			}
+			ready = false
 		}
-		if errors.Is(err, swvfsdaemon.ErrRDMAPeerUnpaired) {
-			logger.WithError(err).Info("RDMA peer handshake skipped")
-			return
-		}
-		logger.WithError(err).Warn("RDMA peer handshake not ready; retrying")
 		select {
 		case <-ctx.Done():
 			return
@@ -332,7 +345,7 @@ func connectRDMAPeersOnce(ctx context.Context, control *swvfsdaemon.RDMAControl,
 			"peer_lid":   selected.LID,
 			"peer_url":   peer.URL,
 			"service_lv": rdmaPeerSL,
-		}).Info("kernel RDMA peer handshake completed")
+		}).Debug("kernel RDMA peer handshake completed")
 		return nil
 	}
 	return fmt.Errorf("selected RDMA peer disappeared before connect post")
