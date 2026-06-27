@@ -12,6 +12,9 @@ func TestRDMAStructSizesMatchKernelABI(t *testing.T) {
 	if got := unsafe.Sizeof(RDMARemoteInfo{}); got != 112 {
 		t.Fatalf("RDMARemoteInfo size = %d, want 112", got)
 	}
+	if got := unsafe.Sizeof(RDMADataDesc{}); got != RDMADataDescSize {
+		t.Fatalf("RDMADataDesc size = %d, want %d", got, RDMADataDescSize)
+	}
 }
 
 func TestRDMALocalInfoHelpers(t *testing.T) {
@@ -43,5 +46,26 @@ func TestDecodeGIDHex(t *testing.T) {
 	}
 	if _, ok := DecodeGIDHex("bad"); ok {
 		t.Fatal("invalid gid decoded successfully")
+	}
+}
+
+func TestRDMADataDescEncodeDecode(t *testing.T) {
+	desc := RDMADataDesc{
+		RemoteAddr: 0x0102030405060708,
+		RKey:       0xaabbccdd,
+		Length:     4096,
+		Reserved:   [4]uint64{1, 2, 3, 4},
+	}
+
+	encoded := EncodeRDMADataDesc(desc)
+	if len(encoded) != RDMADataDescSize {
+		t.Fatalf("encoded length = %d, want %d", len(encoded), RDMADataDescSize)
+	}
+	got, err := DecodeRDMADataDesc(encoded)
+	if err != nil {
+		t.Fatalf("DecodeRDMADataDesc: %v", err)
+	}
+	if got.RemoteAddr != desc.RemoteAddr || got.RKey != desc.RKey || got.Length != desc.Length || got.Reserved != desc.Reserved {
+		t.Fatalf("decoded desc mismatch: %+v", got)
 	}
 }

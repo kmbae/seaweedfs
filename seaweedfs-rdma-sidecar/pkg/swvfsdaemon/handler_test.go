@@ -32,6 +32,20 @@ type fakeXAttrBackend struct {
 	setRemove bool
 }
 
+type fakeRDMAFileBackend struct {
+	fakeFileBackend
+	readDesc         *swvfsproto.RDMADataDesc
+	readDescPath     string
+	writeDesc        *swvfsproto.RDMADataDesc
+	preparePath      string
+	prepareOffset    uint64
+	prepareSize      uint64
+	commitPath       string
+	commitOffset     uint64
+	commitSize       uint64
+	readDescFallback bool
+}
+
 func (f *fakeFileBackend) ReadFile(ctx context.Context, path string, offset, size uint64, preferRDMA bool) ([]byte, *swvfsproto.Attr, error) {
 	f.readPreferRDMA = preferRDMA
 	return []byte("data"), &swvfsproto.Attr{Ino: 1, Size: 4, Mode: 0100644, Nlink: 1}, nil
@@ -40,6 +54,28 @@ func (f *fakeFileBackend) ReadFile(ctx context.Context, path string, offset, siz
 func (f *fakeFileBackend) WriteFile(ctx context.Context, path string, offset uint64, data []byte, mode, uid, gid uint32, preferRDMA bool) (*swvfsproto.Attr, error) {
 	f.writePreferRDMA = preferRDMA
 	return &swvfsproto.Attr{Ino: 1, Size: uint64(len(data)), Mode: 0100644, Nlink: 1}, nil
+}
+
+func (f *fakeRDMAFileBackend) ReadFileRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
+	f.readDescPath = path
+	if f.readDescFallback {
+		return nil, nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma read desc unavailable"}
+	}
+	return f.readDesc, &swvfsproto.Attr{Ino: 9, Size: size, Mode: 0100644, Nlink: 1}, nil
+}
+
+func (f *fakeRDMAFileBackend) PrepareWriteRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
+	f.preparePath = path
+	f.prepareOffset = offset
+	f.prepareSize = size
+	return f.writeDesc, &swvfsproto.Attr{Ino: 10, Size: offset + size, Mode: 0100644, Nlink: 1}, nil
+}
+
+func (f *fakeRDMAFileBackend) CommitWriteRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.Attr, error) {
+	f.commitPath = path
+	f.commitOffset = offset
+	f.commitSize = size
+	return &swvfsproto.Attr{Ino: 10, Size: offset + size, Mode: 0100644, Nlink: 1}, nil
 }
 
 func (f *fakeFileBackend) StatFS(ctx context.Context, path string) (*swvfsproto.StatFS, error) {
@@ -124,6 +160,94 @@ func TestHandlerPassesWriteHint(t *testing.T) {
 	}
 	if reply.Attr.Size != 3 {
 		t.Fatalf("reply size = %d", reply.Attr.Size)
+	}
+}
+
+func TestHandlerReturnsRDMAReadDescriptor(t *testing.T) {
+	backend := &fakeRDMAFileBackend{
+		readDesc: &swvfsproto.RDMADataDesc{RemoteAddr: 0x1000, RKey: 7, Length: 4096},
+	}
+	h := &Handler{Backend: backend}
+	req := &swvfsproto.Request{
+		Header: swvfsproto.RequestHeader{Tag: 3, Op: swvfsproto.OpRead, Offset: 128, Size: 4096, Valid: swvfsproto.ReadFRDMAPreferred},
+		Path1:  "/rdma-file",
+	}
+
+	reply, err := h.Handle(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if reply.EOF&swvfsproto.ReplyFRDMAReadDesc == 0 {
+		t.Fatalf("RDMA read desc flag not set: eof=0x%x", reply.EOF)
+	}
+	desc, err := swvfsproto.DecodeRDMADataDesc(reply.Data)
+	if err != nil {
+		t.Fatalf("DecodeRDMADataDesc: %v", err)
+	}
+	if desc.RemoteAddr != 0x1000 || desc.RKey != 7 || desc.Length != 4096 {
+		t.Fatalf("descriptor mismatch: %+v", desc)
+	}
+	if backend.readDescPath != "/rdma-file" || reply.Attr.Ino != 9 {
+		t.Fatalf("read desc backend/attr mismatch: path=%q attr=%+v", backend.readDescPath, reply.Attr)
+	}
+}
+
+func TestHandlerFallsBackWhenRDMAReadDescriptorUnsupported(t *testing.T) {
+	backend := &fakeRDMAFileBackend{readDescFallback: true}
+	h := &Handler{Backend: backend}
+	req := &swvfsproto.Request{
+		Header: swvfsproto.RequestHeader{Tag: 3, Op: swvfsproto.OpRead, Size: 4, Valid: swvfsproto.ReadFRDMAPreferred},
+		Path1:  "/plain-file",
+	}
+
+	reply, err := h.Handle(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if reply.EOF&swvfsproto.ReplyFRDMAReadDesc != 0 {
+		t.Fatalf("unexpected RDMA desc flag: eof=0x%x", reply.EOF)
+	}
+	if string(reply.Data) != "data" || !backend.readPreferRDMA {
+		t.Fatalf("fallback read mismatch: data=%q prefer=%v", reply.Data, backend.readPreferRDMA)
+	}
+}
+
+func TestHandlerRDMAWritePrepareCommit(t *testing.T) {
+	backend := &fakeRDMAFileBackend{
+		writeDesc: &swvfsproto.RDMADataDesc{RemoteAddr: 0x2000, RKey: 11, Length: 8192},
+	}
+	h := &Handler{Backend: backend}
+
+	prepare, err := h.Handle(context.Background(), &swvfsproto.Request{
+		Header: swvfsproto.RequestHeader{Tag: 4, Op: swvfsproto.OpWriteRDMAPrepare, Offset: 512, Size: 8192},
+		Path1:  "/write-file",
+	})
+	if err != nil {
+		t.Fatalf("prepare Handle: %v", err)
+	}
+	if prepare.EOF&swvfsproto.ReplyFRDMAWriteDesc == 0 {
+		t.Fatalf("RDMA write desc flag not set: eof=0x%x", prepare.EOF)
+	}
+	desc, err := swvfsproto.DecodeRDMADataDesc(prepare.Data)
+	if err != nil {
+		t.Fatalf("DecodeRDMADataDesc: %v", err)
+	}
+	if desc.RemoteAddr != 0x2000 || desc.RKey != 11 || desc.Length != 8192 {
+		t.Fatalf("write descriptor mismatch: %+v", desc)
+	}
+	if backend.preparePath != "/write-file" || backend.prepareOffset != 512 || backend.prepareSize != 8192 {
+		t.Fatalf("prepare backend mismatch: path=%q off=%d size=%d", backend.preparePath, backend.prepareOffset, backend.prepareSize)
+	}
+
+	commit, err := h.Handle(context.Background(), &swvfsproto.Request{
+		Header: swvfsproto.RequestHeader{Tag: 5, Op: swvfsproto.OpWriteRDMACommit, Offset: 512, Size: 8192},
+		Path1:  "/write-file",
+	})
+	if err != nil {
+		t.Fatalf("commit Handle: %v", err)
+	}
+	if commit.Attr.Size != 8704 || backend.commitPath != "/write-file" || backend.commitOffset != 512 || backend.commitSize != 8192 {
+		t.Fatalf("commit mismatch: attr=%+v path=%q off=%d size=%d", commit.Attr, backend.commitPath, backend.commitOffset, backend.commitSize)
 	}
 }
 

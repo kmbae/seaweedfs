@@ -39,6 +39,15 @@ type FileBackend interface {
 	WriteFile(ctx context.Context, path string, offset uint64, data []byte, mode, uid, gid uint32, preferRDMA bool) (*swvfsproto.Attr, error)
 }
 
+type RDMAReadDescriptorBackend interface {
+	ReadFileRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error)
+}
+
+type RDMAWriteDescriptorBackend interface {
+	PrepareWriteRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error)
+	CommitWriteRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.Attr, error)
+}
+
 type MetadataBackend interface {
 	LookupFile(ctx context.Context, path string) (*swvfsproto.Attr, error)
 	ReadDir(ctx context.Context, path string, offset uint64, limit uint32) ([]swvfsproto.Dirent, bool, error)
@@ -153,6 +162,25 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 		return reply, nil
 	case swvfsproto.OpRead:
 		preferRDMA := h.ForceReadRDMA || req.ReadRDMAPreferred()
+		if preferRDMA {
+			if rdmaBackend, ok := h.Backend.(RDMAReadDescriptorBackend); ok {
+				desc, attr, err := rdmaBackend.ReadFileRDMA(ctx, req.Path1, req.Header.Offset, req.Header.Size)
+				if err == nil && desc != nil {
+					reply := &swvfsproto.Reply{
+						Tag:  req.Header.Tag,
+						EOF:  swvfsproto.ReplyFRDMAReadDesc,
+						Data: swvfsproto.EncodeRDMADataDesc(*desc),
+					}
+					if attr != nil {
+						reply.Attr = *attr
+					}
+					return reply, nil
+				}
+				if err != nil && !isNoSys(err) {
+					return nil, err
+				}
+			}
+		}
 		data, attr, err := h.Backend.ReadFile(ctx, req.Path1, req.Header.Offset, req.Header.Size, preferRDMA)
 		if err != nil {
 			return nil, err
@@ -165,6 +193,41 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 	case swvfsproto.OpWrite:
 		preferRDMA := h.ForceWriteRDMA || req.WriteRDMAPreferred()
 		attr, err := h.Backend.WriteFile(ctx, req.Path1, req.Header.Offset, req.Data, req.Header.Mode, req.Header.UID, req.Header.GID, preferRDMA)
+		if err != nil {
+			return nil, err
+		}
+		reply := &swvfsproto.Reply{Tag: req.Header.Tag}
+		if attr != nil {
+			reply.Attr = *attr
+		}
+		return reply, nil
+	case swvfsproto.OpWriteRDMAPrepare:
+		backend, ok := h.Backend.(RDMAWriteDescriptorBackend)
+		if !ok {
+			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma write prepare is not implemented"}
+		}
+		desc, attr, err := backend.PrepareWriteRDMA(ctx, req.Path1, req.Header.Offset, req.Header.Size)
+		if err != nil {
+			return nil, err
+		}
+		if desc == nil {
+			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma write prepare returned no descriptor"}
+		}
+		reply := &swvfsproto.Reply{
+			Tag:  req.Header.Tag,
+			EOF:  swvfsproto.ReplyFRDMAWriteDesc,
+			Data: swvfsproto.EncodeRDMADataDesc(*desc),
+		}
+		if attr != nil {
+			reply.Attr = *attr
+		}
+		return reply, nil
+	case swvfsproto.OpWriteRDMACommit:
+		backend, ok := h.Backend.(RDMAWriteDescriptorBackend)
+		if !ok {
+			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma write commit is not implemented"}
+		}
+		attr, err := backend.CommitWriteRDMA(ctx, req.Path1, req.Header.Offset, req.Header.Size)
 		if err != nil {
 			return nil, err
 		}
@@ -323,6 +386,11 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 	default:
 		return nil, ErrnoError{Errno: ErrnoNoSys, Msg: fmt.Sprintf("swvfs op %d not implemented by RDMA daemon", req.Header.Op)}
 	}
+}
+
+func isNoSys(err error) bool {
+	var errno ErrnoError
+	return errors.As(err, &errno) && errno.Errno == ErrnoNoSys
 }
 
 func ReplyForError(tag uint64, err error) *swvfsproto.Reply {

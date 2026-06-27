@@ -30,11 +30,19 @@ const (
 	OpMknod     uint32 = 20
 	OpStatFS    uint32 = 21
 	OpLock      uint32 = 22
+
+	OpWriteRDMAPrepare uint32 = 23
+	OpWriteRDMACommit  uint32 = 24
 )
 
 const (
 	ReadFRDMAPreferred  uint32 = 1 << 0
 	WriteFRDMAPreferred uint32 = 1 << 0
+)
+
+const (
+	ReplyFRDMAReadDesc  uint32 = 1 << 31
+	ReplyFRDMAWriteDesc uint32 = 1 << 30
 )
 
 const (

@@ -1,7 +1,9 @@
 package swvfsproto
 
 import (
+	"encoding/binary"
 	"encoding/hex"
+	"fmt"
 	"strings"
 )
 
@@ -26,6 +28,8 @@ const (
 	RDMARemoteFGIDValid    uint32 = 1 << 0
 	RDMARemoteFGRHRequired uint32 = 1 << 1
 )
+
+const RDMADataDescSize = 48
 
 type RDMALocalInfo struct {
 	ABIVersion           uint32
@@ -101,6 +105,40 @@ type RDMARemoteInfo struct {
 	SL         uint32
 	GID        [16]byte
 	Reserved   [8]uint64
+}
+
+type RDMADataDesc struct {
+	RemoteAddr uint64
+	RKey       uint32
+	Length     uint32
+	Reserved   [4]uint64
+}
+
+func EncodeRDMADataDesc(desc RDMADataDesc) []byte {
+	out := make([]byte, RDMADataDescSize)
+	binary.LittleEndian.PutUint64(out[0:8], desc.RemoteAddr)
+	binary.LittleEndian.PutUint32(out[8:12], desc.RKey)
+	binary.LittleEndian.PutUint32(out[12:16], desc.Length)
+	for i, v := range desc.Reserved {
+		off := 16 + i*8
+		binary.LittleEndian.PutUint64(out[off:off+8], v)
+	}
+	return out
+}
+
+func DecodeRDMADataDesc(buf []byte) (RDMADataDesc, error) {
+	if len(buf) < RDMADataDescSize {
+		return RDMADataDesc{}, fmt.Errorf("%w: rdma desc got %d need %d", ErrShortReply, len(buf), RDMADataDescSize)
+	}
+	var desc RDMADataDesc
+	desc.RemoteAddr = binary.LittleEndian.Uint64(buf[0:8])
+	desc.RKey = binary.LittleEndian.Uint32(buf[8:12])
+	desc.Length = binary.LittleEndian.Uint32(buf[12:16])
+	for i := range desc.Reserved {
+		off := 16 + i*8
+		desc.Reserved[i] = binary.LittleEndian.Uint64(buf[off : off+8])
+	}
+	return desc, nil
 }
 
 func DecodeGIDHex(raw string) ([16]byte, bool) {
