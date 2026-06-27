@@ -88,6 +88,156 @@ func TestVolumeNativeRDMAReadDescriptorClientMarksAndReleasesLease(t *testing.T)
 	}
 }
 
+func TestVolumeNativeRDMAReadDescriptorClientConnectsNativePeer(t *testing.T) {
+	var (
+		localRequests   int
+		connectRequests int
+		readRequests    int
+		postedLocal     RDMALocalEndpoint
+	)
+	remoteEndpoint := RDMALocalEndpoint{
+		ABIVersion:    swvfsproto.RDMAABIVersion,
+		KernelEnabled: true,
+		EndpointReady: true,
+		Device:        "mlx5_0",
+		Port:          1,
+		QPNum:         222,
+		PSN:           0x222222,
+		LID:           0x22,
+		LinkLayer:     swvfsproto.RDMALinkInfiniBand,
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case VolumeRDMALocalPath:
+			localRequests++
+			writeJSON(w, remoteEndpoint)
+		case VolumeRDMAConnectPath:
+			connectRequests++
+			if r.URL.Query().Get("sl") != "4" {
+				t.Errorf("service level = %q", r.URL.Query().Get("sl"))
+			}
+			if err := json.NewDecoder(r.Body).Decode(&postedLocal); err != nil {
+				t.Errorf("decode connect request: %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			writeJSON(w, map[string]bool{"connected": true})
+		case VolumeRDMAReadDescPath:
+			readRequests++
+			writeJSON(w, VolumeRDMAReadDescResponse{
+				Desc: swvfsproto.RDMADataDesc{
+					RemoteAddr: 0xbeef,
+					RKey:       77,
+					Length:     512,
+				},
+				SessionID: uint64(100 + readRequests),
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	control := &fakeRDMAControl{
+		local: swvfsproto.RDMALocalInfo{
+			ABIVersion: swvfsproto.RDMAABIVersion,
+			Flags:      swvfsproto.RDMAFKernelEnabled | swvfsproto.RDMAFEndpointReady,
+			Port:       1,
+			QPNum:      111,
+			PSN:        0x111111,
+			LID:        0x11,
+			LinkLayer:  swvfsproto.RDMALinkInfiniBand,
+		},
+	}
+	client := &VolumeNativeRDMAReadDescriptorClient{
+		Client:       server.Client(),
+		Control:      control,
+		Timeout:      time.Second,
+		ReleaseDelay: time.Hour,
+		ServiceLevel: 4,
+		Stats:        NewStats(),
+	}
+
+	for i := 0; i < 2; i++ {
+		desc, _, err := client.ReadNeedleRDMA(context.Background(), NeedleReadDescriptorRequest{
+			FileID:       "3,01637037d6",
+			VolumeID:     3,
+			NeedleID:     0x163703,
+			Cookie:       0x7d6,
+			VolumeServer: server.URL + "/3,01637037d6",
+			Size:         512,
+		})
+		if err != nil {
+			t.Fatalf("ReadNeedleRDMA[%d]: %v", i, err)
+		}
+		if desc.RemoteAddr != 0xbeef || desc.RKey != 77 || desc.Length != 512 {
+			t.Fatalf("unexpected desc[%d]: %+v", i, desc)
+		}
+	}
+	if localRequests != 1 {
+		t.Fatalf("local requests = %d, want 1", localRequests)
+	}
+	if connectRequests != 1 {
+		t.Fatalf("connect requests = %d, want 1", connectRequests)
+	}
+	if readRequests != 2 {
+		t.Fatalf("read requests = %d, want 2", readRequests)
+	}
+	if !control.connected || control.remote.QPN != remoteEndpoint.QPNum || control.remote.LID != remoteEndpoint.LID || control.remote.SL != 4 {
+		t.Fatalf("kernel control was not connected to remote endpoint: connected=%v remote=%+v", control.connected, control.remote)
+	}
+	if postedLocal.QPNum != 111 || postedLocal.LID != 0x11 {
+		t.Fatalf("posted local endpoint = %+v", postedLocal)
+	}
+}
+
+func TestFetchVolumeNativeStatus(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != VolumeRDMAStatusPath {
+			t.Errorf("path = %q", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, VolumeRDMAStatusResponse{
+			ReadExporterConfigured: true,
+			EndpointConfigured:     true,
+			ABIVersion:             swvfsproto.RDMAABIVersion,
+			LocalPath:              VolumeRDMALocalPath,
+			ConnectPath:            VolumeRDMAConnectPath,
+			ReadDescPath:           VolumeRDMAReadDescPath,
+			ReleaseDescPath:        VolumeRDMAReleaseDescPath,
+		})
+	}))
+	defer server.Close()
+
+	status, err := FetchVolumeNativeStatus(context.Background(), server.Client(), server.URL+"/3,abc")
+	if err != nil {
+		t.Fatalf("FetchVolumeNativeStatus: %v", err)
+	}
+	if !status.ReadExporterConfigured || !status.EndpointConfigured || status.LocalPath != VolumeRDMALocalPath {
+		t.Fatalf("unexpected status: %+v", status)
+	}
+}
+
+func TestVolumeNativeRDMAReadDescriptorClientHandshakeFailureFallsBack(t *testing.T) {
+	client := &VolumeNativeRDMAReadDescriptorClient{
+		Control: &fakeRDMAControl{},
+		Timeout: time.Second,
+		Stats:   NewStats(),
+	}
+	_, _, err := client.ReadNeedleRDMA(context.Background(), NeedleReadDescriptorRequest{
+		FileID:       "3,01637037d6",
+		VolumeID:     3,
+		NeedleID:     1,
+		VolumeServer: "http://volume.example",
+		Size:         512,
+	})
+	var errno ErrnoError
+	if !errors.As(err, &errno) || errno.Errno != ErrnoNoSys {
+		t.Fatalf("err = %v, want ErrnoNoSys", err)
+	}
+}
+
 func TestVolumeNativeRDMAReadDescriptorClientMapsUnimplementedToNoSys(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "not implemented", http.StatusNotImplemented)

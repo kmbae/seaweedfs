@@ -163,8 +163,10 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 	if enableVolumeNativeRDMA {
 		backend.NativeReadDescriptor = &swvfsdaemon.VolumeNativeRDMAReadDescriptorClient{
-			Timeout: rdmaPeerTimeout,
-			Stats:   stats,
+			Control:      rdmaControl,
+			Timeout:      rdmaPeerTimeout,
+			ServiceLevel: rdmaPeerSL,
+			Stats:        stats,
 		}
 	}
 	if len(peerList) > 0 {

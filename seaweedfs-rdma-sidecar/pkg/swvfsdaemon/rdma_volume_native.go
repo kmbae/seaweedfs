@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
@@ -15,6 +16,9 @@ import (
 )
 
 const (
+	VolumeRDMAStatusPath      = "/rdma/native/status"
+	VolumeRDMALocalPath       = "/rdma/native/local"
+	VolumeRDMAConnectPath     = "/rdma/native/connect"
 	VolumeRDMAReadDescPath    = "/rdma/native/read-desc"
 	VolumeRDMAReleaseDescPath = "/rdma/native/release-desc"
 	nativeReadLeaseBit        = uint64(1) << 63
@@ -54,15 +58,31 @@ type VolumeRDMAReleaseDescRequest struct {
 	SessionID uint64 `json:"session_id"`
 }
 
+type VolumeRDMAStatusResponse struct {
+	ReadExporterConfigured bool   `json:"read_exporter_configured"`
+	EndpointConfigured     bool   `json:"endpoint_configured"`
+	ABIVersion             uint32 `json:"abi_version"`
+	StatusPath             string `json:"status_path"`
+	LocalPath              string `json:"local_path"`
+	ConnectPath            string `json:"connect_path"`
+	ReadDescPath           string `json:"read_desc_path"`
+	ReleaseDescPath        string `json:"release_desc_path"`
+}
+
 type VolumeNativeRDMAReadDescriptorClient struct {
 	Client       *http.Client
+	Control      RDMAPeerConnectorControl
 	Timeout      time.Duration
 	ReleaseDelay time.Duration
+	ServiceLevel uint32
 	Stats        *Stats
 
 	mu          sync.Mutex
 	nextLeaseID uint64
 	leases      map[uint64]volumeNativeReadLease
+
+	peerMu sync.Mutex
+	peers  map[string]struct{}
 }
 
 type volumeNativeReadLease struct {
@@ -116,6 +136,11 @@ func (c *VolumeNativeRDMAReadDescriptorClient) ReadNeedleRDMA(ctx context.Contex
 	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	if err := c.ensureVolumeNativePeer(attemptCtx, req.VolumeServer); err != nil {
+		c.Stats.Inc("volume_native_rdma_peer_connect_errors")
+		return nil, nil, volumeNativePeerHandshakeError(err)
+	}
+
 	desc, attr, sessionID, err := PostVolumeNativeReadDesc(attemptCtx, c.Client, req.VolumeServer, VolumeRDMAReadDescRequest{
 		FileID:   req.FileID,
 		VolumeID: req.VolumeID,
@@ -146,6 +171,162 @@ func (c *VolumeNativeRDMAReadDescriptorClient) ReadNeedleRDMA(ctx context.Contex
 	c.Stats.Inc("volume_native_rdma_read_desc_success")
 	c.Stats.Add("volume_native_rdma_read_desc_bytes", uint64(desc.Length))
 	return desc, attr, nil
+}
+
+func (c *VolumeNativeRDMAReadDescriptorClient) ensureVolumeNativePeer(ctx context.Context, volumeServer string) error {
+	if c == nil || c.Control == nil {
+		return nil
+	}
+	key := volumeNativeServerKey(volumeServer)
+	c.peerMu.Lock()
+	if c.peers != nil {
+		if _, ok := c.peers[key]; ok {
+			c.peerMu.Unlock()
+			return nil
+		}
+	}
+	c.peerMu.Unlock()
+
+	localInfo, err := c.Control.GetLocal()
+	if err != nil {
+		return err
+	}
+	local := RDMALocalEndpointFromInfo(localInfo)
+	if !local.ReadyForConnect() {
+		return ErrnoError{Errno: ErrnoNoSys, Msg: fmt.Sprintf("local kernel RDMA endpoint is not ready: qpn=%d lid=%d flags=0x%x", local.QPNum, local.LID, local.Flags)}
+	}
+	remote, err := FetchVolumeNativeEndpoint(ctx, c.Client, volumeServer)
+	if err != nil {
+		return err
+	}
+	if !remote.ReadyForConnect() {
+		return ErrnoError{Errno: ErrnoNoSys, Msg: fmt.Sprintf("volume RDMA endpoint is not ready: qpn=%d lid=%d flags=0x%x", remote.QPNum, remote.LID, remote.Flags)}
+	}
+
+	if c.ServiceLevel > 15 {
+		return fmt.Errorf("RDMA service level must be 0..15")
+	}
+	remoteInfo, err := remote.RemoteInfo(c.ServiceLevel)
+	if err != nil {
+		return err
+	}
+	if err := c.Control.Connect(remoteInfo); err != nil {
+		return err
+	}
+	if err := PostVolumeNativeConnect(ctx, c.Client, volumeServer, local, c.ServiceLevel); err != nil {
+		return err
+	}
+
+	c.peerMu.Lock()
+	if c.peers == nil {
+		c.peers = make(map[string]struct{})
+	}
+	c.peers[key] = struct{}{}
+	c.peerMu.Unlock()
+	c.Stats.Inc("volume_native_rdma_peer_connect_success")
+	return nil
+}
+
+func volumeNativePeerHandshakeError(err error) error {
+	if err == nil {
+		return nil
+	}
+	var errno ErrnoError
+	if errors.As(err, &errno) {
+		return err
+	}
+	return ErrnoError{Errno: ErrnoNoSys, Msg: fmt.Sprintf("native volume RDMA peer handshake failed: %v", err)}
+}
+
+func volumeNativeServerKey(volumeServer string) string {
+	reqURL, err := normalizeVolumeNativeURL(volumeServer, "")
+	if err != nil {
+		return volumeServer
+	}
+	if u, err := url.Parse(reqURL); err == nil {
+		return u.Scheme + "://" + u.Host
+	}
+	return reqURL
+}
+
+func FetchVolumeNativeStatus(ctx context.Context, client *http.Client, rawURL string) (VolumeRDMAStatusResponse, error) {
+	var out VolumeRDMAStatusResponse
+	reqURL, err := normalizeVolumeNativeURL(rawURL, VolumeRDMAStatusPath)
+	if err != nil {
+		return out, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return out, err
+	}
+	resp, err := httpClient(client).Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return out, volumeNativeHTTPError(reqURL, resp.StatusCode, resp.Status)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+func FetchVolumeNativeEndpoint(ctx context.Context, client *http.Client, rawURL string) (RDMALocalEndpoint, error) {
+	var endpoint RDMALocalEndpoint
+	reqURL, err := normalizeVolumeNativeURL(rawURL, VolumeRDMALocalPath)
+	if err != nil {
+		return endpoint, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return endpoint, err
+	}
+	resp, err := httpClient(client).Do(req)
+	if err != nil {
+		return endpoint, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return endpoint, volumeNativeHTTPError(reqURL, resp.StatusCode, resp.Status)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&endpoint); err != nil {
+		return endpoint, err
+	}
+	return endpoint, nil
+}
+
+func PostVolumeNativeConnect(ctx context.Context, client *http.Client, rawURL string, local RDMALocalEndpoint, serviceLevel uint32) error {
+	reqURL, err := normalizeVolumeNativeURL(rawURL, VolumeRDMAConnectPath)
+	if err != nil {
+		return err
+	}
+	u, err := url.Parse(reqURL)
+	if err != nil {
+		return err
+	}
+	q := u.Query()
+	q.Set("sl", fmt.Sprintf("%d", serviceLevel))
+	u.RawQuery = q.Encode()
+	body, err := json.Marshal(local)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient(client).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return volumeNativeHTTPError(u.String(), resp.StatusCode, resp.Status)
+	}
+	return nil
 }
 
 func PostVolumeNativeReadDesc(ctx context.Context, client *http.Client, rawURL string, reqBody VolumeRDMAReadDescRequest) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, uint64, error) {
