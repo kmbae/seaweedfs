@@ -1,0 +1,41 @@
+# Runtime image for locally prebuilt Go sidecar binaries.
+# Build the binaries first with:
+#   CGO_ENABLED=0 GOOS=linux go build -tags 5BytesOffset -o bin/sidecar ./cmd/sidecar
+FROM alpine:3.18
+
+RUN apk --no-cache add ca-certificates curl
+
+ARG INCLUDE_TEST_TOOLS=false
+RUN if [ "${INCLUDE_TEST_TOOLS}" = "true" ]; then \
+      apk add --no-cache \
+        autoconf \
+        automake \
+        fio \
+        gcc \
+        git \
+        make \
+        musl-dev \
+        openssl \
+        perl \
+        perl-utils; \
+      git clone --depth 1 https://github.com/pjd/pjdfstest.git /opt/pjdfstest; \
+      cd /opt/pjdfstest && autoreconf -ifs && ./configure && make; \
+    fi
+
+RUN addgroup -g 1001 appgroup && adduser -D -s /bin/sh -u 1001 -G appgroup appuser
+
+WORKDIR /app
+COPY seaweedfs-rdma-sidecar/bin/sidecar .
+COPY seaweedfs-rdma-sidecar/bin/demo-server .
+COPY seaweedfs-rdma-sidecar/bin/swvfs-rdma-daemon .
+
+RUN chown -R appuser:appgroup /app
+USER appuser
+
+EXPOSE 8081
+
+HEALTHCHECK --interval=10s --timeout=5s --start-period=15s --retries=3 \
+    CMD curl -f http://localhost:8081/health || exit 1
+
+ENTRYPOINT ["./sidecar"]
+CMD ["--port", "8081", "--enable-rdma=true"]
