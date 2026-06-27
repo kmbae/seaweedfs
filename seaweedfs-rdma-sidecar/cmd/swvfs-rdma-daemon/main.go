@@ -37,6 +37,7 @@ var (
 	fallbackOnError   bool
 	rdmaControlListen string
 	rdmaPeerEndpoints string
+	rdmaPeerMinCount  int
 	rdmaPeerSL        uint32
 	rdmaPeerInterval  time.Duration
 	rdmaPeerTimeout   time.Duration
@@ -71,6 +72,7 @@ carries RDMA preference hints.`,
 	root.Flags().BoolVar(&fallbackOnError, "fallback-on-error", true, "fall back to TCP/HTTP when RDMA is unavailable")
 	root.Flags().StringVar(&rdmaControlListen, "rdma-control-listen", "", "listen address for kernel RDMA peer-control HTTP API; empty disables it")
 	root.Flags().StringVar(&rdmaPeerEndpoints, "rdma-peer-endpoints", "", "comma-separated peer-control URLs used for automatic kernel RDMA QP handshake")
+	root.Flags().IntVar(&rdmaPeerMinCount, "rdma-peer-min-count", 0, "minimum total ready RDMA peer-control endpoints, including self, before selecting a deterministic peer")
 	root.Flags().Uint32Var(&rdmaPeerSL, "rdma-peer-service-level", 0, "InfiniBand service level for automatic peer connections")
 	root.Flags().DurationVar(&rdmaPeerInterval, "rdma-peer-connect-interval", 5*time.Second, "retry interval for automatic kernel RDMA peer connection")
 	root.Flags().DurationVar(&rdmaPeerTimeout, "rdma-peer-connect-timeout", 5*time.Second, "per-attempt timeout for automatic kernel RDMA peer connection")
@@ -269,6 +271,9 @@ func connectRDMAPeersOnce(ctx context.Context, control *swvfsdaemon.RDMAControl,
 	}
 	if len(fetched) == 0 {
 		return fmt.Errorf("no RDMA peer endpoints were reachable")
+	}
+	if rdmaPeerMinCount > 0 && len(fetched)+1 < rdmaPeerMinCount {
+		return fmt.Errorf("only %d/%d RDMA peer endpoints are ready", len(fetched)+1, rdmaPeerMinCount)
 	}
 
 	endpoints := make([]swvfsdaemon.RDMALocalEndpoint, 0, len(fetched))
