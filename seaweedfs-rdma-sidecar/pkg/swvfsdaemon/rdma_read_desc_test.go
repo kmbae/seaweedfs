@@ -164,6 +164,13 @@ func TestKernelMRWriteStagerFlushesRemoteBufferedWrite(t *testing.T) {
 	if err != nil {
 		t.Fatalf("CommitWriteRDMASession: %v", err)
 	}
+	if writer.flushedPath != "" || attr == nil || attr.Ino != 1 {
+		t.Fatalf("commit should defer flush: path=%q attr=%+v", writer.flushedPath, attr)
+	}
+	attr, err = stager.FlushFile(context.Background(), "/file")
+	if err != nil {
+		t.Fatalf("FlushFile: %v", err)
+	}
 	if writer.flushedPath != "/file" || attr == nil || attr.Ino != 7 {
 		t.Fatalf("flush mismatch: path=%q attr=%+v", writer.flushedPath, attr)
 	}

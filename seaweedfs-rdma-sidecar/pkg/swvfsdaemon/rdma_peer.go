@@ -24,6 +24,7 @@ const (
 	RDMAPeerWritePrepare    = "/rdma/write-prepare"
 	RDMAPeerWriteCommit     = "/rdma/write-commit"
 	RDMAPeerWriteAbort      = "/rdma/write-abort"
+	RDMAPeerWriteFlush      = "/rdma/write-flush"
 )
 
 var ErrRDMAPeerUnpaired = errors.New("no deterministic RDMA pair selected")
@@ -145,6 +146,7 @@ func (s *RDMAPeerControlServer) Handler() http.Handler {
 	mux.HandleFunc(RDMAPeerWritePrepare, s.handleWritePrepare)
 	mux.HandleFunc(RDMAPeerWriteCommit, s.handleWriteCommit)
 	mux.HandleFunc(RDMAPeerWriteAbort, s.handleWriteAbort)
+	mux.HandleFunc(RDMAPeerWriteFlush, s.handleWriteFlush)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -241,6 +243,14 @@ type RDMAPeerWriteCommitRequest struct {
 }
 
 type RDMAPeerWriteCommitResponse struct {
+	Attr *swvfsproto.Attr `json:"attr,omitempty"`
+}
+
+type RDMAPeerWriteFlushRequest struct {
+	Path string `json:"path"`
+}
+
+type RDMAPeerWriteFlushResponse struct {
 	Attr *swvfsproto.Attr `json:"attr,omitempty"`
 }
 
@@ -427,6 +437,46 @@ func (s *RDMAPeerControlServer) handleWriteAbort(w http.ResponseWriter, r *http.
 	}
 	s.Stats.Inc("peer_control_write_abort_success")
 	writeJSON(w, map[string]any{"aborted": true})
+}
+
+func (s *RDMAPeerControlServer) handleWriteFlush(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.Stats.Inc("peer_control_write_flush_requests")
+	if s.WriteStager == nil {
+		s.Stats.Inc("peer_control_write_flush_not_configured")
+		http.Error(w, "rdma write descriptor staging is not configured", http.StatusNotImplemented)
+		return
+	}
+	var req RDMAPeerWriteFlushRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.Stats.Inc("peer_control_write_flush_bad_request")
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Path == "" {
+		s.Stats.Inc("peer_control_write_flush_bad_request")
+		http.Error(w, "path is required", http.StatusBadRequest)
+		return
+	}
+	flusher, ok := s.WriteStager.(interface {
+		FlushFile(context.Context, string) (*swvfsproto.Attr, error)
+	})
+	if !ok {
+		s.Stats.Inc("peer_control_write_flush_not_configured")
+		http.Error(w, "rdma write descriptor flush is not configured", http.StatusNotImplemented)
+		return
+	}
+	attr, err := flusher.FlushFile(r.Context(), req.Path)
+	if err != nil {
+		s.Stats.Inc("peer_control_write_flush_errors")
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	s.Stats.Inc("peer_control_write_flush_success")
+	writeJSON(w, RDMAPeerWriteFlushResponse{Attr: attr})
 }
 
 func FetchRDMAPeerEndpoint(ctx context.Context, client *http.Client, rawURL string) (RDMALocalEndpoint, error) {
@@ -631,6 +681,35 @@ func PostRDMAPeerWriteAbort(ctx context.Context, client *http.Client, rawURL str
 		return fmt.Errorf("POST %s returned %s", reqURL, resp.Status)
 	}
 	return nil
+}
+
+func PostRDMAPeerWriteFlush(ctx context.Context, client *http.Client, rawURL string, path string) (*swvfsproto.Attr, error) {
+	reqURL, err := normalizeRDMAPeerURL(rawURL, RDMAPeerWriteFlush)
+	if err != nil {
+		return nil, err
+	}
+	body, err := json.Marshal(RDMAPeerWriteFlushRequest{Path: path})
+	if err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient(client).Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("POST %s returned %s", reqURL, resp.Status)
+	}
+	var out RDMAPeerWriteFlushResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, err
+	}
+	return out.Attr, nil
 }
 
 func ExpandRDMAPeerURLs(ctx context.Context, rawEndpoints []string) []string {

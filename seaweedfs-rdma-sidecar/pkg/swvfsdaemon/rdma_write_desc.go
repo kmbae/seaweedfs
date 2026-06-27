@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -148,21 +149,27 @@ func (s *KernelMRWriteStager) CommitWriteRDMASession(ctx context.Context, sessio
 		s.Stats.Inc("rdma_write_stager_backend_errors")
 		return nil, err
 	}
+	s.Stats.Inc("rdma_write_stager_flush_deferred")
+	s.Stats.Inc("rdma_write_stager_commit_success")
+	return attr, nil
+}
+
+func (s *KernelMRWriteStager) FlushFile(ctx context.Context, path string) (*swvfsproto.Attr, error) {
+	if s == nil || s.Writer == nil {
+		return nil, nil
+	}
 	if flusher, ok := s.Writer.(interface {
 		FlushFile(context.Context, string) (*swvfsproto.Attr, error)
 	}); ok {
-		flushedAttr, err := flusher.FlushFile(ctx, path)
+		attr, err := flusher.FlushFile(ctx, path)
 		if err != nil {
 			s.Stats.Inc("rdma_write_stager_flush_errors")
 			return nil, err
 		}
-		if flushedAttr != nil {
-			attr = flushedAttr
-		}
 		s.Stats.Inc("rdma_write_stager_flush_success")
+		return attr, nil
 	}
-	s.Stats.Inc("rdma_write_stager_commit_success")
-	return attr, nil
+	return nil, nil
 }
 
 func (s *KernelMRWriteStager) AbortWriteRDMASession(ctx context.Context, sessionID uint64) error {
@@ -258,6 +265,7 @@ type RemoteRDMAWriteDescriptorClient struct {
 	nextLeaseID uint64
 	leases      map[uint64]rdmaWriteDescriptorLease
 	byKey       map[rdmaWriteDescriptorKey]uint64
+	dirty       map[string]map[string]struct{}
 }
 
 func (c *RemoteRDMAWriteDescriptorClient) PrepareWriteRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
@@ -332,7 +340,37 @@ func (c *RemoteRDMAWriteDescriptorClient) CommitWriteRDMA(ctx context.Context, p
 		abortCancel()
 		return nil, err
 	}
+	c.trackDirty(path, lease.PeerURL)
 	c.Stats.Inc("rdma_write_desc_client_commit_success")
+	return attr, nil
+}
+
+func (c *RemoteRDMAWriteDescriptorClient) FlushFile(ctx context.Context, path string) (*swvfsproto.Attr, error) {
+	if c == nil || path == "" {
+		return nil, nil
+	}
+	peers := c.popDirty(path)
+	if len(peers) == 0 {
+		return nil, nil
+	}
+	c.Stats.Inc("rdma_write_desc_client_flush_requests")
+	var attr *swvfsproto.Attr
+	for _, peerURL := range peers {
+		timeout := c.timeout()
+		attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+		peerAttr, err := PostRDMAPeerWriteFlush(attemptCtx, c.Client, peerURL, path)
+		cancel()
+		if err != nil {
+			c.Stats.Inc("rdma_write_desc_client_flush_post_errors")
+			c.trackDirty(path, peerURL)
+			return attr, err
+		}
+		if peerAttr != nil {
+			attr = peerAttr
+		}
+		c.Stats.Inc("rdma_write_desc_client_flush_peer_success")
+	}
+	c.Stats.Inc("rdma_write_desc_client_flush_success")
 	return attr, nil
 }
 
@@ -392,6 +430,42 @@ func (c *RemoteRDMAWriteDescriptorClient) trackLease(lease rdmaWriteDescriptorLe
 	c.byKey[lease.Key] = leaseID
 	c.Stats.Inc("rdma_write_desc_client_leases_created")
 	return leaseID
+}
+
+func (c *RemoteRDMAWriteDescriptorClient) trackDirty(path, peerURL string) {
+	if c == nil || path == "" || peerURL == "" {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.dirty == nil {
+		c.dirty = make(map[string]map[string]struct{})
+	}
+	peers := c.dirty[path]
+	if peers == nil {
+		peers = make(map[string]struct{})
+		c.dirty[path] = peers
+	}
+	peers[peerURL] = struct{}{}
+}
+
+func (c *RemoteRDMAWriteDescriptorClient) popDirty(path string) []string {
+	if c == nil || path == "" {
+		return nil
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	peers := c.dirty[path]
+	if len(peers) == 0 {
+		return nil
+	}
+	out := make([]string, 0, len(peers))
+	for peerURL := range peers {
+		out = append(out, peerURL)
+	}
+	delete(c.dirty, path)
+	sort.Strings(out)
+	return out
 }
 
 func (c *RemoteRDMAWriteDescriptorClient) popLease(leaseID uint64) (rdmaWriteDescriptorLease, bool) {

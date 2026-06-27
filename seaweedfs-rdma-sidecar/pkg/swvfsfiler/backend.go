@@ -815,11 +815,33 @@ func (b *Backend) WriteFile(ctx context.Context, fullPath string, offset uint64,
 }
 
 func (b *Backend) FlushFile(ctx context.Context, fullPath string) (*swvfsproto.Attr, error) {
+	fullPath = cleanFullPath(fullPath)
+	var attr *swvfsproto.Attr
+	if b != nil && b.WriteDescriptorBackend != nil {
+		if flusher, ok := b.WriteDescriptorBackend.(interface {
+			FlushFile(context.Context, string) (*swvfsproto.Attr, error)
+		}); ok {
+			remoteAttr, err := flusher.FlushFile(ctx, fullPath)
+			if err != nil {
+				return nil, err
+			}
+			if remoteAttr != nil {
+				attr = remoteAttr
+			}
+		}
+	}
 	pending := b.takePending(fullPath)
 	if pending == nil {
-		return nil, nil
+		return attr, nil
 	}
-	return b.persistPendingWrite(ctx, pending)
+	localAttr, err := b.persistPendingWrite(ctx, pending)
+	if err != nil {
+		return nil, err
+	}
+	if localAttr != nil {
+		attr = localAttr
+	}
+	return attr, nil
 }
 
 func (b *Backend) persistPendingWrite(ctx context.Context, pending *pendingWrite) (*swvfsproto.Attr, error) {

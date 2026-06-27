@@ -35,6 +35,7 @@ type fakeWriteStager struct {
 	commitSize    uint64
 	commitSession uint64
 	abortSession  uint64
+	flushPath     string
 	desc          swvfsproto.RDMADataDesc
 	attr          *swvfsproto.Attr
 }
@@ -87,6 +88,11 @@ func (f *fakeWriteStager) CommitWriteRDMASession(ctx context.Context, sessionID 
 func (f *fakeWriteStager) AbortWriteRDMASession(ctx context.Context, sessionID uint64) error {
 	f.abortSession = sessionID
 	return nil
+}
+
+func (f *fakeWriteStager) FlushFile(ctx context.Context, path string) (*swvfsproto.Attr, error) {
+	f.flushPath = path
+	return f.attr, nil
 }
 
 func TestRDMALocalEndpointFromInfo(t *testing.T) {
@@ -276,6 +282,8 @@ func TestRemoteRDMAWriteDescriptorClient(t *testing.T) {
 			(&RDMAPeerControlServer{WriteStager: stager}).handleWriteCommit(w, r)
 		case RDMAPeerWriteAbort:
 			(&RDMAPeerControlServer{WriteStager: stager}).handleWriteAbort(w, r)
+		case RDMAPeerWriteFlush:
+			(&RDMAPeerControlServer{WriteStager: stager}).handleWriteFlush(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -305,6 +313,16 @@ func TestRemoteRDMAWriteDescriptorClient(t *testing.T) {
 	}
 	if commitAttr == nil || stager.commitSession != 44 || stager.commitPath != "/file" || stager.commitSize != 512 {
 		t.Fatalf("remote write commit delegation mismatch: attr=%+v session=%d path=%q size=%d", commitAttr, stager.commitSession, stager.commitPath, stager.commitSize)
+	}
+	if stager.flushPath != "" {
+		t.Fatalf("commit should defer flush, got flush path %q", stager.flushPath)
+	}
+	flushAttr, err := client.FlushFile(context.Background(), "/file")
+	if err != nil {
+		t.Fatalf("FlushFile: %v", err)
+	}
+	if flushAttr == nil || stager.flushPath != "/file" {
+		t.Fatalf("remote write flush delegation mismatch: attr=%+v path=%q", flushAttr, stager.flushPath)
 	}
 }
 
