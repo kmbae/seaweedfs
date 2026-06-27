@@ -36,6 +36,7 @@ RUN if [ "${INCLUDE_TEST_TOOLS}" = "true" ]; then \
         git \
         make \
         musl-dev \
+        openssl \
         perl \
         perl-utils; \
       git clone --depth 1 https://github.com/pjd/pjdfstest.git /opt/pjdfstest; \
