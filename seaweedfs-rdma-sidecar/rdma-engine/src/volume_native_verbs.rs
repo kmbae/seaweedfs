@@ -53,6 +53,8 @@ const DEFAULT_RNR_RETRY: u8 = 7;
 const DEFAULT_RD_ATOMIC: u8 = 1;
 const DEFAULT_GRH_HOP_LIMIT: u8 = 64;
 const DEFAULT_READ_POLL_SLEEP: Duration = Duration::from_micros(50);
+const MAX_POOLED_READ_MRS: usize = 8;
+const MAX_POOLED_LOCAL_MRS: usize = 8;
 
 #[derive(Debug, Clone)]
 pub struct VolumeVerbsConfig {
@@ -158,7 +160,11 @@ impl RealVerbsVolumeRdmaProvider {
             data.len(),
         )?;
 
-        let lease = connection.resources.register_read_lease(session_id, data)?;
+        let lease = connection.resources.register_read_lease(
+            session_id,
+            data,
+            &mut connection.read_pool,
+        )?;
         let desc = lease.desc.clone();
         connection.leases.insert(session_id, lease);
 
@@ -172,7 +178,16 @@ impl RealVerbsVolumeRdmaProvider {
             .map_err(|_| anyhow!("verbs provider mutex poisoned"))?;
         for connection in state.connections.values_mut() {
             if let Some(lease) = connection.leases.remove(&session_id) {
-                lease.release()?;
+                let buffer = lease.release()?;
+                if connection.read_pool.len() < MAX_POOLED_READ_MRS {
+                    debug!(
+                        "returned verbs read MR to pool session={} pool_len={} capacity={}",
+                        session_id,
+                        connection.read_pool.len() + 1,
+                        buffer.capacity()
+                    );
+                    connection.read_pool.push(buffer);
+                }
                 break;
             }
         }
@@ -284,14 +299,23 @@ impl RealVerbsVolumeRdmaRequester {
         )?;
         let mut local = connection
             .resources
-            .register_local_buffer(desc.length as usize)?;
+            .acquire_local_buffer(desc.length as usize, &mut connection.local_pool)?;
         connection
             .resources
             .post_rdma_read(&mut local, desc, wr_id)?;
         connection
             .resources
             .poll_read_completion(wr_id, desc.length, timeout)?;
-        local.into_vec()
+        let data = local.read_vec(desc.length as usize)?;
+        if connection.local_pool.len() < MAX_POOLED_LOCAL_MRS {
+            debug!(
+                "returned local verbs read buffer to pool pool_len={} capacity={}",
+                connection.local_pool.len() + 1,
+                local.capacity()
+            );
+            connection.local_pool.push(local);
+        }
+        Ok(data)
     }
 }
 
@@ -336,6 +360,7 @@ struct VerbsRequesterConnection {
     resources: VerbsResources,
     endpoint: VolumeRdmaEndpointInfo,
     connected_remote: Option<VolumeRdmaRemoteInfo>,
+    local_pool: Vec<VerbsLocalBuffer>,
 }
 
 impl VerbsRequesterState {
@@ -356,6 +381,7 @@ impl VerbsRequesterState {
                     resources,
                     endpoint,
                     connected_remote: None,
+                    local_pool: Vec::new(),
                 })
             }
         };
@@ -529,6 +555,7 @@ struct VerbsProviderConnection {
     endpoint: VolumeRdmaEndpointInfo,
     connected_remote: Option<VolumeRdmaRemoteInfo>,
     leases: HashMap<u64, VerbsReadLease>,
+    read_pool: Vec<VerbsReadBuffer>,
 }
 
 impl VerbsProviderState {
@@ -550,6 +577,7 @@ impl VerbsProviderState {
                     endpoint,
                     connected_remote: None,
                     leases: HashMap::new(),
+                    read_pool: Vec::new(),
                 })
             }
         };
@@ -788,12 +816,21 @@ impl VerbsResources {
         Ok(())
     }
 
-    fn register_read_lease(&self, session_id: u64, data: Vec<u8>) -> Result<VerbsReadLease> {
-        VerbsReadLease::register(self.api.clone(), self.pd, session_id, data)
+    fn register_read_lease(
+        &self,
+        session_id: u64,
+        data: Vec<u8>,
+        pool: &mut Vec<VerbsReadBuffer>,
+    ) -> Result<VerbsReadLease> {
+        VerbsReadLease::from_pool(self.api.clone(), self.pd, session_id, data, pool)
     }
 
-    fn register_local_buffer(&self, length: usize) -> Result<VerbsLocalBuffer> {
-        VerbsLocalBuffer::register(self.api.clone(), self.pd, length)
+    fn acquire_local_buffer(
+        &self,
+        length: usize,
+        pool: &mut Vec<VerbsLocalBuffer>,
+    ) -> Result<VerbsLocalBuffer> {
+        VerbsLocalBuffer::from_pool(self.api.clone(), self.pd, length, pool)
     }
 
     fn post_rdma_read(
@@ -1010,33 +1047,30 @@ impl VerbsResources {
     }
 }
 
-struct VerbsReadLease {
+struct VerbsReadBuffer {
     api: Arc<VerbsApi>,
     mr: *mut IbvMr,
     data: Vec<u8>,
-    desc: VolumeRdmaDataDesc,
+    remote_addr: u64,
+    rkey: u32,
 }
 
 // Memory regions are owned by this provider and accessed under its mutex.
-unsafe impl Send for VerbsReadLease {}
+unsafe impl Send for VerbsReadBuffer {}
 
-impl fmt::Debug for VerbsReadLease {
+impl fmt::Debug for VerbsReadBuffer {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("VerbsReadLease")
+        f.debug_struct("VerbsReadBuffer")
             .field("mr", &self.mr)
-            .field("len", &self.data.len())
-            .field("desc", &self.desc)
+            .field("capacity", &self.data.len())
+            .field("remote_addr", &self.remote_addr)
+            .field("rkey", &self.rkey)
             .finish()
     }
 }
 
-impl VerbsReadLease {
-    fn register(
-        api: Arc<VerbsApi>,
-        pd: *mut IbvPd,
-        session_id: u64,
-        mut data: Vec<u8>,
-    ) -> Result<Self> {
+impl VerbsReadBuffer {
+    fn register(api: Arc<VerbsApi>, pd: *mut IbvPd, mut data: Vec<u8>) -> Result<Self> {
         let access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ;
         let mr = unsafe {
             (api.ibv_reg_mr)(
@@ -1048,30 +1082,52 @@ impl VerbsReadLease {
         };
         if mr.is_null() {
             return Err(anyhow!(
-                "ibv_reg_mr(read session {}, len={}) failed: {}",
-                session_id,
+                "ibv_reg_mr(read buffer, len={}) failed: {}",
                 data.len(),
                 std::io::Error::last_os_error()
             ));
         }
 
         let mr_prefix = unsafe { &*(mr as *const IbvMrPrefix) };
-        let desc = read_desc_from_mr(session_id, data.len(), mr_prefix)?;
+        let desc = read_desc_from_mr(0, data.len(), mr_prefix)?;
         debug!(
-            "registered verbs read MR session={} addr=0x{:x} rkey={} len={}",
-            session_id, desc.remote_addr, desc.rkey, desc.length
+            "registered verbs read MR addr=0x{:x} rkey={} capacity={}",
+            desc.remote_addr,
+            desc.rkey,
+            data.len()
         );
 
         Ok(Self {
             api,
             mr,
             data,
-            desc,
+            remote_addr: desc.remote_addr,
+            rkey: desc.rkey,
         })
     }
 
-    fn release(mut self) -> Result<()> {
-        self.deregister("release")
+    fn capacity(&self) -> usize {
+        self.data.len()
+    }
+
+    fn fill(&mut self, session_id: u64, data: &[u8]) -> Result<VolumeRdmaDataDesc> {
+        if data.is_empty() {
+            return Err(anyhow!("register_read requires data"));
+        }
+        if data.len() > self.data.len() {
+            return Err(anyhow!(
+                "pooled verbs read MR too small: capacity={} data={}",
+                self.data.len(),
+                data.len()
+            ));
+        }
+        self.data[..data.len()].copy_from_slice(data);
+        Ok(VolumeRdmaDataDesc {
+            remote_addr: self.remote_addr,
+            rkey: self.rkey,
+            length: data.len() as u32,
+            reserved: [session_id, 0, 0, 0],
+        })
     }
 
     fn deregister(&mut self, reason: &str) -> Result<()> {
@@ -1082,26 +1138,98 @@ impl VerbsReadLease {
         if rc != 0 {
             return Err(anyhow!(
                 "ibv_dereg_mr({reason}, addr=0x{:x}, rkey={}) failed: rc={} errno={}",
-                self.desc.remote_addr,
-                self.desc.rkey,
+                self.remote_addr,
+                self.rkey,
                 rc,
                 std::io::Error::last_os_error()
             ));
         }
         debug!(
-            "deregistered verbs read MR reason={} addr=0x{:x} rkey={} len={}",
-            reason, self.desc.remote_addr, self.desc.rkey, self.desc.length
+            "deregistered verbs read MR reason={} addr=0x{:x} rkey={} capacity={}",
+            reason,
+            self.remote_addr,
+            self.rkey,
+            self.data.len()
         );
         self.mr = ptr::null_mut();
         Ok(())
     }
 }
 
-impl Drop for VerbsReadLease {
+impl Drop for VerbsReadBuffer {
     fn drop(&mut self) {
         if let Err(err) = self.deregister("drop") {
             warn!("failed to deregister verbs read MR during drop: {err:#}");
         }
+    }
+}
+
+struct VerbsReadLease {
+    buffer: Option<VerbsReadBuffer>,
+    desc: VolumeRdmaDataDesc,
+}
+
+unsafe impl Send for VerbsReadLease {}
+
+impl fmt::Debug for VerbsReadLease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VerbsReadLease")
+            .field("buffer", &self.buffer)
+            .field("desc", &self.desc)
+            .finish()
+    }
+}
+
+impl VerbsReadLease {
+    fn from_pool(
+        api: Arc<VerbsApi>,
+        pd: *mut IbvPd,
+        session_id: u64,
+        data: Vec<u8>,
+        pool: &mut Vec<VerbsReadBuffer>,
+    ) -> Result<Self> {
+        if let Some(idx) = pool
+            .iter()
+            .position(|buffer| buffer.capacity() >= data.len())
+        {
+            let mut buffer = pool.swap_remove(idx);
+            let desc = buffer.fill(session_id, &data)?;
+            debug!(
+                "reused verbs read MR session={} addr=0x{:x} rkey={} len={} capacity={} pool_remaining={}",
+                session_id,
+                desc.remote_addr,
+                desc.rkey,
+                desc.length,
+                buffer.capacity(),
+                pool.len()
+            );
+            return Ok(Self {
+                buffer: Some(buffer),
+                desc,
+            });
+        }
+
+        let buffer = VerbsReadBuffer::register(api, pd, data)?;
+        let desc = VolumeRdmaDataDesc {
+            remote_addr: buffer.remote_addr,
+            rkey: buffer.rkey,
+            length: buffer.data.len() as u32,
+            reserved: [session_id, 0, 0, 0],
+        };
+        debug!(
+            "created verbs read MR session={} addr=0x{:x} rkey={} len={}",
+            session_id, desc.remote_addr, desc.rkey, desc.length
+        );
+        Ok(Self {
+            buffer: Some(buffer),
+            desc,
+        })
+    }
+
+    fn release(mut self) -> Result<VerbsReadBuffer> {
+        self.buffer
+            .take()
+            .ok_or_else(|| anyhow!("verbs read lease already released"))
     }
 }
 
@@ -1126,6 +1254,26 @@ impl fmt::Debug for VerbsLocalBuffer {
 }
 
 impl VerbsLocalBuffer {
+    fn from_pool(
+        api: Arc<VerbsApi>,
+        pd: *mut IbvPd,
+        length: usize,
+        pool: &mut Vec<VerbsLocalBuffer>,
+    ) -> Result<Self> {
+        if let Some(idx) = pool.iter().position(|buffer| buffer.capacity() >= length) {
+            let buffer = pool.swap_remove(idx);
+            debug!(
+                "reused local verbs read buffer lkey={} capacity={} requested={} pool_remaining={}",
+                buffer.lkey,
+                buffer.capacity(),
+                length,
+                pool.len()
+            );
+            return Ok(buffer);
+        }
+        Self::register(api, pd, length)
+    }
+
     fn register(api: Arc<VerbsApi>, pd: *mut IbvPd, length: usize) -> Result<Self> {
         if length == 0 {
             return Err(anyhow!("local RDMA read buffer length is zero"));
@@ -1183,9 +1331,19 @@ impl VerbsLocalBuffer {
         })
     }
 
-    fn into_vec(mut self) -> Result<Vec<u8>> {
-        self.deregister("complete")?;
-        Ok(std::mem::take(&mut self.data))
+    fn capacity(&self) -> usize {
+        self.data.len()
+    }
+
+    fn read_vec(&self, length: usize) -> Result<Vec<u8>> {
+        if length > self.data.len() {
+            return Err(anyhow!(
+                "local RDMA read buffer shorter than completed read: capacity={} length={}",
+                self.data.len(),
+                length
+            ));
+        }
+        Ok(self.data[..length].to_vec())
     }
 
     fn deregister(&mut self, reason: &str) -> Result<()> {
