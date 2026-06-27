@@ -38,7 +38,6 @@ func TestVolumeRdmaEngineClientEndpointAndRegistrar(t *testing.T) {
 					t.Errorf("decode request: %v", err)
 					return
 				}
-				requests <- req
 				resp := volumeRdmaEngineResponse{OK: true}
 				switch req.Op {
 				case volumeRdmaEngineOpLocal:
@@ -55,6 +54,18 @@ func TestVolumeRdmaEngineClientEndpointAndRegistrar(t *testing.T) {
 					}
 				case volumeRdmaEngineOpConnect:
 				case volumeRdmaEngineOpRegisterRead:
+					if !req.DataSideband {
+						t.Errorf("register_read did not request sideband data")
+					}
+					if len(req.Data) != 0 {
+						t.Errorf("register_read JSON data = %q, want empty", req.Data)
+					}
+					sideband, err := readVolumeRdmaEngineFrame(conn)
+					if err != nil {
+						t.Errorf("read sideband: %v", err)
+						return
+					}
+					req.Data = sideband
 					if string(req.Data) != "needle-data" {
 						t.Errorf("register data = %q", req.Data)
 					}
@@ -69,6 +80,7 @@ func TestVolumeRdmaEngineClientEndpointAndRegistrar(t *testing.T) {
 					resp.OK = false
 					resp.Error = "unknown op"
 				}
+				requests <- req
 				encoded, err := json.Marshal(resp)
 				if err != nil {
 					t.Errorf("encode response: %v", err)

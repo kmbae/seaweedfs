@@ -156,6 +156,8 @@ pub struct EngineRequest {
     pub session_id: u64,
     #[serde(default)]
     pub timeout_ms: u64,
+    #[serde(default)]
+    pub data_sideband: bool,
     #[serde(default, deserialize_with = "deserialize_go_json_bytes")]
     pub data: Vec<u8>,
 }
@@ -245,8 +247,16 @@ impl VolumeNativeEngine {
 
     async fn handle_stream(self: Arc<Self>, mut stream: UnixStream) -> Result<()> {
         let frame = read_frame(&mut stream).await?;
-        let request: EngineRequest =
+        let mut request: EngineRequest =
             serde_json::from_slice(&frame).context("decode volume RDMA engine request")?;
+        if request.data_sideband {
+            if !request.data.is_empty() {
+                return Err(anyhow!("data_sideband request must not include JSON data"));
+            }
+            request.data = read_frame(&mut stream)
+                .await
+                .context("read volume RDMA engine data sideband")?;
+        }
         debug!("volume RDMA engine request: {:?}", request);
         let response = self.process_request(request).await;
         let payload =
@@ -803,6 +813,7 @@ mod tests {
                 desc: None,
                 session_id: 0,
                 timeout_ms: 0,
+                data_sideband: false,
                 data: Vec::new(),
             })
             .await;
@@ -830,6 +841,7 @@ mod tests {
                 desc: None,
                 session_id: 0,
                 timeout_ms: 0,
+                data_sideband: false,
                 data: Vec::new(),
             })
             .await;
@@ -855,6 +867,7 @@ mod tests {
                 desc: None,
                 session_id: 0,
                 timeout_ms: 0,
+                data_sideband: false,
                 data: Vec::new(),
             })
             .await;
@@ -879,6 +892,7 @@ mod tests {
                 desc: None,
                 session_id: 0,
                 timeout_ms: 0,
+                data_sideband: false,
                 data: Vec::new(),
             })
             .await;
@@ -891,6 +905,7 @@ mod tests {
                 desc: None,
                 session_id: 0,
                 timeout_ms: 0,
+                data_sideband: false,
                 data: b"needle-data".to_vec(),
             })
             .await;
@@ -916,6 +931,7 @@ mod tests {
                 desc: None,
                 session_id,
                 timeout_ms: 0,
+                data_sideband: false,
                 data: Vec::new(),
             })
             .await;
@@ -934,6 +950,7 @@ mod tests {
                 desc: None,
                 session_id: 0,
                 timeout_ms: 0,
+                data_sideband: false,
                 data: Vec::new(),
             })
             .await;
@@ -952,6 +969,7 @@ mod tests {
                 desc: None,
                 session_id: 0,
                 timeout_ms: 0,
+                data_sideband: false,
                 data: Vec::new(),
             })
             .await;
@@ -979,6 +997,7 @@ mod tests {
                 desc: None,
                 session_id: 0,
                 timeout_ms: 0,
+                data_sideband: false,
                 data: Vec::new(),
             })
             .await;
@@ -1005,6 +1024,7 @@ mod tests {
                 }),
                 session_id: 0,
                 timeout_ms: 10,
+                data_sideband: false,
                 data: Vec::new(),
             })
             .await;
@@ -1024,6 +1044,74 @@ mod tests {
         let request: EngineRequest =
             serde_json::from_str(r#"{"op":"register_read","data":[1,2,3]}"#).unwrap();
         assert_eq!(request.data, vec![1, 2, 3]);
+    }
+
+    #[tokio::test]
+    async fn handle_stream_accepts_register_read_data_sideband() {
+        let (engine, provider, _) = mock_engine();
+        let local = engine
+            .process_request(EngineRequest {
+                op: "local".to_string(),
+                connection_id: 0,
+                remote: None,
+                desc: None,
+                session_id: 0,
+                timeout_ms: 0,
+                data_sideband: false,
+                data: Vec::new(),
+            })
+            .await;
+        assert!(local.ok);
+        let connection_id = local.connection_id;
+        let connect = engine
+            .process_request(EngineRequest {
+                op: "connect".to_string(),
+                connection_id,
+                remote: Some(VolumeRdmaRemoteInfo {
+                    abi_version: ABI_VERSION,
+                    flags: 0,
+                    qpn: 10,
+                    lid: 1,
+                    psn: 2,
+                    port: 1,
+                    gid_index: 0,
+                    sl: 0,
+                    gid: [0; 16],
+                    reserved: [0; 8],
+                }),
+                desc: None,
+                session_id: 0,
+                timeout_ms: 0,
+                data_sideband: false,
+                data: Vec::new(),
+            })
+            .await;
+        assert!(connect.ok);
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let engine = Arc::new(engine);
+        let server_task = tokio::spawn(async move { engine.handle_stream(server).await });
+        let request = serde_json::json!({
+            "op": "register_read",
+            "connection_id": connection_id,
+            "data_sideband": true,
+        });
+        write_frame(
+            &mut client,
+            serde_json::to_string(&request).unwrap().as_bytes(),
+        )
+        .await
+        .unwrap();
+        write_frame(&mut client, b"sideband-data").await.unwrap();
+        let response_payload = read_frame(&mut client).await.unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&response_payload).unwrap();
+        assert_eq!(response["ok"], true);
+        let session_id = response["session_id"].as_u64().unwrap();
+        assert_eq!(
+            provider.lease_data(session_id).await.unwrap(),
+            b"sideband-data"
+        );
+        server_task.await.unwrap().unwrap();
     }
 
     #[test]

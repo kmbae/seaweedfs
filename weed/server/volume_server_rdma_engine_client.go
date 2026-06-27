@@ -34,6 +34,7 @@ type volumeRdmaEngineRequest struct {
 	ConnectionID uint64                `json:"connection_id,omitempty"`
 	Remote       *VolumeRdmaRemoteInfo `json:"remote,omitempty"`
 	SessionID    uint64                `json:"session_id,omitempty"`
+	DataSideband bool                  `json:"data_sideband,omitempty"`
 	Data         []byte                `json:"data,omitempty"`
 }
 
@@ -121,11 +122,11 @@ func (c *VolumeRdmaEngineClient) RegisterReadBufferFor(ctx context.Context, conn
 	if len(data) == 0 {
 		return nil, fmt.Errorf("native RDMA register_read requires data")
 	}
-	resp, err := c.roundTrip(ctx, volumeRdmaEngineRequest{
+	resp, err := c.roundTripWithSideband(ctx, volumeRdmaEngineRequest{
 		Op:           volumeRdmaEngineOpRegisterRead,
 		ConnectionID: connectionID,
-		Data:         data,
-	})
+		DataSideband: true,
+	}, data)
 	if err != nil {
 		return nil, err
 	}
@@ -161,6 +162,10 @@ func (b *volumeRdmaEngineRegisteredBuffer) Release(ctx context.Context) error {
 }
 
 func (c *VolumeRdmaEngineClient) roundTrip(ctx context.Context, req volumeRdmaEngineRequest) (*volumeRdmaEngineResponse, error) {
+	return c.roundTripWithSideband(ctx, req, nil)
+}
+
+func (c *VolumeRdmaEngineClient) roundTripWithSideband(ctx context.Context, req volumeRdmaEngineRequest, sideband []byte) (*volumeRdmaEngineResponse, error) {
 	if c == nil || strings.TrimSpace(c.SocketPath) == "" {
 		return nil, ErrVolumeRdmaReadNotConfigured
 	}
@@ -181,6 +186,9 @@ func (c *VolumeRdmaEngineClient) roundTrip(ctx context.Context, req volumeRdmaEn
 	if len(payload) > volumeRdmaEngineMaxFrameSize {
 		return nil, fmt.Errorf("native RDMA engine request too large: %d bytes", len(payload))
 	}
+	if sideband != nil && len(sideband) > volumeRdmaEngineMaxFrameSize {
+		return nil, fmt.Errorf("native RDMA engine sideband too large: %d bytes", len(sideband))
+	}
 
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "unix", c.SocketPath)
@@ -193,6 +201,11 @@ func (c *VolumeRdmaEngineClient) roundTrip(ctx context.Context, req volumeRdmaEn
 	}
 	if err := writeVolumeRdmaEngineFrame(conn, payload); err != nil {
 		return nil, fmt.Errorf("%w: write request: %v", ErrVolumeRdmaEngineUnavailable, err)
+	}
+	if sideband != nil {
+		if err := writeVolumeRdmaEngineFrame(conn, sideband); err != nil {
+			return nil, fmt.Errorf("%w: write request sideband: %v", ErrVolumeRdmaEngineUnavailable, err)
+		}
 	}
 	responsePayload, err := readVolumeRdmaEngineFrame(conn)
 	if err != nil {
