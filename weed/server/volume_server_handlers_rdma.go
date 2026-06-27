@@ -3,6 +3,7 @@ package weed_server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 )
@@ -64,11 +65,11 @@ func (vs *VolumeServer) volumeRdmaReadDescHandler(w http.ResponseWriter, r *http
 
 	lease, err := vs.rdmaReadExporter.PrepareRead(r.Context(), req)
 	if err != nil {
-		writeJsonError(w, r, http.StatusServiceUnavailable, err)
+		writeJsonError(w, r, volumeRdmaReadHTTPStatus(err), err)
 		return
 	}
 	if lease == nil || lease.Desc.RemoteAddr == 0 || lease.Desc.RKey == 0 || lease.Desc.Length == 0 {
-		writeJsonError(w, r, http.StatusServiceUnavailable, fmt.Errorf("native RDMA read exporter returned no exportable descriptor"))
+		writeJsonError(w, r, http.StatusNotImplemented, fmt.Errorf("native RDMA read exporter returned no exportable descriptor"))
 		return
 	}
 	writeJsonQuiet(w, r, http.StatusOK, volumeRdmaReadDescResponse{
@@ -97,8 +98,21 @@ func (vs *VolumeServer) volumeRdmaReleaseDescHandler(w http.ResponseWriter, r *h
 		return
 	}
 	if err := vs.rdmaReadExporter.ReleaseRead(r.Context(), req.SessionID); err != nil {
-		writeJsonError(w, r, http.StatusServiceUnavailable, err)
+		writeJsonError(w, r, volumeRdmaReadHTTPStatus(err), err)
 		return
 	}
 	writeJsonQuiet(w, r, http.StatusOK, map[string]bool{"released": true})
+}
+
+func volumeRdmaReadHTTPStatus(err error) int {
+	switch {
+	case err == nil:
+		return http.StatusOK
+	case errors.Is(err, ErrVolumeRdmaReadNotConfigured), errors.Is(err, ErrVolumeRdmaReadNotExportable):
+		return http.StatusNotImplemented
+	case errors.Is(err, ErrVolumeRdmaReadTooLarge):
+		return http.StatusRequestEntityTooLarge
+	default:
+		return http.StatusServiceUnavailable
+	}
 }

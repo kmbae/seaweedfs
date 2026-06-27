@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -13,16 +14,47 @@ type fakeVolumeRdmaReadExporter struct {
 	req             VolumeRdmaReadRequest
 	releasedSession uint64
 	lease           *VolumeRdmaReadLease
+	err             error
 }
 
 func (e *fakeVolumeRdmaReadExporter) PrepareRead(ctx context.Context, req VolumeRdmaReadRequest) (*VolumeRdmaReadLease, error) {
 	e.req = req
+	if e.err != nil {
+		return nil, e.err
+	}
 	return e.lease, nil
 }
 
 func (e *fakeVolumeRdmaReadExporter) ReleaseRead(ctx context.Context, sessionID uint64) error {
 	e.releasedSession = sessionID
 	return nil
+}
+
+func TestVolumeRdmaReadDescHandlerMapsExporterErrors(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		code int
+	}{
+		{"not_configured", ErrVolumeRdmaReadNotConfigured, http.StatusNotImplemented},
+		{"not_exportable", ErrVolumeRdmaReadNotExportable, http.StatusNotImplemented},
+		{"too_large", ErrVolumeRdmaReadTooLarge, http.StatusRequestEntityTooLarge},
+		{"unavailable", errors.New("device unavailable"), http.StatusServiceUnavailable},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			vs := &VolumeServer{rdmaReadExporter: &fakeVolumeRdmaReadExporter{err: tt.err}}
+			req := httptest.NewRequest(http.MethodPost, "/rdma/native/read-desc", bytes.NewBufferString(`{"volume_id":3,"needle_id":123,"size":4096}`))
+			rec := httptest.NewRecorder()
+
+			vs.volumeRdmaReadDescHandler(rec, req)
+
+			if rec.Code != tt.code {
+				t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+			}
+		})
+	}
 }
 
 func TestVolumeRdmaReadDescHandlerReturnsDescriptor(t *testing.T) {
