@@ -85,18 +85,21 @@ impl Default for VolumeVerbsConfig {
 
 #[derive(Debug)]
 pub struct RealVerbsVolumeRdmaProvider {
+    config: VolumeVerbsConfig,
     state: Mutex<VerbsProviderState>,
 }
 
 impl RealVerbsVolumeRdmaProvider {
     pub fn new(config: VolumeVerbsConfig) -> Result<Self> {
-        let resources = VerbsResources::open(config)?;
+        let resources = VerbsResources::open(config.clone())?;
         let endpoint = resources.endpoint.clone();
         Ok(Self {
+            config,
             state: Mutex::new(VerbsProviderState {
-                _resources: resources,
+                resources,
                 endpoint,
                 connected_remote: None,
+                cached_resources: Vec::new(),
                 next_session_id: 1,
                 leases: HashMap::new(),
             }),
@@ -104,10 +107,13 @@ impl RealVerbsVolumeRdmaProvider {
     }
 
     pub fn local_endpoint_info(&self) -> Result<VolumeRdmaEndpointInfo> {
-        let state = self
+        let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("verbs provider mutex poisoned"))?;
+        if state.connected_remote.is_some() {
+            state.rotate_resources(&self.config)?;
+        }
         let mut endpoint = state.endpoint.clone();
         endpoint.qp_connected = state.connected_remote.is_some();
         Ok(endpoint)
@@ -129,8 +135,8 @@ impl RealVerbsVolumeRdmaProvider {
                 existing.psn
             ));
         }
-        state._resources.connect(&remote)?;
-        state.endpoint = state._resources.endpoint.clone();
+        state.resources.connect(&remote)?;
+        state.endpoint = state.resources.endpoint.clone();
         state.connected_remote = Some(remote);
         Ok(())
     }
@@ -147,7 +153,7 @@ impl RealVerbsVolumeRdmaProvider {
         )?;
 
         let session_id = state.next_session_id()?;
-        let lease = state._resources.register_read_lease(session_id, data)?;
+        let lease = state.resources.register_read_lease(session_id, data)?;
         let desc = lease.desc.clone();
         state.leases.insert(session_id, lease);
 
@@ -187,28 +193,34 @@ impl VolumeRdmaProvider for RealVerbsVolumeRdmaProvider {
 
 #[derive(Debug)]
 pub struct RealVerbsVolumeRdmaRequester {
+    config: VolumeVerbsConfig,
     state: Mutex<VerbsRequesterState>,
 }
 
 impl RealVerbsVolumeRdmaRequester {
     pub fn new(config: VolumeVerbsConfig) -> Result<Self> {
-        let resources = VerbsResources::open(config)?;
+        let resources = VerbsResources::open(config.clone())?;
         let endpoint = resources.endpoint.clone();
         Ok(Self {
+            config,
             state: Mutex::new(VerbsRequesterState {
                 resources,
                 endpoint,
                 connected_remote: None,
+                cached_resources: Vec::new(),
                 next_wr_id: 1,
             }),
         })
     }
 
     pub fn local_endpoint_info(&self) -> Result<VolumeRdmaEndpointInfo> {
-        let state = self
+        let mut state = self
             .state
             .lock()
             .map_err(|_| anyhow!("verbs requester mutex poisoned"))?;
+        if state.connected_remote.is_some() {
+            state.rotate_resources(&self.config)?;
+        }
         let mut endpoint = state.endpoint.clone();
         endpoint.qp_connected = state.connected_remote.is_some();
         Ok(endpoint)
@@ -279,10 +291,21 @@ struct VerbsRequesterState {
     resources: VerbsResources,
     endpoint: VolumeRdmaEndpointInfo,
     connected_remote: Option<VolumeRdmaRemoteInfo>,
+    cached_resources: Vec<VerbsResources>,
     next_wr_id: u64,
 }
 
 impl VerbsRequesterState {
+    fn rotate_resources(&mut self, config: &VolumeVerbsConfig) -> Result<()> {
+        let new_resources = VerbsResources::open(config.clone())
+            .context("open replacement requester QP for new native RDMA peer")?;
+        let old_resources = std::mem::replace(&mut self.resources, new_resources);
+        self.cached_resources.push(old_resources);
+        self.endpoint = self.resources.endpoint.clone();
+        self.connected_remote = None;
+        Ok(())
+    }
+
     fn next_wr_id(&mut self) -> Result<u64> {
         let wr_id = self.next_wr_id;
         if wr_id == 0 {
@@ -419,14 +442,25 @@ pub fn endpoint_to_remote_info(
 
 #[derive(Debug)]
 struct VerbsProviderState {
-    _resources: VerbsResources,
+    resources: VerbsResources,
     endpoint: VolumeRdmaEndpointInfo,
     connected_remote: Option<VolumeRdmaRemoteInfo>,
+    cached_resources: Vec<VerbsResources>,
     next_session_id: u64,
     leases: HashMap<u64, VerbsReadLease>,
 }
 
 impl VerbsProviderState {
+    fn rotate_resources(&mut self, config: &VolumeVerbsConfig) -> Result<()> {
+        let new_resources = VerbsResources::open(config.clone())
+            .context("open replacement provider QP for new native RDMA peer")?;
+        let old_resources = std::mem::replace(&mut self.resources, new_resources);
+        self.cached_resources.push(old_resources);
+        self.endpoint = self.resources.endpoint.clone();
+        self.connected_remote = None;
+        Ok(())
+    }
+
     fn next_session_id(&mut self) -> Result<u64> {
         let session_id = self.next_session_id;
         if session_id == 0 {
