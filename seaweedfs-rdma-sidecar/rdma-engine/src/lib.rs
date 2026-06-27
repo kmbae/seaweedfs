@@ -1,5 +1,5 @@
 //! High-Performance RDMA Engine for SeaweedFS
-//! 
+//!
 //! This crate provides a high-performance RDMA (Remote Direct Memory Access) engine
 //! designed to accelerate data transfer operations in SeaweedFS. It communicates with
 //! the Go-based sidecar via IPC and handles the performance-critical RDMA operations.
@@ -22,19 +22,20 @@
 //! - `mock-rdma` (default): Mock RDMA operations for testing and development
 //! - `real-rdma`: Real RDMA hardware integration using rdma-core bindings
 
-use std::sync::Arc;
 use anyhow::Result;
+use std::sync::Arc;
 
-pub mod ucx;
-pub mod rdma;
+pub mod buffer_pool;
+pub mod error;
 pub mod ipc;
-pub mod session;
 pub mod local_volume;
 pub mod memory;
-pub mod error;
-pub mod network;
-pub mod buffer_pool;
+pub mod metrics;
 pub mod needle_blob;
+pub mod network;
+pub mod rdma;
+pub mod session;
+pub mod ucx;
 pub mod volume_grpc;
 
 pub use error::{RdmaError, RdmaResult};
@@ -68,7 +69,7 @@ impl Default for RdmaEngineConfig {
             device_name: "mlx5_0".to_string(),
             port: 18515,
             max_sessions: 1000,
-            session_timeout_secs: 300, // 5 minutes
+            session_timeout_secs: 300,       // 5 minutes
             buffer_size: 1024 * 1024 * 1024, // 1GB
             ipc_socket_path: "/tmp/rdma-engine.sock".to_string(),
             debug: false,
@@ -83,6 +84,7 @@ pub struct RdmaEngine {
     config: RdmaEngineConfig,
     rdma_context: Arc<rdma::RdmaContext>,
     session_manager: Arc<session::SessionManager>,
+    metrics: Arc<metrics::Metrics>,
     ipc_server: Option<ipc::IpcServer>,
 }
 
@@ -90,69 +92,86 @@ impl RdmaEngine {
     /// Create a new RDMA engine with the given configuration
     pub async fn new(config: RdmaEngineConfig) -> Result<Self> {
         tracing::info!("Initializing RDMA engine with config: {:?}", config);
-        
+
         // Initialize RDMA context
         let rdma_context = Arc::new(rdma::RdmaContext::new(&config).await?);
-        
+
         // Initialize session manager
         let session_manager = Arc::new(session::SessionManager::new(
             config.max_sessions,
             std::time::Duration::from_secs(config.session_timeout_secs),
         ));
-        
+        let metrics = metrics::Metrics::new();
+
         Ok(Self {
             config,
             rdma_context,
             session_manager,
+            metrics,
             ipc_server: None,
         })
     }
-    
+
     /// Start the RDMA engine server
     pub async fn run(&mut self) -> Result<()> {
-        tracing::info!("Starting RDMA engine server on {}", self.config.ipc_socket_path);
-        
+        tracing::info!(
+            "Starting RDMA engine server on {}",
+            self.config.ipc_socket_path
+        );
+
         // Start IPC server
         let ipc_server = ipc::IpcServer::new(
             &self.config.ipc_socket_path,
             self.rdma_context.clone(),
             self.session_manager.clone(),
-        ).await?;
-        
+        )
+        .await?;
+
         self.ipc_server = Some(ipc_server);
-        
+
         // Start session cleanup task
         let session_manager = self.session_manager.clone();
         tokio::spawn(async move {
             session_manager.start_cleanup_task().await;
         });
 
+        if let Some(addr) = metrics::metrics_addr_from_env() {
+            let metrics = self.metrics.clone();
+            tokio::spawn(async move {
+                metrics::serve(metrics, addr).await;
+            });
+        }
+
         // Remote read listener (TCP over IB/RoCE CNI IP, port from config)
-        let network_server = network::NetworkServer::new(&self.config, self.rdma_context.clone());
+        let network_server = network::NetworkServer::new(
+            &self.config,
+            self.rdma_context.clone(),
+            self.metrics.clone(),
+        );
         tokio::spawn(async move {
             if let Err(e) = network_server.run().await {
                 tracing::error!("Network server error: {}", e);
             }
         });
-        
+
         // Run IPC server
         if let Some(ref mut server) = self.ipc_server {
             server.run().await?;
         }
-        
+
         Ok(())
     }
-    
+
     /// Shutdown the RDMA engine
     pub async fn shutdown(&mut self) -> Result<()> {
         tracing::info!("Shutting down RDMA engine");
-        
+
         if let Some(ref mut server) = self.ipc_server {
             server.shutdown().await?;
         }
-        
+
         self.session_manager.shutdown().await;
-        
+
         Ok(())
     }
 }
@@ -160,12 +179,12 @@ impl RdmaEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[tokio::test]
     async fn test_rdma_engine_creation() {
         let config = RdmaEngineConfig::default();
         let result = RdmaEngine::new(config).await;
-        
+
         // Should succeed with mock RDMA
         assert!(result.is_ok());
     }

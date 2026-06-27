@@ -1,5 +1,5 @@
 //! RDMA operations and context management
-//! 
+//!
 //! This module provides both mock and real RDMA implementations:
 //! - Mock implementation for development and testing
 //! - Real implementation using libibverbs for production
@@ -138,10 +138,10 @@ impl MockRdmaContext {
         warn!("🟡 Using MOCK RDMA implementation - for development only!");
         info!("   Device: {} (mock)", config.device_name);
         info!("   Port: {} (mock)", config.port);
-        
+
         let device_info = RdmaDeviceInfo {
             name: config.device_name.clone(),
-            vendor_id: 0x02c9, // Mellanox mock vendor ID
+            vendor_id: 0x02c9,      // Mellanox mock vendor ID
             vendor_part_id: 0x1017, // ConnectX-5 mock part ID
             hw_ver: 0,
             max_mr: 131072,
@@ -151,7 +151,7 @@ impl MockRdmaContext {
             port_gid: "fe80:0000:0000:0000:0200:5eff:fe12:3456".to_string(),
             port_lid: 1,
         };
-        
+
         Ok(Self {
             device_info,
             registered_regions: RwLock::new(Vec::new()),
@@ -163,11 +163,14 @@ impl MockRdmaContext {
 
 impl MockRdmaContext {
     pub async fn register_memory(&self, addr: u64, size: usize) -> RdmaResult<MemoryRegion> {
-        debug!("🟡 Mock: Registering memory region addr=0x{:x}, size={}", addr, size);
-        
+        debug!(
+            "🟡 Mock: Registering memory region addr=0x{:x}, size={}",
+            addr, size
+        );
+
         // Simulate registration delay
         tokio::time::sleep(tokio::time::Duration::from_micros(10)).await;
-        
+
         let region = MemoryRegion {
             addr,
             rkey: 0x12345678, // Mock remote key
@@ -176,34 +179,40 @@ impl MockRdmaContext {
             size,
             registered: true,
         };
-        
+
         self.registered_regions.write().push(region.clone());
-        
+
         Ok(region)
     }
-    
+
     pub async fn deregister_memory(&self, region: &MemoryRegion) -> RdmaResult<()> {
-        debug!("🟡 Mock: Deregistering memory region rkey=0x{:x}", region.rkey);
-        
+        debug!(
+            "🟡 Mock: Deregistering memory region rkey=0x{:x}",
+            region.rkey
+        );
+
         let mut regions = self.registered_regions.write();
         regions.retain(|r| r.rkey != region.rkey);
-        
+
         Ok(())
     }
-    
-    pub async fn post_read(&self, 
-        local_addr: u64, 
-        remote_addr: u64, 
-        rkey: u32, 
+
+    pub async fn post_read(
+        &self,
+        local_addr: u64,
+        remote_addr: u64,
+        rkey: u32,
         size: usize,
         wr_id: u64,
     ) -> RdmaResult<()> {
-        debug!("🟡 Mock: RDMA READ local=0x{:x}, remote=0x{:x}, rkey=0x{:x}, size={}", 
-               local_addr, remote_addr, rkey, size);
-        
+        debug!(
+            "🟡 Mock: RDMA READ local=0x{:x}, remote=0x{:x}, rkey=0x{:x}, size={}",
+            local_addr, remote_addr, rkey, size
+        );
+
         // Simulate RDMA read latency (much faster than real network, but realistic for mock)
         tokio::time::sleep(tokio::time::Duration::from_nanos(150)).await;
-        
+
         // Mock data transfer - copy pattern data to local address
         let data_ptr = local_addr as *mut u8;
         unsafe {
@@ -211,7 +220,7 @@ impl MockRdmaContext {
                 *data_ptr.add(i) = (i % 256) as u8; // Pattern: 0,1,2,...,255,0,1,2...
             }
         }
-        
+
         // Create completion
         let completion = WorkCompletion {
             wr_id,
@@ -220,25 +229,28 @@ impl MockRdmaContext {
             byte_len: size as u32,
             imm_data: None,
         };
-        
+
         self.pending_operations.write().push(completion);
-        
+
         Ok(())
     }
-    
-    pub async fn post_write(&self, 
-        local_addr: u64, 
-        remote_addr: u64, 
-        rkey: u32, 
+
+    pub async fn post_write(
+        &self,
+        local_addr: u64,
+        remote_addr: u64,
+        rkey: u32,
         size: usize,
         wr_id: u64,
     ) -> RdmaResult<()> {
-        debug!("🟡 Mock: RDMA WRITE local=0x{:x}, remote=0x{:x}, rkey=0x{:x}, size={}", 
-               local_addr, remote_addr, rkey, size);
-        
+        debug!(
+            "🟡 Mock: RDMA WRITE local=0x{:x}, remote=0x{:x}, rkey=0x{:x}, size={}",
+            local_addr, remote_addr, rkey, size
+        );
+
         // Simulate RDMA write latency
         tokio::time::sleep(tokio::time::Duration::from_nanos(100)).await;
-        
+
         // Create completion
         let completion = WorkCompletion {
             wr_id,
@@ -247,20 +259,20 @@ impl MockRdmaContext {
             byte_len: size as u32,
             imm_data: None,
         };
-        
+
         self.pending_operations.write().push(completion);
-        
+
         Ok(())
     }
-    
+
     pub async fn poll_completion(&self, max_completions: usize) -> RdmaResult<Vec<WorkCompletion>> {
         let mut operations = self.pending_operations.write();
         let available = operations.len().min(max_completions);
         let completions = operations.drain(..available).collect();
-        
+
         Ok(completions)
     }
-    
+
     pub fn device_info(&self) -> &RdmaDeviceInfo {
         &self.device_info
     }
@@ -281,9 +293,7 @@ impl UcxRdmaContext {
         let device_info = detect_active_rdma_device(&config.device_name)?;
         info!(
             "✅ Active RDMA device selected: {} gid={} lid={}",
-            device_info.name,
-            device_info.port_gid,
-            device_info.port_lid
+            device_info.name, device_info.port_gid, device_info.port_lid
         );
         Ok(Self {
             ucx,
@@ -369,7 +379,14 @@ impl UcxRdmaContext {
         size: usize,
         wr_id: u64,
     ) -> RdmaResult<()> {
-        self.ucx.get_from_peer(peer_key, worker_address, local_addr, remote_addr, remote_rkey, size)?;
+        self.ucx.get_from_peer(
+            peer_key,
+            worker_address,
+            local_addr,
+            remote_addr,
+            remote_rkey,
+            size,
+        )?;
         self.pending_operations.write().push(WorkCompletion {
             wr_id,
             status: CompletionStatus::Success,
@@ -390,7 +407,14 @@ impl UcxRdmaContext {
         size: usize,
         wr_id: u64,
     ) -> RdmaResult<()> {
-        self.ucx.put_to_peer(peer_key, worker_address, local_addr, remote_addr, remote_rkey, size)?;
+        self.ucx.put_to_peer(
+            peer_key,
+            worker_address,
+            local_addr,
+            remote_addr,
+            remote_rkey,
+            size,
+        )?;
         self.pending_operations.write().push(WorkCompletion {
             wr_id,
             status: CompletionStatus::Success,
@@ -416,11 +440,7 @@ impl UcxRdmaContext {
 fn detect_active_rdma_device(preferred_device: &str) -> RdmaResult<RdmaDeviceInfo> {
     let sysfs = Path::new("/sys/class/infiniband");
     let entries = fs::read_dir(sysfs).map_err(|err| {
-        RdmaError::context_init_failed(format!(
-            "cannot read {}: {}",
-            sysfs.display(),
-            err
-        ))
+        RdmaError::context_init_failed(format!("cannot read {}: {}", sysfs.display(), err))
     })?;
 
     let prefer_auto = preferred_device.is_empty() || preferred_device == "auto";
@@ -447,7 +467,11 @@ fn detect_active_rdma_device(preferred_device: &str) -> RdmaResult<RdmaDeviceInf
     Err(RdmaError::context_init_failed(format!(
         "no ACTIVE RDMA device with a valid LID found for preference '{}'; seen devices: {}",
         preferred_device,
-        if seen.is_empty() { "<none>".to_string() } else { seen.join(",") }
+        if seen.is_empty() {
+            "<none>".to_string()
+        } else {
+            seen.join(",")
+        }
     )))
 }
 
@@ -589,7 +613,7 @@ impl RdmaContext {
             RdmaContextImpl::Mock(_) => None,
             #[cfg(feature = "real-ucx")]
             RdmaContextImpl::Ucx(ctx) => {
-                use base64::{Engine as _, engine::general_purpose::STANDARD};
+                use base64::{engine::general_purpose::STANDARD, Engine as _};
                 Some(STANDARD.encode(ctx.ucx.worker_address()))
             }
         }
@@ -620,9 +644,15 @@ impl RdmaContext {
         wr_id: u64,
     ) -> RdmaResult<()> {
         match &self.inner {
-            RdmaContextImpl::Mock(ctx) => ctx.post_read(local_addr, remote_addr, rkey, size, wr_id).await,
+            RdmaContextImpl::Mock(ctx) => {
+                ctx.post_read(local_addr, remote_addr, rkey, size, wr_id)
+                    .await
+            }
             #[cfg(feature = "real-ucx")]
-            RdmaContextImpl::Ucx(ctx) => ctx.post_read(local_addr, remote_addr, rkey, size, wr_id).await,
+            RdmaContextImpl::Ucx(ctx) => {
+                ctx.post_read(local_addr, remote_addr, rkey, size, wr_id)
+                    .await
+            }
         }
     }
 
@@ -635,9 +665,15 @@ impl RdmaContext {
         wr_id: u64,
     ) -> RdmaResult<()> {
         match &self.inner {
-            RdmaContextImpl::Mock(ctx) => ctx.post_write(local_addr, remote_addr, rkey, size, wr_id).await,
+            RdmaContextImpl::Mock(ctx) => {
+                ctx.post_write(local_addr, remote_addr, rkey, size, wr_id)
+                    .await
+            }
             #[cfg(feature = "real-ucx")]
-            RdmaContextImpl::Ucx(ctx) => ctx.post_write(local_addr, remote_addr, rkey, size, wr_id).await,
+            RdmaContextImpl::Ucx(ctx) => {
+                ctx.post_write(local_addr, remote_addr, rkey, size, wr_id)
+                    .await
+            }
         }
     }
 
@@ -652,11 +688,22 @@ impl RdmaContext {
         wr_id: u64,
     ) -> RdmaResult<()> {
         match &self.inner {
-            RdmaContextImpl::Mock(_) => Err(RdmaError::invalid_request("peer RDMA requires real UCX context")),
+            RdmaContextImpl::Mock(_) => Err(RdmaError::invalid_request(
+                "peer RDMA requires real UCX context",
+            )),
             #[cfg(feature = "real-ucx")]
-            RdmaContextImpl::Ucx(ctx) => ctx
-                .post_read_peer(peer_key, worker_address, local_addr, remote_addr, remote_rkey, size, wr_id)
-                .await,
+            RdmaContextImpl::Ucx(ctx) => {
+                ctx.post_read_peer(
+                    peer_key,
+                    worker_address,
+                    local_addr,
+                    remote_addr,
+                    remote_rkey,
+                    size,
+                    wr_id,
+                )
+                .await
+            }
         }
     }
 
@@ -671,11 +718,22 @@ impl RdmaContext {
         wr_id: u64,
     ) -> RdmaResult<()> {
         match &self.inner {
-            RdmaContextImpl::Mock(_) => Err(RdmaError::invalid_request("peer RDMA requires real UCX context")),
+            RdmaContextImpl::Mock(_) => Err(RdmaError::invalid_request(
+                "peer RDMA requires real UCX context",
+            )),
             #[cfg(feature = "real-ucx")]
-            RdmaContextImpl::Ucx(ctx) => ctx
-                .post_write_peer(peer_key, worker_address, local_addr, remote_addr, remote_rkey, size, wr_id)
-                .await,
+            RdmaContextImpl::Ucx(ctx) => {
+                ctx.post_write_peer(
+                    peer_key,
+                    worker_address,
+                    local_addr,
+                    remote_addr,
+                    remote_rkey,
+                    size,
+                    wr_id,
+                )
+                .await
+            }
         }
     }
 
@@ -699,17 +757,17 @@ impl RdmaContext {
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[tokio::test]
     async fn test_mock_rdma_context() {
         let config = RdmaEngineConfig::default();
         let ctx = RdmaContext::new(&config).await.unwrap();
-        
+
         // Test device info
         let info = ctx.device_info();
         assert_eq!(info.name, "mlx5_0");
         assert!(info.max_mr > 0);
-        
+
         // Test memory registration
         let addr = 0x7f000000u64;
         let size = 4096;
@@ -717,27 +775,32 @@ mod tests {
         assert_eq!(region.addr, addr);
         assert_eq!(region.size, size);
         assert!(region.registered);
-        
+
         // Test RDMA read
         let local_buf = vec![0u8; 1024];
         let local_addr = local_buf.as_ptr() as u64;
-        let result = ctx.post_read(local_addr, 0x8000000, region.rkey, 1024, 1).await;
+        let result = ctx
+            .post_read(local_addr, 0x8000000, region.rkey, 1024, 1)
+            .await;
         assert!(result.is_ok());
-        
+
         // Test completion polling
         let completions = ctx.poll_completion(10).await.unwrap();
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].status, CompletionStatus::Success);
-        
+
         // Test memory deregistration
         let result = ctx.deregister_memory(&region).await;
         assert!(result.is_ok());
     }
-    
+
     #[test]
     fn test_completion_status_conversion() {
         assert_eq!(CompletionStatus::from(0), CompletionStatus::Success);
-        assert_eq!(CompletionStatus::from(1), CompletionStatus::LocalLengthError);
+        assert_eq!(
+            CompletionStatus::from(1),
+            CompletionStatus::LocalLengthError
+        );
         assert_eq!(CompletionStatus::from(999), CompletionStatus::GeneralError);
     }
 }

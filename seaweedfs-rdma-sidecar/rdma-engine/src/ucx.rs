@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::ffi::CStr;
 use std::ptr;
 use std::sync::Arc;
-use tracing::{debug, info, warn, error};
+use tracing::{debug, error, info, warn};
 
 /// UCX context handle
 pub type UcpContext = *mut c_void;
@@ -74,18 +74,11 @@ pub struct UcpMemMapParams {
 }
 
 /// UCX error handler callback
-pub type UcpErrHandler = extern "C" fn(
-    arg: *mut c_void,
-    ep: UcpEp,
-    status: c_int,
-);
+pub type UcpErrHandler = extern "C" fn(arg: *mut c_void, ep: UcpEp, status: c_int);
 
 /// UCX request callback
-pub type UcpSendCallback = extern "C" fn(
-    request: *mut c_void,
-    status: c_int,
-    user_data: *mut c_void,
-);
+pub type UcpSendCallback =
+    extern "C" fn(request: *mut c_void, status: c_int, user_data: *mut c_void);
 
 /// UCX feature flags
 pub const UCP_FEATURE_TAG: u64 = 1 << 0;
@@ -153,24 +146,65 @@ const UCP_API_MINOR: libc::c_uint = 19;
 
 /// UCX FFI function signatures
 pub struct UcxApi {
-    pub ucp_init_version: Symbol<'static, unsafe extern "C" fn(libc::c_uint, libc::c_uint, *const UcpParams, *const c_void, *mut UcpContext) -> c_int>,
+    pub ucp_init_version: Symbol<
+        'static,
+        unsafe extern "C" fn(
+            libc::c_uint,
+            libc::c_uint,
+            *const UcpParams,
+            *const c_void,
+            *mut UcpContext,
+        ) -> c_int,
+    >,
     pub ucp_cleanup: Symbol<'static, unsafe extern "C" fn(UcpContext)>,
-    pub ucp_worker_create: Symbol<'static, unsafe extern "C" fn(UcpContext, *const UcpWorkerParams, *mut UcpWorker) -> c_int>,
+    pub ucp_worker_create: Symbol<
+        'static,
+        unsafe extern "C" fn(UcpContext, *const UcpWorkerParams, *mut UcpWorker) -> c_int,
+    >,
     pub ucp_worker_destroy: Symbol<'static, unsafe extern "C" fn(UcpWorker)>,
-    pub ucp_ep_create: Symbol<'static, unsafe extern "C" fn(UcpWorker, *const UcpEpParams, *mut UcpEp) -> c_int>,
+    pub ucp_ep_create:
+        Symbol<'static, unsafe extern "C" fn(UcpWorker, *const UcpEpParams, *mut UcpEp) -> c_int>,
     pub ucp_ep_destroy: Symbol<'static, unsafe extern "C" fn(UcpEp)>,
-    pub ucp_mem_map: Symbol<'static, unsafe extern "C" fn(UcpContext, *const UcpMemMapParams, *mut UcpMem) -> c_int>,
+    pub ucp_mem_map: Symbol<
+        'static,
+        unsafe extern "C" fn(UcpContext, *const UcpMemMapParams, *mut UcpMem) -> c_int,
+    >,
     pub ucp_mem_unmap: Symbol<'static, unsafe extern "C" fn(UcpContext, UcpMem) -> c_int>,
-    pub ucp_rkey_pack: Symbol<'static, unsafe extern "C" fn(UcpContext, UcpMem, *mut *mut c_void, *mut size_t) -> c_int>,
+    pub ucp_rkey_pack: Symbol<
+        'static,
+        unsafe extern "C" fn(UcpContext, UcpMem, *mut *mut c_void, *mut size_t) -> c_int,
+    >,
     pub ucp_rkey_buffer_release: Symbol<'static, unsafe extern "C" fn(*mut c_void)>,
-    pub ucp_ep_rkey_unpack: Symbol<'static, unsafe extern "C" fn(UcpEp, *const c_void, *mut UcpRkey) -> c_int>,
+    pub ucp_ep_rkey_unpack:
+        Symbol<'static, unsafe extern "C" fn(UcpEp, *const c_void, *mut UcpRkey) -> c_int>,
     pub ucp_rkey_destroy: Symbol<'static, unsafe extern "C" fn(UcpRkey)>,
-    pub ucp_put_nb: Symbol<'static, unsafe extern "C" fn(UcpEp, *const c_void, size_t, u64, UcpRkey, UcpSendCallback) -> UcpRequest>,
-    pub ucp_get_nb: Symbol<'static, unsafe extern "C" fn(UcpEp, *mut c_void, size_t, u64, UcpRkey, UcpSendCallback) -> UcpRequest>,
+    pub ucp_put_nb: Symbol<
+        'static,
+        unsafe extern "C" fn(
+            UcpEp,
+            *const c_void,
+            size_t,
+            u64,
+            UcpRkey,
+            UcpSendCallback,
+        ) -> UcpRequest,
+    >,
+    pub ucp_get_nb: Symbol<
+        'static,
+        unsafe extern "C" fn(
+            UcpEp,
+            *mut c_void,
+            size_t,
+            u64,
+            UcpRkey,
+            UcpSendCallback,
+        ) -> UcpRequest,
+    >,
     pub ucp_worker_progress: Symbol<'static, unsafe extern "C" fn(UcpWorker) -> c_int>,
     pub ucp_request_check_status: Symbol<'static, unsafe extern "C" fn(UcpRequest) -> c_int>,
     pub ucp_request_free: Symbol<'static, unsafe extern "C" fn(UcpRequest)>,
-    pub ucp_worker_get_address: Symbol<'static, unsafe extern "C" fn(UcpWorker, *mut *mut c_void, *mut size_t) -> c_int>,
+    pub ucp_worker_get_address:
+        Symbol<'static, unsafe extern "C" fn(UcpWorker, *mut *mut c_void, *mut size_t) -> c_int>,
     pub ucp_worker_release_address: Symbol<'static, unsafe extern "C" fn(UcpWorker, *mut c_void)>,
     pub ucs_status_string: Symbol<'static, unsafe extern "C" fn(c_int) -> *const c_char>,
 }
@@ -184,7 +218,7 @@ impl UcxApi {
     /// wrapper around it).
     pub fn load() -> RdmaResult<Self> {
         info!("🔗 Loading UCX library");
-        
+
         let ucp_names = [
             "libucp.so.0",
             "libucp.so",
@@ -193,8 +227,9 @@ impl UcxApi {
             "/usr/lib64/libucp.so.0",
             "/lib/libucp.so.0",
         ];
-        
-        let ucp_lib = ucp_names.iter()
+
+        let ucp_lib = ucp_names
+            .iter()
             .find_map(|name| {
                 debug!("Trying to load UCX library: {}", name);
                 match unsafe { Library::new(name) } {
@@ -218,7 +253,8 @@ impl UcxApi {
             "/lib/libucs.so.0",
         ];
 
-        let ucs_lib = ucs_names.iter()
+        let ucs_lib = ucs_names
+            .iter()
             .find_map(|name| {
                 debug!("Trying to load UCS library: {}", name);
                 match unsafe { Library::new(name) } {
@@ -236,53 +272,83 @@ impl UcxApi {
 
         let ucp_lib: &'static Library = Box::leak(Box::new(ucp_lib));
         let ucs_lib: &'static Library = Box::leak(Box::new(ucs_lib));
-        
+
         unsafe {
             Ok(UcxApi {
-                ucp_init_version: ucp_lib.get(b"ucp_init_version")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_init_version symbol: {}", e)))?,
-                ucp_cleanup: ucp_lib.get(b"ucp_cleanup")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_cleanup symbol: {}", e)))?,
-                ucp_worker_create: ucp_lib.get(b"ucp_worker_create")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_worker_create symbol: {}", e)))?,
-                ucp_worker_destroy: ucp_lib.get(b"ucp_worker_destroy")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_worker_destroy symbol: {}", e)))?,
-                ucp_ep_create: ucp_lib.get(b"ucp_ep_create")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_ep_create symbol: {}", e)))?,
-                ucp_ep_destroy: ucp_lib.get(b"ucp_ep_destroy")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_ep_destroy symbol: {}", e)))?,
-                ucp_mem_map: ucp_lib.get(b"ucp_mem_map")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_mem_map symbol: {}", e)))?,
-                ucp_mem_unmap: ucp_lib.get(b"ucp_mem_unmap")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_mem_unmap symbol: {}", e)))?,
-                ucp_rkey_pack: ucp_lib.get(b"ucp_rkey_pack")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_rkey_pack symbol: {}", e)))?,
-                ucp_rkey_buffer_release: ucp_lib.get(b"ucp_rkey_buffer_release")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_rkey_buffer_release symbol: {}", e)))?,
-                ucp_ep_rkey_unpack: ucp_lib.get(b"ucp_ep_rkey_unpack")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_ep_rkey_unpack symbol: {}", e)))?,
-                ucp_rkey_destroy: ucp_lib.get(b"ucp_rkey_destroy")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_rkey_destroy symbol: {}", e)))?,
-                ucp_put_nb: ucp_lib.get(b"ucp_put_nb")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_put_nb symbol: {}", e)))?,
-                ucp_get_nb: ucp_lib.get(b"ucp_get_nb")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_get_nb symbol: {}", e)))?,
-                ucp_worker_progress: ucp_lib.get(b"ucp_worker_progress")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_worker_progress symbol: {}", e)))?,
-                ucp_request_check_status: ucp_lib.get(b"ucp_request_check_status")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_request_check_status symbol: {}", e)))?,
-                ucp_request_free: ucp_lib.get(b"ucp_request_free")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_request_free symbol: {}", e)))?,
-                ucp_worker_get_address: ucp_lib.get(b"ucp_worker_get_address")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_worker_get_address symbol: {}", e)))?,
-                ucp_worker_release_address: ucp_lib.get(b"ucp_worker_release_address")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucp_worker_release_address symbol: {}", e)))?,
-                ucs_status_string: ucs_lib.get(b"ucs_status_string")
-                    .map_err(|e| RdmaError::context_init_failed(format!("ucs_status_string symbol: {}", e)))?,
+                ucp_init_version: ucp_lib.get(b"ucp_init_version").map_err(|e| {
+                    RdmaError::context_init_failed(format!("ucp_init_version symbol: {}", e))
+                })?,
+                ucp_cleanup: ucp_lib.get(b"ucp_cleanup").map_err(|e| {
+                    RdmaError::context_init_failed(format!("ucp_cleanup symbol: {}", e))
+                })?,
+                ucp_worker_create: ucp_lib.get(b"ucp_worker_create").map_err(|e| {
+                    RdmaError::context_init_failed(format!("ucp_worker_create symbol: {}", e))
+                })?,
+                ucp_worker_destroy: ucp_lib.get(b"ucp_worker_destroy").map_err(|e| {
+                    RdmaError::context_init_failed(format!("ucp_worker_destroy symbol: {}", e))
+                })?,
+                ucp_ep_create: ucp_lib.get(b"ucp_ep_create").map_err(|e| {
+                    RdmaError::context_init_failed(format!("ucp_ep_create symbol: {}", e))
+                })?,
+                ucp_ep_destroy: ucp_lib.get(b"ucp_ep_destroy").map_err(|e| {
+                    RdmaError::context_init_failed(format!("ucp_ep_destroy symbol: {}", e))
+                })?,
+                ucp_mem_map: ucp_lib.get(b"ucp_mem_map").map_err(|e| {
+                    RdmaError::context_init_failed(format!("ucp_mem_map symbol: {}", e))
+                })?,
+                ucp_mem_unmap: ucp_lib.get(b"ucp_mem_unmap").map_err(|e| {
+                    RdmaError::context_init_failed(format!("ucp_mem_unmap symbol: {}", e))
+                })?,
+                ucp_rkey_pack: ucp_lib.get(b"ucp_rkey_pack").map_err(|e| {
+                    RdmaError::context_init_failed(format!("ucp_rkey_pack symbol: {}", e))
+                })?,
+                ucp_rkey_buffer_release: ucp_lib.get(b"ucp_rkey_buffer_release").map_err(|e| {
+                    RdmaError::context_init_failed(format!("ucp_rkey_buffer_release symbol: {}", e))
+                })?,
+                ucp_ep_rkey_unpack: ucp_lib.get(b"ucp_ep_rkey_unpack").map_err(|e| {
+                    RdmaError::context_init_failed(format!("ucp_ep_rkey_unpack symbol: {}", e))
+                })?,
+                ucp_rkey_destroy: ucp_lib.get(b"ucp_rkey_destroy").map_err(|e| {
+                    RdmaError::context_init_failed(format!("ucp_rkey_destroy symbol: {}", e))
+                })?,
+                ucp_put_nb: ucp_lib.get(b"ucp_put_nb").map_err(|e| {
+                    RdmaError::context_init_failed(format!("ucp_put_nb symbol: {}", e))
+                })?,
+                ucp_get_nb: ucp_lib.get(b"ucp_get_nb").map_err(|e| {
+                    RdmaError::context_init_failed(format!("ucp_get_nb symbol: {}", e))
+                })?,
+                ucp_worker_progress: ucp_lib.get(b"ucp_worker_progress").map_err(|e| {
+                    RdmaError::context_init_failed(format!("ucp_worker_progress symbol: {}", e))
+                })?,
+                ucp_request_check_status: ucp_lib.get(b"ucp_request_check_status").map_err(
+                    |e| {
+                        RdmaError::context_init_failed(format!(
+                            "ucp_request_check_status symbol: {}",
+                            e
+                        ))
+                    },
+                )?,
+                ucp_request_free: ucp_lib.get(b"ucp_request_free").map_err(|e| {
+                    RdmaError::context_init_failed(format!("ucp_request_free symbol: {}", e))
+                })?,
+                ucp_worker_get_address: ucp_lib.get(b"ucp_worker_get_address").map_err(|e| {
+                    RdmaError::context_init_failed(format!("ucp_worker_get_address symbol: {}", e))
+                })?,
+                ucp_worker_release_address: ucp_lib.get(b"ucp_worker_release_address").map_err(
+                    |e| {
+                        RdmaError::context_init_failed(format!(
+                            "ucp_worker_release_address symbol: {}",
+                            e
+                        ))
+                    },
+                )?,
+                ucs_status_string: ucs_lib.get(b"ucs_status_string").map_err(|e| {
+                    RdmaError::context_init_failed(format!("ucs_status_string symbol: {}", e))
+                })?,
             })
         }
     }
-    
+
     /// Convert UCX status code to human-readable string
     pub fn status_string(&self, status: c_int) -> String {
         unsafe {
@@ -316,9 +382,9 @@ impl UcxContext {
     /// Initialize UCX context with RMA support
     pub fn new() -> RdmaResult<Self> {
         info!("🚀 Initializing UCX context for RDMA operations");
-        
+
         let api = Arc::new(UcxApi::load()?);
-        
+
         // Initialize UCP context
         let params = UcpParams {
             field_mask: UCP_PARAM_FIELD_FEATURES,
@@ -328,20 +394,27 @@ impl UcxContext {
             request_cleanup: request_cleanup_cb,
             tag_sender_mask: 0,
         };
-        
+
         let mut context = ptr::null_mut();
         let status = unsafe {
-            (api.ucp_init_version)(UCP_API_MAJOR, UCP_API_MINOR, &params, ptr::null(), &mut context)
+            (api.ucp_init_version)(
+                UCP_API_MAJOR,
+                UCP_API_MINOR,
+                &params,
+                ptr::null(),
+                &mut context,
+            )
         };
         if status != UCS_OK {
             return Err(RdmaError::context_init_failed(format!(
-                "ucp_init_version failed: {} ({})", 
-                api.status_string(status), status
+                "ucp_init_version failed: {} ({})",
+                api.status_string(status),
+                status
             )));
         }
-        
+
         info!("✅ UCX context initialized successfully");
-        
+
         // Create worker
         let worker_params = UcpWorkerParams {
             field_mask: UCP_WORKER_PARAM_FIELD_THREAD_MODE,
@@ -350,42 +423,47 @@ impl UcxContext {
             events: 0,
             user_data: ptr::null_mut(),
         };
-        
+
         let mut worker = ptr::null_mut();
         let status = unsafe { (api.ucp_worker_create)(context, &worker_params, &mut worker) };
         if status != UCS_OK {
             unsafe { (api.ucp_cleanup)(context) };
             return Err(RdmaError::context_init_failed(format!(
                 "ucp_worker_create failed: {} ({})",
-                api.status_string(status), status
+                api.status_string(status),
+                status
             )));
         }
-        
+
         info!("✅ UCX worker created successfully");
-        
+
         // Get worker address for connection establishment
         let mut address_ptr = ptr::null_mut();
         let mut address_len = 0;
-        let status = unsafe { (api.ucp_worker_get_address)(worker, &mut address_ptr, &mut address_len) };
+        let status =
+            unsafe { (api.ucp_worker_get_address)(worker, &mut address_ptr, &mut address_len) };
         if status != UCS_OK {
-            unsafe { 
+            unsafe {
                 (api.ucp_worker_destroy)(worker);
                 (api.ucp_cleanup)(context);
             }
             return Err(RdmaError::context_init_failed(format!(
                 "ucp_worker_get_address failed: {} ({})",
-                api.status_string(status), status
+                api.status_string(status),
+                status
             )));
         }
-        
-        let worker_address = unsafe {
-            std::slice::from_raw_parts(address_ptr as *const u8, address_len).to_vec()
-        };
-        
+
+        let worker_address =
+            unsafe { std::slice::from_raw_parts(address_ptr as *const u8, address_len).to_vec() };
+
         unsafe { (api.ucp_worker_release_address)(worker, address_ptr) };
-        
-        info!("✅ UCX worker address obtained ({} bytes)", worker_address.len());
-        
+
+        info!(
+            "✅ UCX worker address obtained ({} bytes)",
+            worker_address.len()
+        );
+
         Ok(UcxContext {
             api,
             context,
@@ -396,11 +474,14 @@ impl UcxContext {
             worker_ops: Mutex::new(()),
         })
     }
-    
+
     /// Map memory for RDMA operations
     pub fn map_memory(&self, addr: u64, size: usize) -> RdmaResult<Vec<u8>> {
-        debug!("📍 Mapping memory for RDMA: addr=0x{:x}, size={}", addr, size);
-        
+        debug!(
+            "📍 Mapping memory for RDMA: addr=0x{:x}, size={}",
+            addr, size
+        );
+
         let params = UcpMemMapParams {
             field_mask: UCP_MEM_MAP_PARAM_FIELD_ADDRESS | UCP_MEM_MAP_PARAM_FIELD_LENGTH,
             address: addr as *mut c_void,
@@ -408,14 +489,15 @@ impl UcxContext {
             flags: 0,
             prot: libc::PROT_READ | libc::PROT_WRITE,
         };
-        
+
         let mut mem_handle = ptr::null_mut();
         let status = unsafe { (self.api.ucp_mem_map)(self.context, &params, &mut mem_handle) };
-        
+
         if status != UCS_OK {
             return Err(RdmaError::memory_reg_failed(format!(
                 "ucp_mem_map failed: {} ({})",
-                self.api.status_string(status), status
+                self.api.status_string(status),
+                status
             )));
         }
 
@@ -428,21 +510,21 @@ impl UcxContext {
             unsafe { (self.api.ucp_mem_unmap)(self.context, mem_handle) };
             return Err(RdmaError::memory_reg_failed(format!(
                 "ucp_rkey_pack failed: {} ({})",
-                self.api.status_string(status), status
+                self.api.status_string(status),
+                status
             )));
         }
 
-        let packed_rkey = unsafe {
-            std::slice::from_raw_parts(rkey_buffer as *const u8, rkey_size).to_vec()
-        };
+        let packed_rkey =
+            unsafe { std::slice::from_raw_parts(rkey_buffer as *const u8, rkey_size).to_vec() };
         unsafe { (self.api.ucp_rkey_buffer_release)(rkey_buffer) };
-        
+
         // Store memory handle for cleanup
         {
             let mut regions = self.memory_regions.lock();
             regions.insert(addr, mem_handle);
         }
-        
+
         info!(
             "✅ Memory mapped successfully: addr=0x{:x}, size={}, rkey_bytes={}",
             addr,
@@ -451,39 +533,44 @@ impl UcxContext {
         );
         Ok(packed_rkey)
     }
-    
+
     /// Unmap memory
     pub fn unmap_memory(&self, addr: u64) -> RdmaResult<()> {
         debug!("🗑️ Unmapping memory: addr=0x{:x}", addr);
-        
+
         let mem_handle = {
             let mut regions = self.memory_regions.lock();
             regions.remove(&addr)
         };
-        
+
         if let Some(handle) = mem_handle {
             let status = unsafe { (self.api.ucp_mem_unmap)(self.context, handle) };
             if status != UCS_OK {
-                warn!("ucp_mem_unmap failed: {} ({})", 
-                      self.api.status_string(status), status);
+                warn!(
+                    "ucp_mem_unmap failed: {} ({})",
+                    self.api.status_string(status),
+                    status
+                );
             }
         }
-        
+
         Ok(())
     }
-    
+
     /// Perform RDMA GET (read from remote memory)
     pub fn get(&self, local_addr: u64, remote_addr: u64, size: usize) -> RdmaResult<()> {
-        debug!("📥 RDMA GET: local=0x{:x}, remote=0x{:x}, size={}", 
-               local_addr, remote_addr, size);
+        debug!(
+            "📥 RDMA GET: local=0x{:x}, remote=0x{:x}, size={}",
+            local_addr, remote_addr, size
+        );
         let _worker_guard = self.worker_ops.lock();
 
         // For now, use a simple synchronous approach
         // In production, this would be properly async with completion callbacks
-        
+
         // Find or create endpoint (simplified - would need proper address resolution)
         let ep = self.get_or_create_endpoint_unlocked("default")?;
-        
+
         let request = unsafe {
             (self.api.ucp_get_nb)(
                 ep,
@@ -494,7 +581,7 @@ impl UcxContext {
                 get_completion_cb,
             )
         };
-        
+
         // Wait for completion
         if !request.is_null() {
             loop {
@@ -504,30 +591,30 @@ impl UcxContext {
                     if status == UCS_OK {
                         break;
                     } else {
-                        return Err(RdmaError::operation_failed(
-                            "RDMA GET", status
-                        ));
+                        return Err(RdmaError::operation_failed("RDMA GET", status));
                     }
                 }
-                
+
                 // Progress the worker
                 unsafe { (self.api.ucp_worker_progress)(self.worker) };
                 std::thread::yield_now();
             }
         }
-        
+
         info!("✅ RDMA GET completed successfully");
         Ok(())
     }
-    
+
     /// Perform RDMA PUT (write to remote memory)
     pub fn put(&self, local_addr: u64, remote_addr: u64, size: usize) -> RdmaResult<()> {
-        debug!("📤 RDMA PUT: local=0x{:x}, remote=0x{:x}, size={}", 
-               local_addr, remote_addr, size);
+        debug!(
+            "📤 RDMA PUT: local=0x{:x}, remote=0x{:x}, size={}",
+            local_addr, remote_addr, size
+        );
         let _worker_guard = self.worker_ops.lock();
 
         let ep = self.get_or_create_endpoint_unlocked("default")?;
-        
+
         let request = unsafe {
             (self.api.ucp_put_nb)(
                 ep,
@@ -538,7 +625,7 @@ impl UcxContext {
                 put_completion_cb,
             )
         };
-        
+
         // Wait for completion (same pattern as GET)
         if !request.is_null() {
             loop {
@@ -548,17 +635,15 @@ impl UcxContext {
                     if status == UCS_OK {
                         break;
                     } else {
-                        return Err(RdmaError::operation_failed(
-                            "RDMA PUT", status
-                        ));
+                        return Err(RdmaError::operation_failed("RDMA PUT", status));
                     }
                 }
-                
+
                 unsafe { (self.api.ucp_worker_progress)(self.worker) };
                 std::thread::yield_now();
             }
         }
-        
+
         info!("✅ RDMA PUT completed successfully");
         Ok(())
     }
@@ -640,11 +725,7 @@ impl UcxContext {
 
         let mut rkey = ptr::null_mut();
         let status = unsafe {
-            (self.api.ucp_ep_rkey_unpack)(
-                ep,
-                remote_rkey.as_ptr() as *const c_void,
-                &mut rkey,
-            )
+            (self.api.ucp_ep_rkey_unpack)(ep, remote_rkey.as_ptr() as *const c_void, &mut rkey)
         };
         if status != UCS_OK {
             return Err(RdmaError::operation_failed("ucp_ep_rkey_unpack", status));
@@ -671,12 +752,12 @@ impl UcxContext {
             std::thread::yield_now();
         }
     }
-    
+
     /// Get worker address for connection establishment
     pub fn worker_address(&self) -> &[u8] {
         &self.worker_address
     }
-    
+
     /// Create endpoint to a remote UCX peer using its worker address bytes.
     pub fn connect_peer(&self, key: &str, worker_address: &[u8]) -> RdmaResult<UcpEp> {
         let _worker_guard = self.worker_ops.lock();
@@ -708,7 +789,11 @@ impl UcxContext {
             )));
         }
 
-        info!("✅ UCX peer endpoint created for key={} ({} bytes worker addr)", key, worker_address.len());
+        info!(
+            "✅ UCX peer endpoint created for key={} ({} bytes worker addr)",
+            key,
+            worker_address.len()
+        );
         endpoints.insert(key.to_string(), endpoint);
         Ok(endpoint)
     }
@@ -716,11 +801,11 @@ impl UcxContext {
     /// Create endpoint for communication (legacy default key — local only)
     fn get_or_create_endpoint_unlocked(&self, key: &str) -> RdmaResult<UcpEp> {
         let endpoints = self.endpoints.lock();
-        
+
         if let Some(&ep) = endpoints.get(key) {
             return Ok(ep);
         }
-        
+
         // Without a remote worker address, cannot create a useful peer endpoint.
         Err(RdmaError::context_init_failed(
             "no peer worker address; call connect_peer first".to_string(),
@@ -731,7 +816,7 @@ impl UcxContext {
 impl Drop for UcxContext {
     fn drop(&mut self) {
         info!("🧹 Cleaning up UCX context");
-        
+
         // Clean up endpoints
         {
             let mut endpoints = self.endpoints.lock();
@@ -739,7 +824,7 @@ impl Drop for UcxContext {
                 unsafe { (self.api.ucp_ep_destroy)(ep) };
             }
         }
-        
+
         // Clean up memory regions
         {
             let mut regions = self.memory_regions.lock();
@@ -747,13 +832,13 @@ impl Drop for UcxContext {
                 unsafe { (self.api.ucp_mem_unmap)(self.context, handle) };
             }
         }
-        
+
         // Clean up worker and context
         unsafe {
             (self.api.ucp_worker_destroy)(self.worker);
             (self.api.ucp_cleanup)(self.context);
         }
-        
+
         info!("✅ UCX context cleanup completed");
     }
 }
@@ -779,18 +864,14 @@ extern "C" fn put_completion_cb(_request: *mut c_void, status: c_int, _user_data
     }
 }
 
-extern "C" fn error_handler_cb(
-    _arg: *mut c_void,
-    _ep: UcpEp,
-    status: c_int,
-) {
+extern "C" fn error_handler_cb(_arg: *mut c_void, _ep: UcpEp, status: c_int) {
     error!("UCX endpoint error: {}", status);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[tokio::test]
     async fn test_ucx_api_loading() {
         // This test will fail without UCX installed, which is expected
@@ -804,7 +885,7 @@ mod tests {
             }
         }
     }
-    
+
     #[tokio::test]
     async fn test_ucx_context_mock() {
         // This would test the mock implementation

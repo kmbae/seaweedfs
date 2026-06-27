@@ -51,7 +51,9 @@ func (s *KernelMRReadStager) StageReadRDMA(ctx context.Context, path string, off
 	if size > swvfsproto.RDMAIOMax {
 		return nil, ErrnoError{Errno: ErrnoTooLarge, Msg: "rdma read descriptor request exceeds kernel RDMA IO max"}
 	}
+	fileReadStart := time.Now()
 	data, attr, err := s.Reader.ReadFile(ctx, path, offset, size, true)
+	s.Stats.Observe("rdma_stager_file_read", time.Since(fileReadStart))
 	if err != nil {
 		s.Stats.Inc("rdma_stager_file_read_errors")
 		return nil, err
@@ -64,7 +66,9 @@ func (s *KernelMRReadStager) StageReadRDMA(ctx context.Context, path string, off
 	if len(data) > swvfsproto.RDMAIOMax {
 		return nil, ErrnoError{Errno: ErrnoTooLarge, Msg: "rdma read descriptor payload exceeds kernel RDMA IO max"}
 	}
+	mrAcquireStart := time.Now()
 	session, err := s.acquireMR(uint32(len(data)))
+	s.Stats.Observe("rdma_stager_mr_acquire", time.Since(mrAcquireStart))
 	if err != nil {
 		s.Stats.Inc("rdma_stager_mr_alloc_errors")
 		return nil, err
@@ -73,12 +77,17 @@ func (s *KernelMRReadStager) StageReadRDMA(ctx context.Context, path string, off
 	if sessionID == 0 {
 		return nil, fmt.Errorf("kernel RDMA test MR allocation returned no session id")
 	}
+	mrWriteStart := time.Now()
 	if _, err := s.Control.TestMRWrite(sessionID, data); err != nil {
+		s.Stats.Observe("rdma_stager_mr_write", time.Since(mrWriteStart))
 		s.discardMR(sessionID)
 		s.Stats.Inc("rdma_stager_mr_write_errors")
 		return nil, err
 	}
+	s.Stats.Observe("rdma_stager_mr_write", time.Since(mrWriteStart))
+	mrInfoStart := time.Now()
 	mr, err := s.Control.TestMRInfo(sessionID)
+	s.Stats.Observe("rdma_stager_mr_info", time.Since(mrInfoStart))
 	if err != nil {
 		s.discardMR(sessionID)
 		s.Stats.Inc("rdma_stager_mr_info_errors")
@@ -193,7 +202,9 @@ func (c *RemoteRDMAReadDescriptorClient) ReadFileRDMA(ctx context.Context, path 
 	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	localStart := time.Now()
 	localInfo, err := c.Control.GetLocal()
+	c.Stats.Observe("rdma_read_desc_client_get_local", time.Since(localStart))
 	if err != nil {
 		c.Stats.Inc("rdma_read_desc_client_local_errors")
 		return nil, nil, err
@@ -204,11 +215,14 @@ func (c *RemoteRDMAReadDescriptorClient) ReadFileRDMA(ctx context.Context, path 
 		return nil, nil, ErrnoError{Errno: ErrnoNoSys, Msg: "local kernel RDMA endpoint is not connected"}
 	}
 
+	peerDiscoveryStart := time.Now()
 	urls := ExpandRDMAPeerURLs(attemptCtx, c.Peers)
 	peers := make([]RDMALocalEndpoint, 0, len(urls))
 	peerURLs := make(map[string]string, len(urls))
 	for _, peerURL := range urls {
+		peerFetchStart := time.Now()
 		endpoint, err := FetchRDMAPeerEndpoint(attemptCtx, c.Client, peerURL)
+		c.Stats.Observe("rdma_read_desc_client_peer_fetch", time.Since(peerFetchStart))
 		if err != nil || !endpoint.ReadyForConnect() {
 			c.Stats.Inc("rdma_read_desc_client_peer_unready")
 			continue
@@ -216,7 +230,10 @@ func (c *RemoteRDMAReadDescriptorClient) ReadFileRDMA(ctx context.Context, path 
 		peers = append(peers, endpoint)
 		peerURLs[endpoint.PeerKey()] = peerURL
 	}
+	c.Stats.Observe("rdma_read_desc_client_peer_discovery", time.Since(peerDiscoveryStart))
+	selectStart := time.Now()
 	selected, ok := SelectRDMAPairedPeer(local, peers)
+	c.Stats.Observe("rdma_read_desc_client_peer_select", time.Since(selectStart))
 	if !ok {
 		c.Stats.Inc("rdma_read_desc_client_no_paired_peer")
 		return nil, nil, ErrnoError{Errno: ErrnoNoSys, Msg: "no paired RDMA peer is available for read descriptor"}
@@ -226,7 +243,9 @@ func (c *RemoteRDMAReadDescriptorClient) ReadFileRDMA(ctx context.Context, path 
 		c.Stats.Inc("rdma_read_desc_client_peer_url_missing")
 		return nil, nil, ErrnoError{Errno: ErrnoNoSys, Msg: "selected RDMA peer URL is unavailable"}
 	}
+	postStart := time.Now()
 	desc, attr, sessionID, err := PostRDMAPeerReadDesc(attemptCtx, c.Client, peerURL, path, offset, size)
+	c.Stats.Observe("rdma_read_desc_client_post_read_desc", time.Since(postStart))
 	if err != nil {
 		c.Stats.Inc("rdma_read_desc_client_post_errors")
 		return nil, nil, ErrnoError{Errno: ErrnoNoSys, Msg: "remote rdma read descriptor unavailable: " + err.Error()}
@@ -296,10 +315,13 @@ func (c *RemoteRDMAReadDescriptorClient) ReleaseReadDescriptor(ctx context.Conte
 	}
 	releaseCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
+	postStart := time.Now()
 	if err := PostRDMAPeerReleaseDesc(releaseCtx, c.Client, lease.PeerURL, lease.SessionID); err != nil {
+		c.Stats.Observe("rdma_read_desc_client_post_release_desc", time.Since(postStart))
 		c.Stats.Inc("rdma_read_desc_client_release_errors")
 		return err
 	}
+	c.Stats.Observe("rdma_read_desc_client_post_release_desc", time.Since(postStart))
 	c.Stats.Inc("rdma_read_desc_client_release_success")
 	return nil
 }

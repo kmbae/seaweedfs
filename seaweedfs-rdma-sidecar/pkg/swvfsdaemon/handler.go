@@ -184,7 +184,9 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 			if !h.shouldUseRDMAReadDescriptor(req.Header.Size) {
 				h.Stats.Inc("handler_read_rdma_desc_policy_too_small")
 			} else if rdmaBackend, ok := h.Backend.(RDMAReadDescriptorBackend); ok {
+				readRDMAStart := time.Now()
 				desc, attr, err := rdmaBackend.ReadFileRDMA(ctx, req.Path1, req.Header.Offset, req.Header.Size)
+				h.Stats.Observe("handler_read_rdma_desc", time.Since(readRDMAStart))
 				if err == nil && desc != nil {
 					h.Stats.Inc("handler_read_rdma_desc_replies")
 					h.Stats.Add("handler_read_rdma_desc_bytes", uint64(desc.Length))
@@ -247,7 +249,9 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 			h.Stats.Inc("handler_write_rdma_prepare_policy_too_small")
 			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma write prepare below minimum size"}
 		}
+		prepareStart := time.Now()
 		desc, attr, err := backend.PrepareWriteRDMA(ctx, req.Path1, req.Header.Offset, req.Header.Size)
+		h.Stats.Observe("handler_write_rdma_prepare", time.Since(prepareStart))
 		if err != nil {
 			h.Stats.Inc("handler_write_rdma_prepare_errors")
 			return nil, err
@@ -271,7 +275,9 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 		}
 		h.Stats.Inc("handler_write_rdma_commit_requests")
 		h.Stats.Add("handler_write_rdma_commit_bytes", req.Header.Size)
+		commitStart := time.Now()
 		attr, err := backend.CommitWriteRDMA(ctx, req.Path1, req.Header.Offset, req.Header.Size)
+		h.Stats.Observe("handler_write_rdma_commit", time.Since(commitStart))
 		if err != nil {
 			h.Stats.Inc("handler_write_rdma_commit_errors")
 			return nil, err
@@ -291,10 +297,13 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 		}
 		h.Stats.Inc("handler_read_rdma_release_requests")
 		h.Stats.Add("handler_read_rdma_release_bytes", req.Header.Size)
+		releaseStart := time.Now()
 		if err := backend.ReleaseReadDescriptor(ctx, req.Header.Offset, int32(req.Header.Valid), req.Header.Size); err != nil {
+			h.Stats.Observe("handler_read_rdma_release", time.Since(releaseStart))
 			h.Stats.Inc("handler_read_rdma_release_errors")
 			return nil, err
 		}
+		h.Stats.Observe("handler_read_rdma_release", time.Since(releaseStart))
 		h.Stats.Inc("handler_read_rdma_release_replies")
 		return &swvfsproto.Reply{Tag: req.Header.Tag}, nil
 	case swvfsproto.OpUnlink, swvfsproto.OpRmdir:

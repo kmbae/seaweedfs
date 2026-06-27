@@ -102,6 +102,8 @@ mod tests {
     #[test]
     fn rejects_unsupported_versions() {
         let err = encode_payload_blob(1, 2, b"payload", 2).unwrap_err();
-        assert!(err.to_string().contains("unsupported direct write volume version"));
+        assert!(err
+            .to_string()
+            .contains("unsupported direct write volume version"));
     }
 }
