@@ -124,6 +124,14 @@ pub trait VolumeRdmaProvider: std::fmt::Debug + Send + Sync {
         connection_id: u64,
         data: Vec<u8>,
     ) -> Result<VolumeRdmaRegisteredRead>;
+    async fn register_read_frame(
+        &self,
+        connection_id: u64,
+        stream: &mut UnixStream,
+    ) -> Result<VolumeRdmaRegisteredRead> {
+        let data = read_frame(stream).await?;
+        self.register_read(connection_id, data).await
+    }
     async fn release_read(&self, session_id: u64) -> Result<()>;
 }
 
@@ -260,7 +268,11 @@ impl VolumeNativeEngine {
                 .context("read volume RDMA engine data sideband")?;
         }
         debug!("volume RDMA engine request: {:?}", request);
-        let mut response = self.process_request(request).await;
+        let mut response = if request.op == "register_read_stream" {
+            self.process_stream_request(request, &mut stream).await
+        } else {
+            self.process_request(request).await
+        };
         let sideband = if response.data_sideband {
             Some(std::mem::take(&mut response.data))
         } else {
@@ -275,6 +287,33 @@ impl VolumeNativeEngine {
                 .context("write volume RDMA engine response data sideband")?;
         }
         Ok(())
+    }
+
+    async fn process_stream_request(
+        &self,
+        request: EngineRequest,
+        stream: &mut UnixStream,
+    ) -> EngineResponse {
+        match request.op.as_str() {
+            "register_read_stream" => {
+                if request.data_sideband || !request.data.is_empty() {
+                    return EngineResponse::error(
+                        "register_read_stream requires an empty JSON request and one data frame",
+                    );
+                }
+                match self
+                    .provider
+                    .register_read_frame(request.connection_id, stream)
+                    .await
+                {
+                    Ok(read) => EngineResponse::ok_registered_read(read),
+                    Err(err) => {
+                        EngineResponse::error(format!("register_read_stream failed: {err:#}"))
+                    }
+                }
+            }
+            other => EngineResponse::error(format!("unknown stream op {other}")),
+        }
     }
 
     pub async fn process_request(&self, request: EngineRequest) -> EngineResponse {
@@ -698,7 +737,7 @@ fn mock_connection_id(next: &AtomicU64, requested: u64) -> Result<u64> {
     Ok(id)
 }
 
-pub async fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>> {
+pub async fn read_frame_header(stream: &mut UnixStream) -> Result<usize> {
     let mut header = [0u8; 4];
     stream
         .read_exact(&mut header)
@@ -708,11 +747,35 @@ pub async fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>> {
     if size > MAX_FRAME_SIZE {
         return Err(anyhow!("frame too large: {size}"));
     }
-    let mut payload = vec![0u8; size];
+    Ok(size)
+}
+
+pub async fn read_frame_payload_into(
+    stream: &mut UnixStream,
+    size: usize,
+    dst: &mut [u8],
+) -> Result<()> {
+    if size > MAX_FRAME_SIZE {
+        return Err(anyhow!("frame too large: {size}"));
+    }
+    if size > dst.len() {
+        return Err(anyhow!(
+            "frame payload larger than destination: frame={} destination={}",
+            size,
+            dst.len()
+        ));
+    }
     stream
-        .read_exact(&mut payload)
+        .read_exact(&mut dst[..size])
         .await
         .context("read frame payload")?;
+    Ok(())
+}
+
+pub async fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>> {
+    let size = read_frame_header(stream).await?;
+    let mut payload = vec![0u8; size];
+    read_frame_payload_into(stream, size, &mut payload).await?;
     Ok(payload)
 }
 
@@ -1131,6 +1194,73 @@ mod tests {
         assert_eq!(
             provider.lease_data(session_id).await.unwrap(),
             b"sideband-data"
+        );
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_stream_accepts_register_read_stream_frame() {
+        let (engine, provider, _) = mock_engine();
+        let local = engine
+            .process_request(EngineRequest {
+                op: "local".to_string(),
+                connection_id: 0,
+                remote: None,
+                desc: None,
+                session_id: 0,
+                timeout_ms: 0,
+                data_sideband: false,
+                data: Vec::new(),
+            })
+            .await;
+        assert!(local.ok);
+        let connection_id = local.connection_id;
+        let connect = engine
+            .process_request(EngineRequest {
+                op: "connect".to_string(),
+                connection_id,
+                remote: Some(VolumeRdmaRemoteInfo {
+                    abi_version: ABI_VERSION,
+                    flags: 0,
+                    qpn: 10,
+                    lid: 1,
+                    psn: 2,
+                    port: 1,
+                    gid_index: 0,
+                    sl: 0,
+                    gid: [0; 16],
+                    reserved: [0; 8],
+                }),
+                desc: None,
+                session_id: 0,
+                timeout_ms: 0,
+                data_sideband: false,
+                data: Vec::new(),
+            })
+            .await;
+        assert!(connect.ok);
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let engine = Arc::new(engine);
+        let server_task = tokio::spawn(async move { engine.handle_stream(server).await });
+        let request = serde_json::json!({
+            "op": "register_read_stream",
+            "connection_id": connection_id,
+        });
+        write_frame(
+            &mut client,
+            serde_json::to_string(&request).unwrap().as_bytes(),
+        )
+        .await
+        .unwrap();
+        write_frame(&mut client, b"streamed-data").await.unwrap();
+        let response_payload = read_frame(&mut client).await.unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&response_payload).unwrap();
+        assert_eq!(response["ok"], true);
+        let session_id = response["session_id"].as_u64().unwrap();
+        assert_eq!(
+            provider.lease_data(session_id).await.unwrap(),
+            b"streamed-data"
         );
         server_task.await.unwrap().unwrap();
     }

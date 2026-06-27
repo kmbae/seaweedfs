@@ -1,6 +1,7 @@
 use crate::volume_native::{
-    VolumeRdmaDataDesc, VolumeRdmaEndpointInfo, VolumeRdmaProvider, VolumeRdmaRegisteredRead,
-    VolumeRdmaRemoteInfo, VolumeRdmaRequester, ABI_VERSION, LINK_ETHERNET, LINK_INFINIBAND,
+    read_frame_header, read_frame_payload_into, VolumeRdmaDataDesc, VolumeRdmaEndpointInfo,
+    VolumeRdmaProvider, VolumeRdmaRegisteredRead, VolumeRdmaRemoteInfo, VolumeRdmaRequester,
+    ABI_VERSION, LINK_ETHERNET, LINK_INFINIBAND,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -13,6 +14,7 @@ use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::net::UnixStream;
 use tracing::{debug, info, warn};
 
 const IBV_QPT_RC: c_int = 2;
@@ -171,6 +173,71 @@ impl RealVerbsVolumeRdmaProvider {
         Ok(VolumeRdmaRegisteredRead { session_id, desc })
     }
 
+    pub async fn register_read_frame_buffer(
+        &self,
+        connection_id: u64,
+        stream: &mut UnixStream,
+    ) -> Result<VolumeRdmaRegisteredRead> {
+        let length = read_frame_header(stream)
+            .await
+            .context("read register_read_stream frame header")?;
+        let (session_id, mut buffer) = self.acquire_stream_read_buffer(connection_id, length)?;
+        read_frame_payload_into(stream, length, buffer.data_mut(length)?)
+            .await
+            .context("read register_read_stream payload into verbs MR")?;
+        let desc = buffer.desc_for(session_id, length)?;
+        self.insert_stream_read_buffer(connection_id, session_id, buffer, desc.clone())?;
+
+        Ok(VolumeRdmaRegisteredRead { session_id, desc })
+    }
+
+    fn acquire_stream_read_buffer(
+        &self,
+        connection_id: u64,
+        length: usize,
+    ) -> Result<(u64, VerbsReadBuffer)> {
+        if connection_id == 0 {
+            return Err(anyhow!("verbs register_read_stream requires connection_id"));
+        }
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("verbs provider mutex poisoned"))?;
+        let session_id = state.next_session_id()?;
+        let connection = state.get_connection_mut(connection_id)?;
+        validate_register_read_ready(
+            &connection.endpoint,
+            connection.connected_remote.is_some(),
+            length,
+        )?;
+        let buffer = connection
+            .resources
+            .acquire_read_buffer(length, &mut connection.read_pool)?;
+        Ok((session_id, buffer))
+    }
+
+    fn insert_stream_read_buffer(
+        &self,
+        connection_id: u64,
+        session_id: u64,
+        buffer: VerbsReadBuffer,
+        desc: VolumeRdmaDataDesc,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("verbs provider mutex poisoned"))?;
+        let connection = state.get_connection_mut(connection_id)?;
+        connection.leases.insert(
+            session_id,
+            VerbsReadLease {
+                buffer: Some(buffer),
+                desc,
+            },
+        );
+        Ok(())
+    }
+
     pub fn release_read_session(&self, session_id: u64) -> Result<()> {
         let mut state = self
             .state
@@ -215,6 +282,14 @@ impl VolumeRdmaProvider for RealVerbsVolumeRdmaProvider {
         data: Vec<u8>,
     ) -> Result<VolumeRdmaRegisteredRead> {
         self.register_read_buffer(connection_id, data)
+    }
+
+    async fn register_read_frame(
+        &self,
+        connection_id: u64,
+        stream: &mut UnixStream,
+    ) -> Result<VolumeRdmaRegisteredRead> {
+        self.register_read_frame_buffer(connection_id, stream).await
     }
 
     async fn release_read(&self, session_id: u64) -> Result<()> {
@@ -825,6 +900,14 @@ impl VerbsResources {
         VerbsReadLease::from_pool(self.api.clone(), self.pd, session_id, data, pool)
     }
 
+    fn acquire_read_buffer(
+        &self,
+        length: usize,
+        pool: &mut Vec<VerbsReadBuffer>,
+    ) -> Result<VerbsReadBuffer> {
+        VerbsReadBuffer::from_pool(self.api.clone(), self.pd, length, pool)
+    }
+
     fn acquire_local_buffer(
         &self,
         length: usize,
@@ -1106,8 +1189,81 @@ impl VerbsReadBuffer {
         })
     }
 
+    fn register_empty(api: Arc<VerbsApi>, pd: *mut IbvPd, length: usize) -> Result<Self> {
+        if length == 0 {
+            return Err(anyhow!("register_read requires data"));
+        }
+        if length > u32::MAX as usize {
+            return Err(anyhow!("register_read data too large"));
+        }
+        Self::register(api, pd, vec![0u8; length])
+    }
+
+    fn from_pool(
+        api: Arc<VerbsApi>,
+        pd: *mut IbvPd,
+        length: usize,
+        pool: &mut Vec<VerbsReadBuffer>,
+    ) -> Result<Self> {
+        if length == 0 {
+            return Err(anyhow!("register_read requires data"));
+        }
+        if length > u32::MAX as usize {
+            return Err(anyhow!("register_read data too large"));
+        }
+        if let Some(idx) = pool.iter().position(|buffer| buffer.capacity() >= length) {
+            let buffer = pool.swap_remove(idx);
+            debug!(
+                "reused verbs read MR for stream addr=0x{:x} rkey={} requested={} capacity={} pool_remaining={}",
+                buffer.remote_addr,
+                buffer.rkey,
+                length,
+                buffer.capacity(),
+                pool.len()
+            );
+            return Ok(buffer);
+        }
+        Self::register_empty(api, pd, length)
+    }
+
     fn capacity(&self) -> usize {
         self.data.len()
+    }
+
+    fn data_mut(&mut self, length: usize) -> Result<&mut [u8]> {
+        if length == 0 {
+            return Err(anyhow!("register_read requires data"));
+        }
+        if length > self.data.len() {
+            return Err(anyhow!(
+                "verbs read MR too small: capacity={} requested={}",
+                self.data.len(),
+                length
+            ));
+        }
+        Ok(&mut self.data[..length])
+    }
+
+    fn desc_for(&self, session_id: u64, length: usize) -> Result<VolumeRdmaDataDesc> {
+        if length == 0 {
+            return Err(anyhow!("register_read requires data"));
+        }
+        if length > self.data.len() {
+            return Err(anyhow!(
+                "verbs read MR too small: capacity={} requested={}",
+                self.data.len(),
+                length
+            ));
+        }
+        if length > u32::MAX as usize {
+            return Err(anyhow!("register_read data too large"));
+        }
+        Ok(VolumeRdmaDataDesc {
+            remote_addr: self.remote_addr,
+            rkey: self.rkey,
+            length: length as u32,
+            reserved: [session_id, 0, 0, 0],
+        })
     }
 
     fn fill(&mut self, session_id: u64, data: &[u8]) -> Result<VolumeRdmaDataDesc> {
@@ -1122,12 +1278,7 @@ impl VerbsReadBuffer {
             ));
         }
         self.data[..data.len()].copy_from_slice(data);
-        Ok(VolumeRdmaDataDesc {
-            remote_addr: self.remote_addr,
-            rkey: self.rkey,
-            length: data.len() as u32,
-            reserved: [session_id, 0, 0, 0],
-        })
+        self.desc_for(session_id, data.len())
     }
 
     fn deregister(&mut self, reason: &str) -> Result<()> {

@@ -53,6 +53,28 @@ func (r *fakeVolumeRdmaRegistrar) RegisterReadBuffer(ctx context.Context, data [
 	return &fakeVolumeRdmaRegisteredBuffer{registrar: r, desc: r.desc}, nil
 }
 
+type fakeVolumeRdmaStreamRegistrar struct {
+	fakeVolumeRdmaRegistrar
+	connectionID uint64
+	size         uint64
+}
+
+func (r *fakeVolumeRdmaStreamRegistrar) RegisterReadStreamFor(ctx context.Context, connectionID uint64, size uint64, writeData func(io.Writer) error) (VolumeRdmaRegisteredBuffer, error) {
+	r.connectionID = connectionID
+	r.size = size
+	var buf bytes.Buffer
+	if err := writeData(&buf); err != nil {
+		return nil, err
+	}
+	r.data = append([]byte(nil), buf.Bytes()...)
+	if r.err != nil {
+		return nil, r.err
+	}
+	desc := r.desc
+	desc.Length = uint32(len(r.data))
+	return &fakeVolumeRdmaRegisteredBuffer{registrar: &r.fakeVolumeRdmaRegistrar, desc: desc}, nil
+}
+
 type fakeVolumeRdmaRegisteredBuffer struct {
 	registrar *fakeVolumeRdmaRegistrar
 	desc      VolumeRdmaDataDesc
@@ -113,6 +135,48 @@ func TestVolumeStoreRdmaReadExporterPrepareAndRelease(t *testing.T) {
 	}
 	if !registrar.released {
 		t.Fatalf("registered buffer was not released")
+	}
+}
+
+func TestVolumeStoreRdmaReadExporterPrefersStreamRegistrar(t *testing.T) {
+	reader := &fakeVolumeRdmaNeedleReader{data: []byte("stream-range")}
+	registrar := &fakeVolumeRdmaStreamRegistrar{
+		fakeVolumeRdmaRegistrar: fakeVolumeRdmaRegistrar{
+			desc: VolumeRdmaDataDesc{
+				RemoteAddr: 0xface,
+				RKey:       9,
+				Length:     4096,
+			},
+		},
+	}
+	exporter := newVolumeStoreRdmaReadExporter(reader, registrar, VolumeRdmaReadExporterConfig{
+		MaxSize:  4096,
+		LeaseTTL: time.Minute,
+	})
+
+	lease, err := exporter.PrepareRead(context.Background(), VolumeRdmaReadRequest{
+		FileID:       "3,01637037d6",
+		VolumeID:     3,
+		NeedleID:     123,
+		Cookie:       456,
+		Offset:       7,
+		Size:         uint64(len("stream-range")),
+		ConnectionID: 77,
+	})
+	if err != nil {
+		t.Fatalf("PrepareRead: %v", err)
+	}
+	if registrar.connectionID != 77 {
+		t.Fatalf("connectionID = %d, want 77", registrar.connectionID)
+	}
+	if registrar.size != uint64(len("stream-range")) {
+		t.Fatalf("stream size = %d, want %d", registrar.size, len("stream-range"))
+	}
+	if !bytes.Equal(registrar.data, []byte("stream-range")) {
+		t.Fatalf("streamed data = %q", registrar.data)
+	}
+	if lease.Desc.RemoteAddr != 0xface || lease.Desc.RKey != 9 || lease.Desc.Length != uint32(len("stream-range")) {
+		t.Fatalf("unexpected descriptor: %+v", lease.Desc)
 	}
 }
 

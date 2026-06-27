@@ -14,10 +14,11 @@ import (
 )
 
 const (
-	volumeRdmaEngineOpLocal        = "local"
-	volumeRdmaEngineOpConnect      = "connect"
-	volumeRdmaEngineOpRegisterRead = "register_read"
-	volumeRdmaEngineOpRelease      = "release"
+	volumeRdmaEngineOpLocal              = "local"
+	volumeRdmaEngineOpConnect            = "connect"
+	volumeRdmaEngineOpRegisterRead       = "register_read"
+	volumeRdmaEngineOpRegisterReadStream = "register_read_stream"
+	volumeRdmaEngineOpRelease            = "release"
 
 	volumeRdmaEngineMaxFrameSize = 64 << 20
 )
@@ -143,6 +144,36 @@ func (c *VolumeRdmaEngineClient) RegisterReadBufferFor(ctx context.Context, conn
 	}, nil
 }
 
+func (c *VolumeRdmaEngineClient) RegisterReadStreamFor(ctx context.Context, connectionID uint64, size uint64, writeData func(io.Writer) error) (VolumeRdmaRegisteredBuffer, error) {
+	if size == 0 {
+		return nil, fmt.Errorf("native RDMA register_read_stream requires data")
+	}
+	if size > volumeRdmaEngineMaxFrameSize {
+		return nil, fmt.Errorf("native RDMA register_read_stream frame too large: %d bytes", size)
+	}
+	if writeData == nil {
+		return nil, fmt.Errorf("native RDMA register_read_stream requires writer")
+	}
+	resp, err := c.roundTripWithStream(ctx, volumeRdmaEngineRequest{
+		Op:           volumeRdmaEngineOpRegisterReadStream,
+		ConnectionID: connectionID,
+	}, size, writeData)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Desc == nil {
+		return nil, fmt.Errorf("%w: register_read_stream response missing descriptor", ErrVolumeRdmaEngineUnavailable)
+	}
+	if resp.SessionID == 0 {
+		return nil, fmt.Errorf("%w: register_read_stream response missing session_id", ErrVolumeRdmaEngineUnavailable)
+	}
+	return &volumeRdmaEngineRegisteredBuffer{
+		client:    c,
+		sessionID: resp.SessionID,
+		desc:      *resp.Desc,
+	}, nil
+}
+
 func (b *volumeRdmaEngineRegisteredBuffer) Descriptor() VolumeRdmaDataDesc {
 	if b == nil {
 		return VolumeRdmaDataDesc{}
@@ -166,6 +197,36 @@ func (c *VolumeRdmaEngineClient) roundTrip(ctx context.Context, req volumeRdmaEn
 }
 
 func (c *VolumeRdmaEngineClient) roundTripWithSideband(ctx context.Context, req volumeRdmaEngineRequest, sideband []byte) (*volumeRdmaEngineResponse, error) {
+	return c.roundTripWrite(ctx, req, func(conn net.Conn) error {
+		if sideband != nil {
+			if err := writeVolumeRdmaEngineFrame(conn, sideband); err != nil {
+				return fmt.Errorf("write request sideband: %w", err)
+			}
+		}
+		return nil
+	})
+}
+
+func (c *VolumeRdmaEngineClient) roundTripWithStream(ctx context.Context, req volumeRdmaEngineRequest, size uint64, writeData func(io.Writer) error) (*volumeRdmaEngineResponse, error) {
+	return c.roundTripWrite(ctx, req, func(conn net.Conn) error {
+		if err := writeVolumeRdmaEngineFrameHeader(conn, size); err != nil {
+			return fmt.Errorf("write stream frame header: %w", err)
+		}
+		writer := &volumeRdmaEngineExactFrameWriter{
+			w:         conn,
+			remaining: size,
+		}
+		if err := writeData(writer); err != nil {
+			return fmt.Errorf("write stream frame payload: %w", err)
+		}
+		if writer.remaining != 0 {
+			return fmt.Errorf("write stream frame payload: short write: wrote %d of %d bytes", writer.written, size)
+		}
+		return nil
+	})
+}
+
+func (c *VolumeRdmaEngineClient) roundTripWrite(ctx context.Context, req volumeRdmaEngineRequest, writeExtra func(net.Conn) error) (*volumeRdmaEngineResponse, error) {
 	if c == nil || strings.TrimSpace(c.SocketPath) == "" {
 		return nil, ErrVolumeRdmaReadNotConfigured
 	}
@@ -186,9 +247,6 @@ func (c *VolumeRdmaEngineClient) roundTripWithSideband(ctx context.Context, req 
 	if len(payload) > volumeRdmaEngineMaxFrameSize {
 		return nil, fmt.Errorf("native RDMA engine request too large: %d bytes", len(payload))
 	}
-	if sideband != nil && len(sideband) > volumeRdmaEngineMaxFrameSize {
-		return nil, fmt.Errorf("native RDMA engine sideband too large: %d bytes", len(sideband))
-	}
 
 	var dialer net.Dialer
 	conn, err := dialer.DialContext(ctx, "unix", c.SocketPath)
@@ -202,9 +260,9 @@ func (c *VolumeRdmaEngineClient) roundTripWithSideband(ctx context.Context, req 
 	if err := writeVolumeRdmaEngineFrame(conn, payload); err != nil {
 		return nil, fmt.Errorf("%w: write request: %v", ErrVolumeRdmaEngineUnavailable, err)
 	}
-	if sideband != nil {
-		if err := writeVolumeRdmaEngineFrame(conn, sideband); err != nil {
-			return nil, fmt.Errorf("%w: write request sideband: %v", ErrVolumeRdmaEngineUnavailable, err)
+	if writeExtra != nil {
+		if err := writeExtra(conn); err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrVolumeRdmaEngineUnavailable, err)
 		}
 	}
 	responsePayload, err := readVolumeRdmaEngineFrame(conn)
@@ -224,16 +282,38 @@ func (c *VolumeRdmaEngineClient) roundTripWithSideband(ctx context.Context, req 
 	return &resp, nil
 }
 
-func writeVolumeRdmaEngineFrame(w io.Writer, payload []byte) error {
-	if len(payload) > volumeRdmaEngineMaxFrameSize {
-		return fmt.Errorf("frame too large: %d", len(payload))
+type volumeRdmaEngineExactFrameWriter struct {
+	w         io.Writer
+	remaining uint64
+	written   uint64
+}
+
+func (w *volumeRdmaEngineExactFrameWriter) Write(payload []byte) (int, error) {
+	if uint64(len(payload)) > w.remaining {
+		return 0, fmt.Errorf("frame payload exceeds declared size: write=%d remaining=%d", len(payload), w.remaining)
 	}
-	var header [4]byte
-	binary.LittleEndian.PutUint32(header[:], uint32(len(payload)))
-	if err := writeVolumeRdmaEngineFull(w, header[:]); err != nil {
+	if err := writeVolumeRdmaEngineFull(w.w, payload); err != nil {
+		return 0, err
+	}
+	w.remaining -= uint64(len(payload))
+	w.written += uint64(len(payload))
+	return len(payload), nil
+}
+
+func writeVolumeRdmaEngineFrame(w io.Writer, payload []byte) error {
+	if err := writeVolumeRdmaEngineFrameHeader(w, uint64(len(payload))); err != nil {
 		return err
 	}
 	return writeVolumeRdmaEngineFull(w, payload)
+}
+
+func writeVolumeRdmaEngineFrameHeader(w io.Writer, size uint64) error {
+	if size > volumeRdmaEngineMaxFrameSize {
+		return fmt.Errorf("frame too large: %d", size)
+	}
+	var header [4]byte
+	binary.LittleEndian.PutUint32(header[:], uint32(size))
+	return writeVolumeRdmaEngineFull(w, header[:])
 }
 
 func writeVolumeRdmaEngineFull(w io.Writer, payload []byte) error {

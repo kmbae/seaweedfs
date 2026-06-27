@@ -35,6 +35,10 @@ type VolumeRdmaConnectionReadRegistrar interface {
 	RegisterReadBufferFor(context.Context, uint64, []byte) (VolumeRdmaRegisteredBuffer, error)
 }
 
+type VolumeRdmaConnectionReadStreamRegistrar interface {
+	RegisterReadStreamFor(context.Context, uint64, uint64, func(io.Writer) error) (VolumeRdmaRegisteredBuffer, error)
+}
+
 type VolumeRdmaRegisteredBuffer interface {
 	Descriptor() VolumeRdmaDataDesc
 	Release(context.Context) error
@@ -113,19 +117,26 @@ func (e *VolumeStoreRdmaReadExporter) PrepareRead(ctx context.Context, req Volum
 		return nil, fmt.Errorf("invalid read range offset=%d size=%d", req.Offset, req.Size)
 	}
 
-	data, err := e.readNeedleRange(ctx, req)
-	if err != nil {
-		return nil, err
-	}
-	if len(data) == 0 {
-		return nil, fmt.Errorf("native RDMA read produced no data")
-	}
-
 	var registered VolumeRdmaRegisteredBuffer
-	if registrar, ok := e.registrar.(VolumeRdmaConnectionReadRegistrar); ok {
-		registered, err = registrar.RegisterReadBufferFor(ctx, req.ConnectionID, data)
+	var readSize int
+	var err error
+	if registrar, ok := e.registrar.(VolumeRdmaConnectionReadStreamRegistrar); ok {
+		registered, readSize, err = e.registerReadStream(ctx, req, registrar)
 	} else {
-		registered, err = e.registrar.RegisterReadBuffer(ctx, data)
+		var data []byte
+		data, err = e.readNeedleRange(ctx, req)
+		if err != nil {
+			return nil, err
+		}
+		if len(data) == 0 {
+			return nil, fmt.Errorf("native RDMA read produced no data")
+		}
+		readSize = len(data)
+		if registrar, ok := e.registrar.(VolumeRdmaConnectionReadRegistrar); ok {
+			registered, err = registrar.RegisterReadBufferFor(ctx, req.ConnectionID, data)
+		} else {
+			registered, err = e.registrar.RegisterReadBuffer(ctx, data)
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -135,11 +146,11 @@ func (e *VolumeStoreRdmaReadExporter) PrepareRead(ctx context.Context, req Volum
 		_ = registered.Release(ctx)
 		return nil, ErrVolumeRdmaReadNotExportable
 	}
-	if desc.Length == 0 || uint64(desc.Length) < uint64(len(data)) {
+	if desc.Length == 0 || uint64(desc.Length) < uint64(readSize) {
 		_ = registered.Release(ctx)
-		return nil, fmt.Errorf("%w: descriptor length=%d data=%d", ErrVolumeRdmaReadNotExportable, desc.Length, len(data))
+		return nil, fmt.Errorf("%w: descriptor length=%d data=%d", ErrVolumeRdmaReadNotExportable, desc.Length, readSize)
 	}
-	desc.Length = uint32(len(data))
+	desc.Length = uint32(readSize)
 
 	sessionID := e.trackLease(registered)
 	if sessionID == 0 {
@@ -154,6 +165,42 @@ func (e *VolumeStoreRdmaReadExporter) PrepareRead(ctx context.Context, req Volum
 		ConnectionID: req.ConnectionID,
 		SessionID:    sessionID,
 	}, nil
+}
+
+func (e *VolumeStoreRdmaReadExporter) registerReadStream(ctx context.Context, req VolumeRdmaReadRequest, registrar VolumeRdmaConnectionReadStreamRegistrar) (VolumeRdmaRegisteredBuffer, int, error) {
+	if req.Size == 0 || req.Size > math.MaxInt32 {
+		return nil, 0, fmt.Errorf("invalid stream read size: %d", req.Size)
+	}
+	n := &needle.Needle{
+		Id:     types.Uint64ToNeedleId(req.NeedleID),
+		Cookie: types.Uint32ToCookie(req.Cookie),
+	}
+	readOption := &storage.ReadOption{ReadBufferSize: e.cfg.ReadBufferSize}
+	registered, err := registrar.RegisterReadStreamFor(ctx, req.ConnectionID, req.Size, func(writer io.Writer) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+		if err := e.store.ReadVolumeNeedleDataInto(
+			needle.VolumeId(req.VolumeID),
+			n,
+			readOption,
+			writer,
+			int64(req.Offset),
+			int64(req.Size),
+		); err != nil {
+			return err
+		}
+		if n.Cookie != types.Uint32ToCookie(req.Cookie) {
+			return fmt.Errorf("cookie mismatch for needle %d: got %08x, want %08x", req.NeedleID, uint32(n.Cookie), req.Cookie)
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return registered, int(req.Size), nil
 }
 
 func (e *VolumeStoreRdmaReadExporter) ReleaseRead(ctx context.Context, sessionID uint64) error {

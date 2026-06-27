@@ -3,6 +3,7 @@ package weed_server
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"path/filepath"
 	"testing"
@@ -75,6 +76,28 @@ func TestVolumeRdmaEngineClientEndpointAndRegistrar(t *testing.T) {
 						Length:     uint32(len(req.Data)),
 					}
 					resp.SessionID = 99
+				case volumeRdmaEngineOpRegisterReadStream:
+					if req.DataSideband {
+						t.Errorf("register_read_stream unexpectedly requested sideband data")
+					}
+					if len(req.Data) != 0 {
+						t.Errorf("register_read_stream JSON data = %q, want empty", req.Data)
+					}
+					streamed, err := readVolumeRdmaEngineFrame(conn)
+					if err != nil {
+						t.Errorf("read stream frame: %v", err)
+						return
+					}
+					req.Data = streamed
+					if string(req.Data) != "stream-data" {
+						t.Errorf("stream data = %q", req.Data)
+					}
+					resp.Desc = &VolumeRdmaDataDesc{
+						RemoteAddr: 0xcafe,
+						RKey:       88,
+						Length:     uint32(len(req.Data)),
+					}
+					resp.SessionID = 100
 				case volumeRdmaEngineOpRelease:
 				default:
 					resp.OK = false
@@ -118,6 +141,17 @@ func TestVolumeRdmaEngineClientEndpointAndRegistrar(t *testing.T) {
 	if desc.RemoteAddr != 0xbeef || desc.RKey != 77 || desc.Length != uint32(len("needle-data")) {
 		t.Fatalf("unexpected descriptor: %+v", desc)
 	}
+	streamBuffer, err := client.RegisterReadStreamFor(context.Background(), 7, uint64(len("stream-data")), func(w io.Writer) error {
+		_, err := w.Write([]byte("stream-data"))
+		return err
+	})
+	if err != nil {
+		t.Fatalf("RegisterReadStreamFor: %v", err)
+	}
+	streamDesc := streamBuffer.Descriptor()
+	if streamDesc.RemoteAddr != 0xcafe || streamDesc.RKey != 88 || streamDesc.Length != uint32(len("stream-data")) {
+		t.Fatalf("unexpected stream descriptor: %+v", streamDesc)
+	}
 	if err := buffer.Release(context.Background()); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
@@ -126,6 +160,7 @@ func TestVolumeRdmaEngineClientEndpointAndRegistrar(t *testing.T) {
 		volumeRdmaEngineOpLocal,
 		volumeRdmaEngineOpConnect,
 		volumeRdmaEngineOpRegisterRead,
+		volumeRdmaEngineOpRegisterReadStream,
 		volumeRdmaEngineOpRelease,
 	}
 	for _, want := range ops {
