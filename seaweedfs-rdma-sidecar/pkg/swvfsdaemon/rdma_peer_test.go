@@ -17,11 +17,13 @@ type fakeRDMAControl struct {
 }
 
 type fakeReadStager struct {
-	path   string
-	offset uint64
-	size   uint64
-	desc   swvfsproto.RDMADataDesc
-	attr   *swvfsproto.Attr
+	path           string
+	offset         uint64
+	size           uint64
+	desc           swvfsproto.RDMADataDesc
+	attr           *swvfsproto.Attr
+	sessionID      uint64
+	releaseSession uint64
 }
 
 func (f *fakeRDMAControl) GetLocal() (swvfsproto.RDMALocalInfo, error) {
@@ -34,11 +36,20 @@ func (f *fakeRDMAControl) Connect(remote swvfsproto.RDMARemoteInfo) error {
 	return nil
 }
 
-func (f *fakeReadStager) StageReadRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
+func (f *fakeReadStager) StageReadRDMA(ctx context.Context, path string, offset, size uint64) (*RDMAReadDescriptorLease, error) {
 	f.path = path
 	f.offset = offset
 	f.size = size
-	return &f.desc, f.attr, nil
+	return &RDMAReadDescriptorLease{
+		Desc:      f.desc,
+		Attr:      f.attr,
+		SessionID: f.sessionID,
+	}, nil
+}
+
+func (f *fakeReadStager) ReleaseReadRDMA(ctx context.Context, sessionID uint64) error {
+	f.releaseSession = sessionID
+	return nil
 }
 
 func TestRDMALocalEndpointFromInfo(t *testing.T) {
@@ -92,8 +103,9 @@ func TestRDMAPeerControlServerLocalAndConnect(t *testing.T) {
 
 func TestRDMAPeerControlServerReadDesc(t *testing.T) {
 	stager := &fakeReadStager{
-		desc: swvfsproto.RDMADataDesc{RemoteAddr: 0x1234, RKey: 99, Length: 4096},
-		attr: &swvfsproto.Attr{Ino: 4, Size: 4096, Mode: 0100644, Nlink: 1},
+		desc:      swvfsproto.RDMADataDesc{RemoteAddr: 0x1234, RKey: 99, Length: 4096},
+		attr:      &swvfsproto.Attr{Ino: 4, Size: 4096, Mode: 0100644, Nlink: 1},
+		sessionID: 17,
 	}
 	server := httptest.NewServer((&RDMAPeerControlServer{
 		Control:    &fakeRDMAControl{local: readyInfo(7, 11, 13)},
@@ -101,7 +113,7 @@ func TestRDMAPeerControlServerReadDesc(t *testing.T) {
 	}).Handler())
 	defer server.Close()
 
-	desc, attr, err := PostRDMAPeerReadDesc(context.Background(), server.Client(), server.URL, "/file", 8, 4096)
+	desc, attr, sessionID, err := PostRDMAPeerReadDesc(context.Background(), server.Client(), server.URL, "/file", 8, 4096)
 	if err != nil {
 		t.Fatalf("PostRDMAPeerReadDesc: %v", err)
 	}
@@ -111,6 +123,15 @@ func TestRDMAPeerControlServerReadDesc(t *testing.T) {
 	if attr == nil || attr.Ino != 4 || stager.path != "/file" || stager.offset != 8 || stager.size != 4096 {
 		t.Fatalf("read-desc delegation mismatch: attr=%+v path=%q off=%d size=%d", attr, stager.path, stager.offset, stager.size)
 	}
+	if sessionID != 17 {
+		t.Fatalf("session id = %d, want 17", sessionID)
+	}
+	if err := PostRDMAPeerReleaseDesc(context.Background(), server.Client(), server.URL, sessionID); err != nil {
+		t.Fatalf("PostRDMAPeerReleaseDesc: %v", err)
+	}
+	if stager.releaseSession != 17 {
+		t.Fatalf("release session = %d, want 17", stager.releaseSession)
+	}
 }
 
 func TestRemoteRDMAReadDescriptorClient(t *testing.T) {
@@ -118,8 +139,9 @@ func TestRemoteRDMAReadDescriptorClient(t *testing.T) {
 	local.Flags |= swvfsproto.RDMAFQPConnected
 	remote := RDMALocalEndpointFromInfo(readyInfo(2, 20, 200))
 	stager := &fakeReadStager{
-		desc: swvfsproto.RDMADataDesc{RemoteAddr: 0xbeef, RKey: 12, Length: 512},
-		attr: &swvfsproto.Attr{Ino: 5, Size: 512, Mode: 0100644, Nlink: 1},
+		desc:      swvfsproto.RDMADataDesc{RemoteAddr: 0xbeef, RKey: 12, Length: 512},
+		attr:      &swvfsproto.Attr{Ino: 5, Size: 512, Mode: 0100644, Nlink: 1},
+		sessionID: 23,
 	}
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
@@ -127,6 +149,8 @@ func TestRemoteRDMAReadDescriptorClient(t *testing.T) {
 			writeJSON(w, remote)
 		case RDMAPeerReadDescPath:
 			(&RDMAPeerControlServer{ReadStager: stager}).handleReadDesc(w, r)
+		case RDMAPeerReleaseDescPath:
+			(&RDMAPeerControlServer{ReadStager: stager}).handleReleaseDesc(w, r)
 		default:
 			http.NotFound(w, r)
 		}
@@ -134,10 +158,11 @@ func TestRemoteRDMAReadDescriptorClient(t *testing.T) {
 	defer server.Close()
 
 	client := &RemoteRDMAReadDescriptorClient{
-		Control: &fakeRDMAControl{local: local},
-		Peers:   []string{server.URL},
-		Client:  server.Client(),
-		Timeout: time.Second,
+		Control:      &fakeRDMAControl{local: local},
+		Peers:        []string{server.URL},
+		Client:       server.Client(),
+		Timeout:      time.Second,
+		ReleaseDelay: time.Millisecond,
 	}
 	desc, attr, err := client.ReadFileRDMA(context.Background(), "/file", 0, 512)
 	if err != nil {
@@ -148,6 +173,15 @@ func TestRemoteRDMAReadDescriptorClient(t *testing.T) {
 	}
 	if attr == nil || attr.Ino != 5 || stager.path != "/file" || stager.size != 512 {
 		t.Fatalf("remote descriptor delegation mismatch: attr=%+v path=%q size=%d", attr, stager.path, stager.size)
+	}
+	deadline := time.After(time.Second)
+	for stager.releaseSession != 23 {
+		select {
+		case <-deadline:
+			t.Fatalf("release session = %d, want 23", stager.releaseSession)
+		default:
+			time.Sleep(time.Millisecond)
+		}
 	}
 }
 

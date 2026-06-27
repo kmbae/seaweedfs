@@ -130,7 +130,8 @@ type RDMATestMR struct {
 	Length     uint32
 	UserLength uint32
 	Pattern    uint32
-	Reserved   [8]uint64
+	SessionID  uint64
+	Reserved   [7]uint64
 }
 
 func (m RDMATestMR) Allocated() bool {

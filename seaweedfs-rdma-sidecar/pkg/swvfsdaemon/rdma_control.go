@@ -85,8 +85,10 @@ func (c *RDMAControl) TestMRAlloc(length uint32, pattern uint32) (swvfsproto.RDM
 	return mr, nil
 }
 
-func (c *RDMAControl) TestMRInfo() (swvfsproto.RDMATestMR, error) {
-	var mr swvfsproto.RDMATestMR
+func (c *RDMAControl) TestMRInfo(sessionID uint64) (swvfsproto.RDMATestMR, error) {
+	mr := swvfsproto.RDMATestMR{
+		SessionID: sessionID,
+	}
 	if c == nil || c.file == nil {
 		return mr, fmt.Errorf("nil RDMA control device")
 	}
@@ -96,8 +98,11 @@ func (c *RDMAControl) TestMRInfo() (swvfsproto.RDMATestMR, error) {
 	return mr, nil
 }
 
-func (c *RDMAControl) TestMRWrite(data []byte) (swvfsproto.RDMATestMR, error) {
-	mr := swvfsproto.RDMATestMR{ABIVersion: swvfsproto.RDMAABIVersion}
+func (c *RDMAControl) TestMRWrite(sessionID uint64, data []byte) (swvfsproto.RDMATestMR, error) {
+	mr := swvfsproto.RDMATestMR{
+		ABIVersion: swvfsproto.RDMAABIVersion,
+		SessionID:  sessionID,
+	}
 	if c == nil || c.file == nil {
 		return mr, fmt.Errorf("nil RDMA control device")
 	}
@@ -112,8 +117,11 @@ func (c *RDMAControl) TestMRWrite(data []byte) (swvfsproto.RDMATestMR, error) {
 	return mr, nil
 }
 
-func (c *RDMAControl) TestMRRead(length uint32) ([]byte, swvfsproto.RDMATestMR, error) {
-	mr := swvfsproto.RDMATestMR{ABIVersion: swvfsproto.RDMAABIVersion}
+func (c *RDMAControl) TestMRRead(sessionID uint64, length uint32) ([]byte, swvfsproto.RDMATestMR, error) {
+	mr := swvfsproto.RDMATestMR{
+		ABIVersion: swvfsproto.RDMAABIVersion,
+		SessionID:  sessionID,
+	}
 	if c == nil || c.file == nil {
 		return nil, mr, fmt.Errorf("nil RDMA control device")
 	}
@@ -129,11 +137,18 @@ func (c *RDMAControl) TestMRRead(length uint32) ([]byte, swvfsproto.RDMATestMR, 
 	return buf[:mr.UserLength], mr, nil
 }
 
-func (c *RDMAControl) TestMRFree() error {
+func (c *RDMAControl) TestMRFree(sessionID uint64) error {
 	if c == nil || c.file == nil {
 		return fmt.Errorf("nil RDMA control device")
 	}
-	if err := ioctl(c.file.Fd(), ioctlRDMATestMRFree, 0); err != nil {
+	mr := swvfsproto.RDMATestMR{
+		SessionID: sessionID,
+	}
+	arg := uintptr(0)
+	if sessionID != 0 {
+		arg = uintptr(unsafe.Pointer(&mr))
+	}
+	if err := ioctl(c.file.Fd(), ioctlRDMATestMRFree, arg); err != nil {
 		return fmt.Errorf("SWVFS_IOC_RDMA_TEST_MR_FREE: %w", err)
 	}
 	return nil

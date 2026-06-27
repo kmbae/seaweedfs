@@ -17,9 +17,10 @@ import (
 )
 
 const (
-	RDMAPeerLocalPath    = "/rdma/local"
-	RDMAPeerConnectPath  = "/rdma/connect"
-	RDMAPeerReadDescPath = "/rdma/read-desc"
+	RDMAPeerLocalPath       = "/rdma/local"
+	RDMAPeerConnectPath     = "/rdma/connect"
+	RDMAPeerReadDescPath    = "/rdma/read-desc"
+	RDMAPeerReleaseDescPath = "/rdma/release-desc"
 )
 
 var ErrRDMAPeerUnpaired = errors.New("no deterministic RDMA pair selected")
@@ -131,6 +132,7 @@ func (s *RDMAPeerControlServer) Handler() http.Handler {
 	mux.HandleFunc(RDMAPeerLocalPath, s.handleLocal)
 	mux.HandleFunc(RDMAPeerConnectPath, s.handleConnect)
 	mux.HandleFunc(RDMAPeerReadDescPath, s.handleReadDesc)
+	mux.HandleFunc(RDMAPeerReleaseDescPath, s.handleReleaseDesc)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -186,8 +188,13 @@ type RDMAPeerReadDescRequest struct {
 }
 
 type RDMAPeerReadDescResponse struct {
-	Desc swvfsproto.RDMADataDesc `json:"desc"`
-	Attr *swvfsproto.Attr        `json:"attr,omitempty"`
+	Desc      swvfsproto.RDMADataDesc `json:"desc"`
+	Attr      *swvfsproto.Attr        `json:"attr,omitempty"`
+	SessionID uint64                  `json:"session_id,omitempty"`
+}
+
+type RDMAPeerReleaseDescRequest struct {
+	SessionID uint64 `json:"session_id"`
 }
 
 func (s *RDMAPeerControlServer) handleReadDesc(w http.ResponseWriter, r *http.Request) {
@@ -208,16 +215,41 @@ func (s *RDMAPeerControlServer) handleReadDesc(w http.ResponseWriter, r *http.Re
 		http.Error(w, "path is required", http.StatusBadRequest)
 		return
 	}
-	desc, attr, err := s.ReadStager.StageReadRDMA(r.Context(), req.Path, req.Offset, req.Size)
+	lease, err := s.ReadStager.StageReadRDMA(r.Context(), req.Path, req.Offset, req.Size)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
-	if desc == nil {
+	if lease == nil {
 		http.Error(w, "rdma read descriptor stager returned no descriptor", http.StatusServiceUnavailable)
 		return
 	}
-	writeJSON(w, RDMAPeerReadDescResponse{Desc: *desc, Attr: attr})
+	writeJSON(w, RDMAPeerReadDescResponse{Desc: lease.Desc, Attr: lease.Attr, SessionID: lease.SessionID})
+}
+
+func (s *RDMAPeerControlServer) handleReleaseDesc(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.ReadStager == nil {
+		http.Error(w, "rdma read descriptor staging is not configured", http.StatusNotImplemented)
+		return
+	}
+	var req RDMAPeerReleaseDescRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.SessionID == 0 {
+		http.Error(w, "session_id is required", http.StatusBadRequest)
+		return
+	}
+	if err := s.ReadStager.ReleaseReadRDMA(r.Context(), req.SessionID); err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, map[string]any{"released": true})
 }
 
 func FetchRDMAPeerEndpoint(ctx context.Context, client *http.Client, rawURL string) (RDMALocalEndpoint, error) {
@@ -274,10 +306,10 @@ func PostRDMAPeerConnect(ctx context.Context, client *http.Client, rawURL string
 	return nil
 }
 
-func PostRDMAPeerReadDesc(ctx context.Context, client *http.Client, rawURL string, path string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
+func PostRDMAPeerReadDesc(ctx context.Context, client *http.Client, rawURL string, path string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, uint64, error) {
 	reqURL, err := normalizeRDMAPeerURL(rawURL, RDMAPeerReadDescPath)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	body, err := json.Marshal(RDMAPeerReadDescRequest{
 		Path:   path,
@@ -285,26 +317,51 @@ func PostRDMAPeerReadDesc(ctx context.Context, client *http.Client, rawURL strin
 		Size:   size,
 	})
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	resp, err := httpClient(client).Do(req)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, nil, fmt.Errorf("POST %s returned %s", reqURL, resp.Status)
+		return nil, nil, 0, fmt.Errorf("POST %s returned %s", reqURL, resp.Status)
 	}
 	var out RDMAPeerReadDescResponse
 	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		return nil, nil, err
+		return nil, nil, 0, err
 	}
-	return &out.Desc, out.Attr, nil
+	return &out.Desc, out.Attr, out.SessionID, nil
+}
+
+func PostRDMAPeerReleaseDesc(ctx context.Context, client *http.Client, rawURL string, sessionID uint64) error {
+	reqURL, err := normalizeRDMAPeerURL(rawURL, RDMAPeerReleaseDescPath)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(RDMAPeerReleaseDescRequest{SessionID: sessionID})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient(client).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("POST %s returned %s", reqURL, resp.Status)
+	}
+	return nil
 }
 
 func ExpandRDMAPeerURLs(ctx context.Context, rawEndpoints []string) []string {
@@ -367,7 +424,9 @@ func normalizeRDMAPeerURL(raw string, defaultPath string) (string, error) {
 	if u.Scheme == "" {
 		u.Scheme = "http"
 	}
-	if u.Path == "" || u.Path == "/" || u.Path == RDMAPeerLocalPath || u.Path == RDMAPeerConnectPath {
+	if u.Path == "" || u.Path == "/" || u.Path == RDMAPeerLocalPath ||
+		u.Path == RDMAPeerConnectPath || u.Path == RDMAPeerReadDescPath ||
+		u.Path == RDMAPeerReleaseDescPath {
 		u.Path = defaultPath
 	}
 	return u.String(), nil
