@@ -203,6 +203,24 @@ func TestSelectRDMAPairedPeer(t *testing.T) {
 	}
 }
 
+func TestShouldInitiateRDMAPeerConnectUsesStableEndpoint(t *testing.T) {
+	local := RDMALocalEndpointFromInfo(readyInfo(1, 10, 100))
+	peer := RDMALocalEndpointFromInfo(readyInfo(2, 20, 200))
+
+	if !ShouldInitiateRDMAPeerConnect(local, peer) {
+		t.Fatalf("lower stable endpoint should initiate")
+	}
+	if ShouldInitiateRDMAPeerConnect(peer, local) {
+		t.Fatalf("higher stable endpoint should wait as responder")
+	}
+
+	peer.QPNum = 21
+	peer.PSN = 201
+	if !ShouldInitiateRDMAPeerConnect(local, peer) {
+		t.Fatalf("initiator decision should survive peer QP churn")
+	}
+}
+
 func TestNormalizeRDMAPeerURL(t *testing.T) {
 	got, err := normalizeRDMAPeerURL("10.0.0.1:18084", RDMAPeerLocalPath)
 	if err != nil {

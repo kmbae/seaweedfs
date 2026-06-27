@@ -328,6 +328,18 @@ func connectRDMAPeersOnce(ctx context.Context, control *swvfsdaemon.RDMAControl,
 	if err != nil {
 		return err
 	}
+	if !swvfsdaemon.ShouldInitiateRDMAPeerConnect(local, selected) {
+		if local.QPConnected {
+			logger.WithFields(logrus.Fields{
+				"local_qpn": local.QPNum,
+				"local_lid": local.LID,
+				"peer_qpn":  selected.QPNum,
+				"peer_lid":  selected.LID,
+			}).Debug("kernel RDMA peer handshake observed as responder")
+			return nil
+		}
+		return fmt.Errorf("waiting for RDMA peer initiator local_lid=%d peer_lid=%d", local.LID, selected.LID)
+	}
 	for _, peer := range fetched {
 		if !peer.Endpoint.SamePeer(selected) {
 			continue

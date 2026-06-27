@@ -91,6 +91,10 @@ func (e RDMALocalEndpoint) PeerKey() string {
 	return fmt.Sprintf("%08x:%08x:%08x:%s", e.LID, e.QPNum, e.PSN, strings.ToLower(e.GID))
 }
 
+func (e RDMALocalEndpoint) StablePeerKey() string {
+	return fmt.Sprintf("%08x:%08x:%s", e.LID, e.Port, strings.ToLower(e.GID))
+}
+
 func (e RDMALocalEndpoint) SamePeer(other RDMALocalEndpoint) bool {
 	return e.PeerKey() == other.PeerKey()
 }
@@ -438,6 +442,15 @@ func SelectRDMAPairedPeer(local RDMALocalEndpoint, peers []RDMALocalEndpoint) (R
 		return all[idx-1], true
 	}
 	return RDMALocalEndpoint{}, false
+}
+
+func ShouldInitiateRDMAPeerConnect(local, peer RDMALocalEndpoint) bool {
+	localKey := local.StablePeerKey()
+	peerKey := peer.StablePeerKey()
+	if localKey == peerKey {
+		return local.PeerKey() < peer.PeerKey()
+	}
+	return localKey < peerKey
 }
 
 func normalizeRDMAPeerURL(raw string, defaultPath string) (string, error) {
