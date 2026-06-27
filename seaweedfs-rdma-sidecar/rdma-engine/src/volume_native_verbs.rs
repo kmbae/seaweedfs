@@ -1,17 +1,18 @@
 use crate::volume_native::{
-    VolumeRdmaEndpointInfo, VolumeRdmaProvider, VolumeRdmaRegisteredRead, VolumeRdmaRemoteInfo,
-    ABI_VERSION, LINK_ETHERNET, LINK_INFINIBAND,
+    VolumeRdmaDataDesc, VolumeRdmaEndpointInfo, VolumeRdmaProvider, VolumeRdmaRegisteredRead,
+    VolumeRdmaRemoteInfo, ABI_VERSION, LINK_ETHERNET, LINK_INFINIBAND,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
-use libc::{c_char, c_int, c_void};
+use libc::{c_char, c_int, c_void, size_t};
 use libloading::Library;
+use std::collections::HashMap;
 use std::ffi::CStr;
 use std::fmt;
 use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::{Arc, Mutex};
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const IBV_QPT_RC: c_int = 2;
 const IBV_PORT_ACTIVE: c_int = 4;
@@ -90,6 +91,8 @@ impl RealVerbsVolumeRdmaProvider {
                 _resources: resources,
                 endpoint,
                 connected_remote: None,
+                next_session_id: 1,
+                leases: HashMap::new(),
             }),
         })
     }
@@ -129,13 +132,33 @@ impl VolumeRdmaProvider for RealVerbsVolumeRdmaProvider {
         Ok(())
     }
 
-    async fn register_read(&self, _data: Vec<u8>) -> Result<VolumeRdmaRegisteredRead> {
-        Err(anyhow!(
-            "verbs register_read is not implemented yet; next step is ibv_reg_mr-backed read leases"
-        ))
+    async fn register_read(&self, data: Vec<u8>) -> Result<VolumeRdmaRegisteredRead> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("verbs provider mutex poisoned"))?;
+        validate_register_read_ready(
+            &state.endpoint,
+            state.connected_remote.is_some(),
+            data.len(),
+        )?;
+
+        let session_id = state.next_session_id()?;
+        let lease = state._resources.register_read_lease(session_id, data)?;
+        let desc = lease.desc.clone();
+        state.leases.insert(session_id, lease);
+
+        Ok(VolumeRdmaRegisteredRead { session_id, desc })
     }
 
-    async fn release_read(&self, _session_id: u64) -> Result<()> {
+    async fn release_read(&self, session_id: u64) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("verbs provider mutex poisoned"))?;
+        if let Some(lease) = state.leases.remove(&session_id) {
+            lease.release()?;
+        }
         Ok(())
     }
 }
@@ -145,6 +168,27 @@ struct VerbsProviderState {
     _resources: VerbsResources,
     endpoint: VolumeRdmaEndpointInfo,
     connected_remote: Option<VolumeRdmaRemoteInfo>,
+    next_session_id: u64,
+    leases: HashMap<u64, VerbsReadLease>,
+}
+
+impl VerbsProviderState {
+    fn next_session_id(&mut self) -> Result<u64> {
+        let session_id = self.next_session_id;
+        if session_id == 0 {
+            return Err(anyhow!("verbs read session id overflow"));
+        }
+        self.next_session_id = session_id
+            .checked_add(1)
+            .ok_or_else(|| anyhow!("verbs read session id overflow"))?;
+        Ok(session_id)
+    }
+}
+
+impl Drop for VerbsProviderState {
+    fn drop(&mut self) {
+        self.leases.clear();
+    }
 }
 
 #[derive(Debug)]
@@ -339,6 +383,10 @@ impl VerbsResources {
         Ok(())
     }
 
+    fn register_read_lease(&self, session_id: u64, data: Vec<u8>) -> Result<VerbsReadLease> {
+        VerbsReadLease::register(self.api.clone(), self.pd, session_id, data)
+    }
+
     unsafe fn modify_to_init(&mut self) -> Result<()> {
         let mut attr = zeroed_qp_attr();
         attr.qp_state = IBV_QPS_INIT;
@@ -416,6 +464,101 @@ impl VerbsResources {
             self.endpoint.device, self.endpoint.qp_num, target, attr_mask
         );
         Ok(())
+    }
+}
+
+struct VerbsReadLease {
+    api: Arc<VerbsApi>,
+    mr: *mut IbvMr,
+    data: Vec<u8>,
+    desc: VolumeRdmaDataDesc,
+}
+
+// Memory regions are owned by this provider and accessed under its mutex.
+unsafe impl Send for VerbsReadLease {}
+
+impl fmt::Debug for VerbsReadLease {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("VerbsReadLease")
+            .field("mr", &self.mr)
+            .field("len", &self.data.len())
+            .field("desc", &self.desc)
+            .finish()
+    }
+}
+
+impl VerbsReadLease {
+    fn register(
+        api: Arc<VerbsApi>,
+        pd: *mut IbvPd,
+        session_id: u64,
+        mut data: Vec<u8>,
+    ) -> Result<Self> {
+        let access = IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_READ;
+        let mr = unsafe {
+            (api.ibv_reg_mr)(
+                pd,
+                data.as_mut_ptr() as *mut c_void,
+                data.len() as size_t,
+                access,
+            )
+        };
+        if mr.is_null() {
+            return Err(anyhow!(
+                "ibv_reg_mr(read session {}, len={}) failed: {}",
+                session_id,
+                data.len(),
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let mr_prefix = unsafe { &*(mr as *const IbvMrPrefix) };
+        let desc = read_desc_from_mr(session_id, data.len(), mr_prefix)?;
+        debug!(
+            "registered verbs read MR session={} addr=0x{:x} rkey={} len={}",
+            session_id, desc.remote_addr, desc.rkey, desc.length
+        );
+
+        Ok(Self {
+            api,
+            mr,
+            data,
+            desc,
+        })
+    }
+
+    fn release(mut self) -> Result<()> {
+        self.deregister("release")
+    }
+
+    fn deregister(&mut self, reason: &str) -> Result<()> {
+        if self.mr.is_null() {
+            return Ok(());
+        }
+        let rc = unsafe { (self.api.ibv_dereg_mr)(self.mr) };
+        if rc != 0 {
+            return Err(anyhow!(
+                "ibv_dereg_mr({reason}, addr=0x{:x}, rkey={}) failed: rc={} errno={}",
+                self.desc.remote_addr,
+                self.desc.rkey,
+                rc,
+                std::io::Error::last_os_error()
+            ));
+        }
+        debug!(
+            "deregistered verbs read MR reason={} addr=0x{:x} rkey={} len={}",
+            reason, self.desc.remote_addr, self.desc.rkey, self.desc.length
+        );
+        self.mr = ptr::null_mut();
+        Ok(())
+    }
+}
+
+impl Drop for VerbsReadLease {
+    fn drop(&mut self) {
+        if let Err(err) = self.deregister("drop") {
+            warn!("failed to deregister verbs read MR during drop: {err:#}");
+        }
     }
 }
 
@@ -531,6 +674,8 @@ struct VerbsApi {
     ibv_create_qp: unsafe extern "C" fn(*mut IbvPd, *mut IbvQpInitAttr) -> *mut IbvQp,
     ibv_modify_qp: unsafe extern "C" fn(*mut IbvQp, *mut IbvQpAttr, c_int) -> c_int,
     ibv_destroy_qp: unsafe extern "C" fn(*mut IbvQp) -> c_int,
+    ibv_reg_mr: unsafe extern "C" fn(*mut IbvPd, *mut c_void, size_t, c_int) -> *mut IbvMr,
+    ibv_dereg_mr: unsafe extern "C" fn(*mut IbvMr) -> c_int,
 }
 
 impl fmt::Debug for VerbsApi {
@@ -590,6 +735,8 @@ impl VerbsApi {
                 ibv_create_qp: *lib.get(b"ibv_create_qp").context("load ibv_create_qp")?,
                 ibv_modify_qp: *lib.get(b"ibv_modify_qp").context("load ibv_modify_qp")?,
                 ibv_destroy_qp: *lib.get(b"ibv_destroy_qp").context("load ibv_destroy_qp")?,
+                ibv_reg_mr: *lib.get(b"ibv_reg_mr").context("load ibv_reg_mr")?,
+                ibv_dereg_mr: *lib.get(b"ibv_dereg_mr").context("load ibv_dereg_mr")?,
             })
         }
     }
@@ -622,6 +769,11 @@ struct IbvQp {
 
 #[repr(C)]
 struct IbvSrq {
+    _private: [u8; 0],
+}
+
+#[repr(C)]
+struct IbvMr {
     _private: [u8; 0],
 }
 
@@ -747,8 +899,72 @@ struct IbvQpPrefix {
     qp_type: c_int,
 }
 
+#[repr(C)]
+struct IbvMrPrefix {
+    context: *mut IbvContext,
+    pd: *mut IbvPd,
+    addr: *mut c_void,
+    length: size_t,
+    handle: u32,
+    lkey: u32,
+    rkey: u32,
+}
+
 fn zeroed_qp_attr() -> IbvQpAttr {
     unsafe { MaybeUninit::<IbvQpAttr>::zeroed().assume_init() }
+}
+
+fn validate_register_read_ready(
+    endpoint: &VolumeRdmaEndpointInfo,
+    connected_remote: bool,
+    data_len: usize,
+) -> Result<()> {
+    if data_len == 0 {
+        return Err(anyhow!("register_read requires data"));
+    }
+    if data_len > u32::MAX as usize {
+        return Err(anyhow!("register_read data too large"));
+    }
+    if !connected_remote || !endpoint.qp_connected || endpoint.qp_state != IBV_QPS_RTS as u32 {
+        return Err(anyhow!(
+            "register_read requires connected RTS QP: qpn={} qp_connected={} qp_state={} remote_connected={}",
+            endpoint.qp_num,
+            endpoint.qp_connected,
+            endpoint.qp_state,
+            connected_remote
+        ));
+    }
+    Ok(())
+}
+
+fn read_desc_from_mr(
+    session_id: u64,
+    data_len: usize,
+    mr: &IbvMrPrefix,
+) -> Result<VolumeRdmaDataDesc> {
+    if data_len == 0 {
+        return Err(anyhow!("register_read requires data"));
+    }
+    if data_len > u32::MAX as usize {
+        return Err(anyhow!("register_read data too large"));
+    }
+    if mr.addr.is_null() {
+        return Err(anyhow!("ibv_reg_mr returned null address"));
+    }
+    if mr.length < data_len as size_t {
+        return Err(anyhow!(
+            "ibv_reg_mr length {} is shorter than data length {}",
+            mr.length,
+            data_len
+        ));
+    }
+
+    Ok(VolumeRdmaDataDesc {
+        remote_addr: mr.addr as u64,
+        rkey: mr.rkey,
+        length: data_len as u32,
+        reserved: [session_id, 0, 0, 0],
+    })
 }
 
 fn validate_remote(local: &VolumeRdmaEndpointInfo, remote: &VolumeRdmaRemoteInfo) -> Result<()> {
@@ -1030,5 +1246,89 @@ mod tests {
         assert_eq!(path_mtu_for_endpoint(&endpoint), 5);
         endpoint.active_mtu = 0;
         assert_eq!(path_mtu_for_endpoint(&endpoint), 3);
+    }
+
+    #[test]
+    fn validates_register_read_ready_state() {
+        let mut endpoint = local_endpoint(LINK_INFINIBAND);
+        endpoint.qp_state = IBV_QPS_RTS as u32;
+        endpoint.qp_connected = true;
+        validate_register_read_ready(&endpoint, true, 4096).unwrap();
+
+        assert!(validate_register_read_ready(&endpoint, true, 0)
+            .unwrap_err()
+            .to_string()
+            .contains("requires data"));
+
+        endpoint.qp_connected = false;
+        assert!(validate_register_read_ready(&endpoint, true, 4096)
+            .unwrap_err()
+            .to_string()
+            .contains("connected RTS QP"));
+
+        endpoint.qp_connected = true;
+        endpoint.qp_state = IBV_QPS_RTR as u32;
+        assert!(validate_register_read_ready(&endpoint, true, 4096)
+            .unwrap_err()
+            .to_string()
+            .contains("connected RTS QP"));
+
+        endpoint.qp_state = IBV_QPS_RTS as u32;
+        assert!(validate_register_read_ready(&endpoint, false, 4096)
+            .unwrap_err()
+            .to_string()
+            .contains("remote_connected=false"));
+    }
+
+    #[test]
+    fn builds_read_desc_from_mr_prefix() {
+        let mut payload = vec![1u8; 32];
+        let mr = IbvMrPrefix {
+            context: ptr::null_mut(),
+            pd: ptr::null_mut(),
+            addr: payload.as_mut_ptr() as *mut c_void,
+            length: payload.len() as size_t,
+            handle: 9,
+            lkey: 10,
+            rkey: 11,
+        };
+
+        let desc = read_desc_from_mr(77, payload.len(), &mr).unwrap();
+        assert_eq!(desc.remote_addr, payload.as_mut_ptr() as u64);
+        assert_eq!(desc.rkey, 11);
+        assert_eq!(desc.length, payload.len() as u32);
+        assert_eq!(desc.reserved, [77, 0, 0, 0]);
+    }
+
+    #[test]
+    fn rejects_bad_mr_prefix_values() {
+        let mr = IbvMrPrefix {
+            context: ptr::null_mut(),
+            pd: ptr::null_mut(),
+            addr: ptr::null_mut(),
+            length: 8,
+            handle: 0,
+            lkey: 0,
+            rkey: 1,
+        };
+        assert!(read_desc_from_mr(1, 8, &mr)
+            .unwrap_err()
+            .to_string()
+            .contains("null address"));
+
+        let mut payload = vec![1u8; 8];
+        let mr = IbvMrPrefix {
+            context: ptr::null_mut(),
+            pd: ptr::null_mut(),
+            addr: payload.as_mut_ptr() as *mut c_void,
+            length: 7,
+            handle: 0,
+            lkey: 0,
+            rkey: 1,
+        };
+        assert!(read_desc_from_mr(1, 8, &mr)
+            .unwrap_err()
+            .to_string()
+            .contains("shorter"));
     }
 }
