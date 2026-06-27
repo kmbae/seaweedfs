@@ -72,7 +72,7 @@ func TestVolumeStoreRdmaReadExporterPrepareAndRelease(t *testing.T) {
 	registrar := &fakeVolumeRdmaRegistrar{
 		desc: VolumeRdmaDataDesc{
 			RemoteAddr: 0xfeed,
-			RKey:       77,
+			RKey:       0,
 			Length:     4096,
 		},
 	}
@@ -104,7 +104,7 @@ func TestVolumeStoreRdmaReadExporterPrepareAndRelease(t *testing.T) {
 	if lease.SessionID == 0 || lease.Desc.Reserved[0] != lease.SessionID {
 		t.Fatalf("lease session not encoded: %+v", lease)
 	}
-	if lease.Desc.RemoteAddr != 0xfeed || lease.Desc.RKey != 77 || lease.Desc.Length != uint32(len("needle-range")) {
+	if lease.Desc.RemoteAddr != 0xfeed || lease.Desc.RKey != 0 || lease.Desc.Length != uint32(len("needle-range")) {
 		t.Fatalf("unexpected descriptor: %+v", lease.Desc)
 	}
 

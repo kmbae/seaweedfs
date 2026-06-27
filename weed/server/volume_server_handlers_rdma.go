@@ -68,7 +68,7 @@ func (vs *VolumeServer) volumeRdmaReadDescHandler(w http.ResponseWriter, r *http
 		writeJsonError(w, r, volumeRdmaReadHTTPStatus(err), err)
 		return
 	}
-	if lease == nil || lease.Desc.RemoteAddr == 0 || lease.Desc.RKey == 0 || lease.Desc.Length == 0 {
+	if lease == nil || lease.Desc.RemoteAddr == 0 || lease.Desc.Length == 0 {
 		writeJsonError(w, r, http.StatusNotImplemented, fmt.Errorf("native RDMA read exporter returned no exportable descriptor"))
 		return
 	}

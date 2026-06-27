@@ -122,7 +122,7 @@ func (e *VolumeStoreRdmaReadExporter) PrepareRead(ctx context.Context, req Volum
 		return nil, err
 	}
 	desc := registered.Descriptor()
-	if desc.RemoteAddr == 0 || desc.RKey == 0 {
+	if desc.RemoteAddr == 0 {
 		_ = registered.Release(ctx)
 		return nil, ErrVolumeRdmaReadNotExportable
 	}
