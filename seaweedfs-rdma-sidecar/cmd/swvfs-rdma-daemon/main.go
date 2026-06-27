@@ -127,6 +127,7 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 	defer fallbackClient.Stop()
 
+	stats := swvfsdaemon.NewStats()
 	router := &swvfsdaemon.Router{
 		RDMA:             &swvfsfiler.SeaweedNeedlePlane{Client: rdmaClient},
 		Fallback:         &swvfsfiler.SeaweedNeedlePlane{Client: fallbackClient},
@@ -135,6 +136,7 @@ func run(cmd *cobra.Command, args []string) error {
 		ReadRDMAMinSize:  readRDMAMinSize,
 		WriteRDMAMinSize: writeRDMAMinSize,
 		FallbackOnError:  fallbackOnError,
+		Stats:            stats,
 	}
 	if err := swvfsdaemon.RequireRouter(router); err != nil {
 		return err
@@ -156,11 +158,13 @@ func run(cmd *cobra.Command, args []string) error {
 			Control: rdmaControl,
 			Peers:   peerList,
 			Timeout: rdmaPeerTimeout,
+			Stats:   stats,
 		}
 	}
 	readStager := &swvfsdaemon.KernelMRReadStager{
 		Control: rdmaControl,
 		Reader:  backend,
+		Stats:   stats,
 	}
 
 	logger.WithFields(logrus.Fields{
@@ -180,7 +184,7 @@ func run(cmd *cobra.Command, args []string) error {
 	if rdmaControlListen != "" {
 		server := &http.Server{
 			Addr:    rdmaControlListen,
-			Handler: (&swvfsdaemon.RDMAPeerControlServer{Control: rdmaControl, ReadStager: readStager}).Handler(),
+			Handler: (&swvfsdaemon.RDMAPeerControlServer{Control: rdmaControl, ReadStager: readStager, Stats: stats}).Handler(),
 		}
 		go func() {
 			logger.WithField("addr", rdmaControlListen).Info("starting RDMA peer-control server")
@@ -203,8 +207,9 @@ func run(cmd *cobra.Command, args []string) error {
 		ForceReadRDMA:  forceRDMA,
 		ForceWriteRDMA: forceRDMA,
 		Backend:        backend,
+		Stats:          stats,
 	}
-	device := &swvfsdaemon.LegacyDevice{RW: file, Handler: handler}
+	device := &swvfsdaemon.LegacyDevice{RW: file, Handler: handler, Stats: stats}
 	err = device.Serve(ctx)
 	if errors.Is(err, context.Canceled) {
 		return nil

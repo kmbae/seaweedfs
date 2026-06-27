@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"seaweedfs-rdma-sidecar/pkg/swvfsproto"
 )
@@ -74,6 +75,7 @@ type Handler struct {
 	Backend        FileBackend
 	ForceReadRDMA  bool
 	ForceWriteRDMA bool
+	Stats          *Stats
 }
 
 func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfsproto.Reply, error) {
@@ -83,6 +85,13 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 	if h == nil || h.Backend == nil {
 		return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "no swvfs backend configured"}
 	}
+	opName := fmt.Sprintf("op_%d", req.Header.Op)
+	opStart := time.Now()
+	h.Stats.Inc("handler_" + opName + "_requests")
+	h.Stats.Add("handler_request_payload_bytes", uint64(len(req.Data)))
+	defer func() {
+		h.Stats.Observe("handler_"+opName, time.Since(opStart))
+	}()
 	switch req.Header.Op {
 	case swvfsproto.OpLookup, swvfsproto.OpGetAttr:
 		backend, ok := h.Backend.(interface {
@@ -166,10 +175,15 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 		return reply, nil
 	case swvfsproto.OpRead:
 		preferRDMA := h.ForceReadRDMA || req.ReadRDMAPreferred()
+		h.Stats.Inc("handler_read_requests")
+		h.Stats.Add("handler_read_requested_bytes", req.Header.Size)
 		if preferRDMA {
+			h.Stats.Inc("handler_read_prefer_rdma")
 			if rdmaBackend, ok := h.Backend.(RDMAReadDescriptorBackend); ok {
 				desc, attr, err := rdmaBackend.ReadFileRDMA(ctx, req.Path1, req.Header.Offset, req.Header.Size)
 				if err == nil && desc != nil {
+					h.Stats.Inc("handler_read_rdma_desc_replies")
+					h.Stats.Add("handler_read_rdma_desc_bytes", uint64(desc.Length))
 					reply := &swvfsproto.Reply{
 						Tag:  req.Header.Tag,
 						EOF:  swvfsproto.ReplyFRDMAReadDesc,
@@ -181,14 +195,18 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 					return reply, nil
 				}
 				if err != nil && !isNoSys(err) {
+					h.Stats.Inc("handler_read_rdma_desc_errors")
 					return nil, err
 				}
 			}
 		}
 		data, attr, err := h.Backend.ReadFile(ctx, req.Path1, req.Header.Offset, req.Header.Size, preferRDMA)
 		if err != nil {
+			h.Stats.Inc("handler_read_fallback_errors")
 			return nil, err
 		}
+		h.Stats.Inc("handler_read_fallback_replies")
+		h.Stats.Add("handler_read_fallback_bytes", uint64(len(data)))
 		reply := &swvfsproto.Reply{Tag: req.Header.Tag, Data: data}
 		if attr != nil {
 			reply.Attr = *attr
@@ -196,8 +214,14 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 		return reply, nil
 	case swvfsproto.OpWrite:
 		preferRDMA := h.ForceWriteRDMA || req.WriteRDMAPreferred()
+		h.Stats.Inc("handler_write_requests")
+		h.Stats.Add("handler_write_payload_bytes", uint64(len(req.Data)))
+		if preferRDMA {
+			h.Stats.Inc("handler_write_prefer_rdma")
+		}
 		attr, err := h.Backend.WriteFile(ctx, req.Path1, req.Header.Offset, req.Data, req.Header.Mode, req.Header.UID, req.Header.GID, preferRDMA)
 		if err != nil {
+			h.Stats.Inc("handler_write_errors")
 			return nil, err
 		}
 		reply := &swvfsproto.Reply{Tag: req.Header.Tag}
@@ -210,8 +234,11 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 		if !ok {
 			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma write prepare is not implemented"}
 		}
+		h.Stats.Inc("handler_write_rdma_prepare_requests")
+		h.Stats.Add("handler_write_rdma_prepare_bytes", req.Header.Size)
 		desc, attr, err := backend.PrepareWriteRDMA(ctx, req.Path1, req.Header.Offset, req.Header.Size)
 		if err != nil {
+			h.Stats.Inc("handler_write_rdma_prepare_errors")
 			return nil, err
 		}
 		if desc == nil {
@@ -231,8 +258,11 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 		if !ok {
 			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma write commit is not implemented"}
 		}
+		h.Stats.Inc("handler_write_rdma_commit_requests")
+		h.Stats.Add("handler_write_rdma_commit_bytes", req.Header.Size)
 		attr, err := backend.CommitWriteRDMA(ctx, req.Path1, req.Header.Offset, req.Header.Size)
 		if err != nil {
+			h.Stats.Inc("handler_write_rdma_commit_errors")
 			return nil, err
 		}
 		reply := &swvfsproto.Reply{Tag: req.Header.Tag}
@@ -248,9 +278,13 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 		if req.Header.Offset == 0 {
 			return nil, ErrnoError{Errno: ErrnoInval, Msg: "rdma read descriptor release missing lease id"}
 		}
+		h.Stats.Inc("handler_read_rdma_release_requests")
+		h.Stats.Add("handler_read_rdma_release_bytes", req.Header.Size)
 		if err := backend.ReleaseReadDescriptor(ctx, req.Header.Offset, int32(req.Header.Valid), req.Header.Size); err != nil {
+			h.Stats.Inc("handler_read_rdma_release_errors")
 			return nil, err
 		}
+		h.Stats.Inc("handler_read_rdma_release_replies")
 		return &swvfsproto.Reply{Tag: req.Header.Tag}, nil
 	case swvfsproto.OpUnlink, swvfsproto.OpRmdir:
 		backend, ok := h.Backend.(interface {

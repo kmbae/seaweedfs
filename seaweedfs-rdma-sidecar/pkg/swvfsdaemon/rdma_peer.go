@@ -125,6 +125,7 @@ func (e RDMALocalEndpoint) RemoteInfo(serviceLevel uint32) (swvfsproto.RDMARemot
 type RDMAPeerControlServer struct {
 	Control    RDMAPeerConnectorControl
 	ReadStager RDMAReadDescriptorStager
+	Stats      *Stats
 }
 
 func (s *RDMAPeerControlServer) Handler() http.Handler {
@@ -136,6 +137,9 @@ func (s *RDMAPeerControlServer) Handler() http.Handler {
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
+	if s != nil && s.Stats != nil {
+		mux.Handle("/metrics", s.Stats)
+	}
 	return mux
 }
 
@@ -144,11 +148,14 @@ func (s *RDMAPeerControlServer) handleLocal(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	s.Stats.Inc("peer_control_local_requests")
 	info, err := s.Control.GetLocal()
 	if err != nil {
+		s.Stats.Inc("peer_control_local_errors")
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
+	s.Stats.Inc("peer_control_local_success")
 	writeJSON(w, RDMALocalEndpointFromInfo(info))
 }
 
@@ -157,27 +164,33 @@ func (s *RDMAPeerControlServer) handleConnect(w http.ResponseWriter, r *http.Req
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	s.Stats.Inc("peer_control_connect_requests")
 	var endpoint RDMALocalEndpoint
 	if err := json.NewDecoder(r.Body).Decode(&endpoint); err != nil {
+		s.Stats.Inc("peer_control_connect_bad_request")
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	sl := uint32(0)
 	if raw := r.URL.Query().Get("sl"); raw != "" {
 		if _, err := fmt.Sscanf(raw, "%d", &sl); err != nil {
+			s.Stats.Inc("peer_control_connect_bad_request")
 			http.Error(w, "invalid service level", http.StatusBadRequest)
 			return
 		}
 	}
 	remote, err := endpoint.RemoteInfo(sl)
 	if err != nil {
+		s.Stats.Inc("peer_control_connect_bad_request")
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if err := s.Control.Connect(remote); err != nil {
+		s.Stats.Inc("peer_control_connect_errors")
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
+	s.Stats.Inc("peer_control_connect_success")
 	writeJSON(w, map[string]any{"connected": true})
 }
 
@@ -202,28 +215,36 @@ func (s *RDMAPeerControlServer) handleReadDesc(w http.ResponseWriter, r *http.Re
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	s.Stats.Inc("peer_control_read_desc_requests")
 	if s.ReadStager == nil {
+		s.Stats.Inc("peer_control_read_desc_not_configured")
 		http.Error(w, "rdma read descriptor staging is not configured", http.StatusNotImplemented)
 		return
 	}
 	var req RDMAPeerReadDescRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.Stats.Inc("peer_control_read_desc_bad_request")
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if req.Path == "" {
+		s.Stats.Inc("peer_control_read_desc_bad_request")
 		http.Error(w, "path is required", http.StatusBadRequest)
 		return
 	}
 	lease, err := s.ReadStager.StageReadRDMA(r.Context(), req.Path, req.Offset, req.Size)
 	if err != nil {
+		s.Stats.Inc("peer_control_read_desc_errors")
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
 	if lease == nil {
+		s.Stats.Inc("peer_control_read_desc_errors")
 		http.Error(w, "rdma read descriptor stager returned no descriptor", http.StatusServiceUnavailable)
 		return
 	}
+	s.Stats.Inc("peer_control_read_desc_success")
+	s.Stats.Add("peer_control_read_desc_bytes", uint64(lease.Desc.Length))
 	writeJSON(w, RDMAPeerReadDescResponse{Desc: lease.Desc, Attr: lease.Attr, SessionID: lease.SessionID})
 }
 
@@ -232,23 +253,29 @@ func (s *RDMAPeerControlServer) handleReleaseDesc(w http.ResponseWriter, r *http
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	s.Stats.Inc("peer_control_release_desc_requests")
 	if s.ReadStager == nil {
+		s.Stats.Inc("peer_control_release_desc_not_configured")
 		http.Error(w, "rdma read descriptor staging is not configured", http.StatusNotImplemented)
 		return
 	}
 	var req RDMAPeerReleaseDescRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		s.Stats.Inc("peer_control_release_desc_bad_request")
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if req.SessionID == 0 {
+		s.Stats.Inc("peer_control_release_desc_bad_request")
 		http.Error(w, "session_id is required", http.StatusBadRequest)
 		return
 	}
 	if err := s.ReadStager.ReleaseReadRDMA(r.Context(), req.SessionID); err != nil {
+		s.Stats.Inc("peer_control_release_desc_errors")
 		http.Error(w, err.Error(), http.StatusServiceUnavailable)
 		return
 	}
+	s.Stats.Inc("peer_control_release_desc_success")
 	writeJSON(w, map[string]any{"released": true})
 }
 
