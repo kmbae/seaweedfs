@@ -15,6 +15,9 @@ func TestRDMAStructSizesMatchKernelABI(t *testing.T) {
 	if got := unsafe.Sizeof(RDMADataDesc{}); got != RDMADataDescSize {
 		t.Fatalf("RDMADataDesc size = %d, want %d", got, RDMADataDescSize)
 	}
+	if got := unsafe.Sizeof(RDMATestMR{}); got != RDMATestMRSize {
+		t.Fatalf("RDMATestMR size = %d, want %d", got, RDMATestMRSize)
+	}
 }
 
 func TestRDMALocalInfoHelpers(t *testing.T) {

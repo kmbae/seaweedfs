@@ -26,8 +26,13 @@ const (
 )
 
 var (
-	ioctlRDMAGetLocal = ior(swvfsIOCMagic, 1, unsafe.Sizeof(swvfsproto.RDMALocalInfo{}))
-	ioctlRDMAConnect  = iow(swvfsIOCMagic, 2, unsafe.Sizeof(swvfsproto.RDMARemoteInfo{}))
+	ioctlRDMAGetLocal    = ior(swvfsIOCMagic, 1, unsafe.Sizeof(swvfsproto.RDMALocalInfo{}))
+	ioctlRDMAConnect     = iow(swvfsIOCMagic, 2, unsafe.Sizeof(swvfsproto.RDMARemoteInfo{}))
+	ioctlRDMATestMRAlloc = iowr(swvfsIOCMagic, 5, unsafe.Sizeof(swvfsproto.RDMATestMR{}))
+	ioctlRDMATestMRFree  = ioctlNoArg(swvfsIOCMagic, 6)
+	ioctlRDMATestMRInfo  = ior(swvfsIOCMagic, 7, unsafe.Sizeof(swvfsproto.RDMATestMR{}))
+	ioctlRDMATestMRRead  = iowr(swvfsIOCMagic, 8, unsafe.Sizeof(swvfsproto.RDMATestMR{}))
+	ioctlRDMATestMRWrite = iowr(swvfsIOCMagic, 9, unsafe.Sizeof(swvfsproto.RDMATestMR{}))
 )
 
 type RDMAControl struct {
@@ -62,6 +67,78 @@ func (c *RDMAControl) Connect(remote swvfsproto.RDMARemoteInfo) error {
 	return nil
 }
 
+func (c *RDMAControl) TestMRAlloc(length uint32, pattern uint32) (swvfsproto.RDMATestMR, error) {
+	mr := swvfsproto.RDMATestMR{
+		ABIVersion: swvfsproto.RDMAABIVersion,
+		Length:     length,
+		Pattern:    pattern,
+	}
+	if c == nil || c.file == nil {
+		return mr, fmt.Errorf("nil RDMA control device")
+	}
+	if length == 0 || length > swvfsproto.RDMAIOMax {
+		return mr, fmt.Errorf("invalid RDMA test MR length %d", length)
+	}
+	if err := ioctl(c.file.Fd(), ioctlRDMATestMRAlloc, uintptr(unsafe.Pointer(&mr))); err != nil {
+		return mr, fmt.Errorf("SWVFS_IOC_RDMA_TEST_MR_ALLOC: %w", err)
+	}
+	return mr, nil
+}
+
+func (c *RDMAControl) TestMRInfo() (swvfsproto.RDMATestMR, error) {
+	var mr swvfsproto.RDMATestMR
+	if c == nil || c.file == nil {
+		return mr, fmt.Errorf("nil RDMA control device")
+	}
+	if err := ioctl(c.file.Fd(), ioctlRDMATestMRInfo, uintptr(unsafe.Pointer(&mr))); err != nil {
+		return mr, fmt.Errorf("SWVFS_IOC_RDMA_TEST_MR_INFO: %w", err)
+	}
+	return mr, nil
+}
+
+func (c *RDMAControl) TestMRWrite(data []byte) (swvfsproto.RDMATestMR, error) {
+	mr := swvfsproto.RDMATestMR{ABIVersion: swvfsproto.RDMAABIVersion}
+	if c == nil || c.file == nil {
+		return mr, fmt.Errorf("nil RDMA control device")
+	}
+	if len(data) == 0 || len(data) > swvfsproto.RDMAIOMax {
+		return mr, fmt.Errorf("invalid RDMA test MR write length %d", len(data))
+	}
+	mr.UserAddr = uint64(uintptr(unsafe.Pointer(&data[0])))
+	mr.UserLength = uint32(len(data))
+	if err := ioctl(c.file.Fd(), ioctlRDMATestMRWrite, uintptr(unsafe.Pointer(&mr))); err != nil {
+		return mr, fmt.Errorf("SWVFS_IOC_RDMA_TEST_MR_WRITE: %w", err)
+	}
+	return mr, nil
+}
+
+func (c *RDMAControl) TestMRRead(length uint32) ([]byte, swvfsproto.RDMATestMR, error) {
+	mr := swvfsproto.RDMATestMR{ABIVersion: swvfsproto.RDMAABIVersion}
+	if c == nil || c.file == nil {
+		return nil, mr, fmt.Errorf("nil RDMA control device")
+	}
+	if length == 0 || length > swvfsproto.RDMAIOMax {
+		return nil, mr, fmt.Errorf("invalid RDMA test MR read length %d", length)
+	}
+	buf := make([]byte, length)
+	mr.UserAddr = uint64(uintptr(unsafe.Pointer(&buf[0])))
+	mr.UserLength = length
+	if err := ioctl(c.file.Fd(), ioctlRDMATestMRRead, uintptr(unsafe.Pointer(&mr))); err != nil {
+		return nil, mr, fmt.Errorf("SWVFS_IOC_RDMA_TEST_MR_READ: %w", err)
+	}
+	return buf[:mr.UserLength], mr, nil
+}
+
+func (c *RDMAControl) TestMRFree() error {
+	if c == nil || c.file == nil {
+		return fmt.Errorf("nil RDMA control device")
+	}
+	if err := ioctl(c.file.Fd(), ioctlRDMATestMRFree, 0); err != nil {
+		return fmt.Errorf("SWVFS_IOC_RDMA_TEST_MR_FREE: %w", err)
+	}
+	return nil
+}
+
 func ioctl(fd, req, arg uintptr) error {
 	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, fd, req, arg)
 	if errno != 0 {
@@ -76,6 +153,14 @@ func ior(typ uintptr, nr uintptr, size uintptr) uintptr {
 
 func iow(typ uintptr, nr uintptr, size uintptr) uintptr {
 	return ioc(iocWrite, typ, nr, size)
+}
+
+func iowr(typ uintptr, nr uintptr, size uintptr) uintptr {
+	return ioc(iocRead|iocWrite, typ, nr, size)
+}
+
+func ioctlNoArg(typ uintptr, nr uintptr) uintptr {
+	return ioc(0, typ, nr, 0)
 }
 
 func ioc(dir uintptr, typ uintptr, nr uintptr, size uintptr) uintptr {

@@ -30,6 +30,13 @@ const (
 )
 
 const RDMADataDescSize = 48
+const RDMATestMRSize = 104
+
+const (
+	RDMATestFAllocated       uint32 = 1 << 0
+	RDMATestFUnsafeGlobalKey uint32 = 1 << 1
+	RDMATestFRegisteredMR    uint32 = 1 << 2
+)
 
 type RDMALocalInfo struct {
 	ABIVersion           uint32
@@ -112,6 +119,26 @@ type RDMADataDesc struct {
 	RKey       uint32
 	Length     uint32
 	Reserved   [4]uint64
+}
+
+type RDMATestMR struct {
+	ABIVersion uint32
+	Flags      uint32
+	RemoteAddr uint64
+	UserAddr   uint64
+	RKey       uint32
+	Length     uint32
+	UserLength uint32
+	Pattern    uint32
+	Reserved   [8]uint64
+}
+
+func (m RDMATestMR) Allocated() bool {
+	return m.Flags&RDMATestFAllocated != 0
+}
+
+func (m RDMATestMR) Registered() bool {
+	return m.Flags&RDMATestFRegisteredMR != 0
 }
 
 func EncodeRDMADataDesc(desc RDMADataDesc) []byte {

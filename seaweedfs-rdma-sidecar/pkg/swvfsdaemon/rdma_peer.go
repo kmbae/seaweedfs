@@ -17,8 +17,9 @@ import (
 )
 
 const (
-	RDMAPeerLocalPath   = "/rdma/local"
-	RDMAPeerConnectPath = "/rdma/connect"
+	RDMAPeerLocalPath    = "/rdma/local"
+	RDMAPeerConnectPath  = "/rdma/connect"
+	RDMAPeerReadDescPath = "/rdma/read-desc"
 )
 
 var ErrRDMAPeerUnpaired = errors.New("no deterministic RDMA pair selected")
@@ -121,13 +122,15 @@ func (e RDMALocalEndpoint) RemoteInfo(serviceLevel uint32) (swvfsproto.RDMARemot
 }
 
 type RDMAPeerControlServer struct {
-	Control RDMAPeerConnectorControl
+	Control    RDMAPeerConnectorControl
+	ReadStager RDMAReadDescriptorStager
 }
 
 func (s *RDMAPeerControlServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc(RDMAPeerLocalPath, s.handleLocal)
 	mux.HandleFunc(RDMAPeerConnectPath, s.handleConnect)
+	mux.HandleFunc(RDMAPeerReadDescPath, s.handleReadDesc)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -174,6 +177,47 @@ func (s *RDMAPeerControlServer) handleConnect(w http.ResponseWriter, r *http.Req
 		return
 	}
 	writeJSON(w, map[string]any{"connected": true})
+}
+
+type RDMAPeerReadDescRequest struct {
+	Path   string `json:"path"`
+	Offset uint64 `json:"offset"`
+	Size   uint64 `json:"size"`
+}
+
+type RDMAPeerReadDescResponse struct {
+	Desc swvfsproto.RDMADataDesc `json:"desc"`
+	Attr *swvfsproto.Attr        `json:"attr,omitempty"`
+}
+
+func (s *RDMAPeerControlServer) handleReadDesc(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.ReadStager == nil {
+		http.Error(w, "rdma read descriptor staging is not configured", http.StatusNotImplemented)
+		return
+	}
+	var req RDMAPeerReadDescRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if req.Path == "" {
+		http.Error(w, "path is required", http.StatusBadRequest)
+		return
+	}
+	desc, attr, err := s.ReadStager.StageReadRDMA(r.Context(), req.Path, req.Offset, req.Size)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusServiceUnavailable)
+		return
+	}
+	if desc == nil {
+		http.Error(w, "rdma read descriptor stager returned no descriptor", http.StatusServiceUnavailable)
+		return
+	}
+	writeJSON(w, RDMAPeerReadDescResponse{Desc: *desc, Attr: attr})
 }
 
 func FetchRDMAPeerEndpoint(ctx context.Context, client *http.Client, rawURL string) (RDMALocalEndpoint, error) {
@@ -228,6 +272,39 @@ func PostRDMAPeerConnect(ctx context.Context, client *http.Client, rawURL string
 		return fmt.Errorf("POST %s returned %s", reqURL, resp.Status)
 	}
 	return nil
+}
+
+func PostRDMAPeerReadDesc(ctx context.Context, client *http.Client, rawURL string, path string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
+	reqURL, err := normalizeRDMAPeerURL(rawURL, RDMAPeerReadDescPath)
+	if err != nil {
+		return nil, nil, err
+	}
+	body, err := json.Marshal(RDMAPeerReadDescRequest{
+		Path:   path,
+		Offset: offset,
+		Size:   size,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient(client).Do(req)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, nil, fmt.Errorf("POST %s returned %s", reqURL, resp.Status)
+	}
+	var out RDMAPeerReadDescResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, nil, err
+	}
+	return &out.Desc, out.Attr, nil
 }
 
 func ExpandRDMAPeerURLs(ctx context.Context, rawEndpoints []string) []string {

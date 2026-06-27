@@ -36,8 +36,9 @@ type MetadataStore interface {
 }
 
 type Backend struct {
-	Store  MetadataStore
-	Router *swvfsdaemon.Router
+	Store                 MetadataStore
+	Router                *swvfsdaemon.Router
+	ReadDescriptorBackend swvfsdaemon.RDMAReadDescriptorBackend
 
 	mu      sync.Mutex
 	pending map[string]*pendingWrite
@@ -722,6 +723,13 @@ func (b *Backend) ReadFile(ctx context.Context, fullPath string, offset, size ui
 	}
 	overlayPendingData(out, offset, pending)
 	return out, attr, nil
+}
+
+func (b *Backend) ReadFileRDMA(ctx context.Context, fullPath string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
+	if b == nil || b.ReadDescriptorBackend == nil {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma read descriptor backend is not configured"}
+	}
+	return b.ReadDescriptorBackend.ReadFileRDMA(ctx, cleanFullPath(fullPath), offset, size)
 }
 
 func (b *Backend) WriteFile(ctx context.Context, fullPath string, offset uint64, data []byte, mode, uid, gid uint32, preferRDMA bool) (*swvfsproto.Attr, error) {
