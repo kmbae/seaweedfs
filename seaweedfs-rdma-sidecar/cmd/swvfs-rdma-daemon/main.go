@@ -219,6 +219,10 @@ func runRDMAPeerConnector(ctx context.Context, control *swvfsdaemon.RDMAControl,
 		if err == nil {
 			return
 		}
+		if errors.Is(err, swvfsdaemon.ErrRDMAPeerUnpaired) {
+			logger.WithError(err).Info("RDMA peer handshake skipped")
+			return
+		}
 		logger.WithError(err).Warn("RDMA peer handshake not ready; retrying")
 		select {
 		case <-ctx.Done():
@@ -273,7 +277,7 @@ func connectRDMAPeersOnce(ctx context.Context, control *swvfsdaemon.RDMAControl,
 	}
 	selected, ok := swvfsdaemon.SelectRDMAPairedPeer(local, endpoints)
 	if !ok {
-		return fmt.Errorf("no deterministic RDMA pair selected for local qpn=%d lid=%d", local.QPNum, local.LID)
+		return fmt.Errorf("%w for local qpn=%d lid=%d", swvfsdaemon.ErrRDMAPeerUnpaired, local.QPNum, local.LID)
 	}
 	remote, err := selected.RemoteInfo(rdmaPeerSL)
 	if err != nil {

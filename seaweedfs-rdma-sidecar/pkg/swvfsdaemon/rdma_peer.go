@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -19,6 +20,8 @@ const (
 	RDMAPeerLocalPath   = "/rdma/local"
 	RDMAPeerConnectPath = "/rdma/connect"
 )
+
+var ErrRDMAPeerUnpaired = errors.New("no deterministic RDMA pair selected")
 
 type RDMALocalProvider interface {
 	GetLocal() (swvfsproto.RDMALocalInfo, error)
