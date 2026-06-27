@@ -47,6 +47,7 @@ type fakeRDMAFileBackend struct {
 	releaseStatus    int32
 	releaseBytes     uint64
 	readDescFallback bool
+	readDescErr      error
 }
 
 func (f *fakeFileBackend) ReadFile(ctx context.Context, path string, offset, size uint64, preferRDMA bool) ([]byte, *swvfsproto.Attr, error) {
@@ -61,6 +62,9 @@ func (f *fakeFileBackend) WriteFile(ctx context.Context, path string, offset uin
 
 func (f *fakeRDMAFileBackend) ReadFileRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
 	f.readDescPath = path
+	if f.readDescErr != nil {
+		return nil, nil, f.readDescErr
+	}
 	if f.readDescFallback {
 		return nil, nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma read desc unavailable"}
 	}
@@ -208,6 +212,28 @@ func TestHandlerFallsBackWhenRDMAReadDescriptorUnsupported(t *testing.T) {
 	req := &swvfsproto.Request{
 		Header: swvfsproto.RequestHeader{Tag: 3, Op: swvfsproto.OpRead, Size: 4, Valid: swvfsproto.ReadFRDMAPreferred},
 		Path1:  "/plain-file",
+	}
+
+	reply, err := h.Handle(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if reply.EOF&swvfsproto.ReplyFRDMAReadDesc != 0 {
+		t.Fatalf("unexpected RDMA desc flag: eof=0x%x", reply.EOF)
+	}
+	if string(reply.Data) != "data" || !backend.readPreferRDMA {
+		t.Fatalf("fallback read mismatch: data=%q prefer=%v", reply.Data, backend.readPreferRDMA)
+	}
+}
+
+func TestHandlerFallsBackWhenRDMAReadDescriptorTooLarge(t *testing.T) {
+	backend := &fakeRDMAFileBackend{
+		readDescErr: ErrnoError{Errno: ErrnoTooLarge, Msg: "rdma read desc too large"},
+	}
+	h := &Handler{Backend: backend}
+	req := &swvfsproto.Request{
+		Header: swvfsproto.RequestHeader{Tag: 3, Op: swvfsproto.OpRead, Size: swvfsproto.RDMAIOMax + 1, Valid: swvfsproto.ReadFRDMAPreferred},
+		Path1:  "/large-file",
 	}
 
 	reply, err := h.Handle(context.Background(), req)

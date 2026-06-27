@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sync"
 	"time"
 
 	"seaweedfs-rdma-sidecar/pkg/swvfsproto"
@@ -20,6 +21,38 @@ type LegacyDevice struct {
 	Handler        RequestHandler
 	MaxRequestSize int
 	Stats          *Stats
+	BufferPool     *DeviceBufferPool
+}
+
+type DeviceBufferPool struct {
+	size int
+	pool sync.Pool
+}
+
+func NewDeviceBufferPool(size int) *DeviceBufferPool {
+	if size <= 0 {
+		return nil
+	}
+	return &DeviceBufferPool{size: size}
+}
+
+func (p *DeviceBufferPool) Get(size int) ([]byte, bool) {
+	if p == nil || size <= 0 || size > p.size {
+		return make([]byte, size), false
+	}
+	if value := p.pool.Get(); value != nil {
+		if buf, ok := value.([]byte); ok && cap(buf) >= size {
+			return buf[:size], true
+		}
+	}
+	return make([]byte, p.size), false
+}
+
+func (p *DeviceBufferPool) Put(buf []byte) {
+	if p == nil || cap(buf) < p.size {
+		return
+	}
+	p.pool.Put(buf[:p.size])
 }
 
 func (d *LegacyDevice) Serve(ctx context.Context) error {
@@ -42,7 +75,13 @@ func (d *LegacyDevice) ServeOnce(ctx context.Context) error {
 	if max <= 0 {
 		max = DefaultMaxRequestSize
 	}
-	buf := make([]byte, max)
+	buf, pooled := d.BufferPool.Get(max)
+	if pooled {
+		d.Stats.Inc("device_buffer_pool_hits")
+	} else {
+		d.Stats.Inc("device_buffer_pool_misses")
+	}
+	defer d.BufferPool.Put(buf)
 	readStart := time.Now()
 	n, err := d.RW.Read(buf)
 	d.Stats.Observe("device_read", time.Since(readStart))

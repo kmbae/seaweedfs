@@ -42,6 +42,7 @@ var (
 	rdmaPeerInterval  time.Duration
 	rdmaPeerTimeout   time.Duration
 	maxConnections    int
+	deviceBufferPool  int
 	timeout           time.Duration
 	collection        string
 	replication       string
@@ -77,6 +78,7 @@ carries RDMA preference hints.`,
 	root.Flags().DurationVar(&rdmaPeerInterval, "rdma-peer-connect-interval", 5*time.Second, "retry interval for automatic kernel RDMA peer connection")
 	root.Flags().DurationVar(&rdmaPeerTimeout, "rdma-peer-connect-timeout", 5*time.Second, "per-attempt timeout for automatic kernel RDMA peer connection")
 	root.Flags().IntVar(&maxConnections, "max-connections", 8, "maximum RDMA engine IPC connections")
+	root.Flags().IntVar(&deviceBufferPool, "device-buffer-pool-size", swvfsdaemon.DefaultMaxRequestSize, "reusable /dev/seaweedvfs request buffer size; set 0 to disable")
 	root.Flags().DurationVar(&timeout, "timeout", 30*time.Second, "SeaweedFS/RDMA operation timeout")
 	root.Flags().StringVar(&collection, "collection", "", "SeaweedFS collection for new writes")
 	root.Flags().StringVar(&replication, "replication", "", "SeaweedFS replication for new writes")
@@ -179,6 +181,7 @@ func run(cmd *cobra.Command, args []string) error {
 		"fallback_on_error": fallbackOnError,
 		"rdma_control":      rdmaControlListen,
 		"rdma_peers":        rdmaPeerEndpoints,
+		"device_buf_pool":   deviceBufferPool,
 	}).Info("starting swvfs RDMA daemon")
 
 	if rdmaControlListen != "" {
@@ -209,7 +212,12 @@ func run(cmd *cobra.Command, args []string) error {
 		Backend:        backend,
 		Stats:          stats,
 	}
-	device := &swvfsdaemon.LegacyDevice{RW: file, Handler: handler, Stats: stats}
+	device := &swvfsdaemon.LegacyDevice{
+		RW:         file,
+		Handler:    handler,
+		Stats:      stats,
+		BufferPool: swvfsdaemon.NewDeviceBufferPool(deviceBufferPool),
+	}
 	err = device.Serve(ctx)
 	if errors.Is(err, context.Canceled) {
 		return nil

@@ -194,9 +194,12 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 					}
 					return reply, nil
 				}
-				if err != nil && !isNoSys(err) {
+				if err != nil && !isRDMAReadFallback(err) {
 					h.Stats.Inc("handler_read_rdma_desc_errors")
 					return nil, err
+				}
+				if err != nil {
+					h.Stats.Inc("handler_read_rdma_desc_fallbacks")
 				}
 			}
 		}
@@ -441,6 +444,19 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 func isNoSys(err error) bool {
 	var errno ErrnoError
 	return errors.As(err, &errno) && errno.Errno == ErrnoNoSys
+}
+
+func isRDMAReadFallback(err error) bool {
+	var errno ErrnoError
+	if !errors.As(err, &errno) {
+		return false
+	}
+	switch errno.Errno {
+	case ErrnoNoSys, ErrnoTooLarge:
+		return true
+	default:
+		return false
+	}
 }
 
 func ReplyForError(tag uint64, err error) *swvfsproto.Reply {
