@@ -58,6 +58,7 @@ type VolumeServer struct {
 	metricsAddress                string
 	metricsIntervalSec            int
 	fileSizeLimitBytes            int64
+	rdmaEndpoint                  VolumeRdmaEndpoint
 	rdmaReadExporter              VolumeRdmaReadExporter
 	isHeartbeating                bool
 	stopChan                      chan bool
@@ -150,8 +151,11 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 			adminMux.HandleFunc("/stats/disk", vs.guard.WhiteList(vs.statsDiskHandler))
 		*/
 	}
-	adminMux.HandleFunc("/rdma/native/read-desc", requestIDMiddleware(vs.guard.WhiteList(vs.volumeRdmaReadDescHandler)))
-	adminMux.HandleFunc("/rdma/native/release-desc", requestIDMiddleware(vs.guard.WhiteList(vs.volumeRdmaReleaseDescHandler)))
+	adminMux.HandleFunc(VolumeRdmaNativeStatusPath, requestIDMiddleware(vs.guard.WhiteList(vs.volumeRdmaStatusHandler)))
+	adminMux.HandleFunc(VolumeRdmaNativeLocalPath, requestIDMiddleware(vs.guard.WhiteList(vs.volumeRdmaLocalHandler)))
+	adminMux.HandleFunc(VolumeRdmaNativeConnectPath, requestIDMiddleware(vs.guard.WhiteList(vs.volumeRdmaConnectHandler)))
+	adminMux.HandleFunc(VolumeRdmaNativeReadDescPath, requestIDMiddleware(vs.guard.WhiteList(vs.volumeRdmaReadDescHandler)))
+	adminMux.HandleFunc(VolumeRdmaNativeReleaseDescPath, requestIDMiddleware(vs.guard.WhiteList(vs.volumeRdmaReleaseDescHandler)))
 	adminMux.HandleFunc("/", requestIDMiddleware(vs.privateStoreHandler))
 	if publicMux != adminMux {
 		// separated admin and public port
