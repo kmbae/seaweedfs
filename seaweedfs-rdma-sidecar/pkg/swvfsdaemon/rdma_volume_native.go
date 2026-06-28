@@ -24,6 +24,9 @@ const (
 	VolumeRDMARequesterLocalPath   = "/rdma/native/requester-local"
 	VolumeRDMARequesterConnectPath = "/rdma/native/requester-connect"
 	VolumeRDMAWritePath            = "/rdma/native/write"
+	VolumeRDMAWriteDescPath        = "/rdma/native/write-desc"
+	VolumeRDMAWriteCommitPath      = "/rdma/native/write-commit"
+	VolumeRDMAWriteAbortPath       = "/rdma/native/write-abort"
 	nativeReadLeaseBit             = uint64(1) << 63
 )
 
@@ -74,6 +77,34 @@ type VolumeRDMAWriteRequest struct {
 	TimeoutMs    uint64                  `json:"timeout_ms,omitempty"`
 }
 
+type VolumeRDMAWriteDescRequest struct {
+	ConnectionID uint64 `json:"connection_id,omitempty"`
+	FileID       string `json:"file_id"`
+	VolumeID     uint32 `json:"volume_id"`
+	NeedleID     uint64 `json:"needle_id"`
+	Cookie       uint32 `json:"cookie"`
+	Size         uint64 `json:"size"`
+}
+
+type VolumeRDMAWriteDescResponse struct {
+	Desc         swvfsproto.RDMADataDesc `json:"desc"`
+	ConnectionID uint64                  `json:"connection_id,omitempty"`
+	SessionID    uint64                  `json:"session_id,omitempty"`
+}
+
+type VolumeRDMAWriteCommitRequest struct {
+	SessionID uint64 `json:"session_id"`
+	FileID    string `json:"file_id"`
+	VolumeID  uint32 `json:"volume_id"`
+	NeedleID  uint64 `json:"needle_id"`
+	Cookie    uint32 `json:"cookie"`
+	Size      uint64 `json:"size"`
+}
+
+type VolumeRDMAWriteAbortRequest struct {
+	SessionID uint64 `json:"session_id"`
+}
+
 type VolumeRDMAWriteResponse struct {
 	FileID string `json:"file_id"`
 	Size   uint64 `json:"size"`
@@ -92,6 +123,9 @@ type VolumeRDMAStatusResponse struct {
 	RequesterLocalPath     string `json:"requester_local_path"`
 	RequesterConnectPath   string `json:"requester_connect_path"`
 	WritePath              string `json:"write_path"`
+	WriteDescPath          string `json:"write_desc_path"`
+	WriteCommitPath        string `json:"write_commit_path"`
+	WriteAbortPath         string `json:"write_abort_path"`
 }
 
 type VolumeNativeRDMAReadDescriptorClient struct {
@@ -493,6 +527,89 @@ func PostVolumeNativeWrite(ctx context.Context, client *http.Client, rawURL stri
 		return out, err
 	}
 	return out, nil
+}
+
+func PostVolumeNativeWriteDesc(ctx context.Context, client *http.Client, rawURL string, reqBody VolumeRDMAWriteDescRequest) (*swvfsproto.RDMADataDesc, uint64, error) {
+	reqURL, err := normalizeVolumeNativeURL(rawURL, VolumeRDMAWriteDescPath)
+	if err != nil {
+		return nil, 0, err
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, 0, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, 0, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient(client).Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, 0, volumeNativeHTTPError(reqURL, resp.StatusCode, resp.Status)
+	}
+	var out VolumeRDMAWriteDescResponse
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, 0, err
+	}
+	return &out.Desc, out.SessionID, nil
+}
+
+func PostVolumeNativeWriteCommit(ctx context.Context, client *http.Client, rawURL string, reqBody VolumeRDMAWriteCommitRequest) (VolumeRDMAWriteResponse, error) {
+	var out VolumeRDMAWriteResponse
+	reqURL, err := normalizeVolumeNativeURL(rawURL, VolumeRDMAWriteCommitPath)
+	if err != nil {
+		return out, err
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return out, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
+	if err != nil {
+		return out, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient(client).Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return out, volumeNativeHTTPError(reqURL, resp.StatusCode, resp.Status)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return out, err
+	}
+	return out, nil
+}
+
+func PostVolumeNativeWriteAbort(ctx context.Context, client *http.Client, rawURL string, sessionID uint64) error {
+	reqURL, err := normalizeVolumeNativeURL(rawURL, VolumeRDMAWriteAbortPath)
+	if err != nil {
+		return err
+	}
+	body, err := json.Marshal(VolumeRDMAWriteAbortRequest{SessionID: sessionID})
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient(client).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return volumeNativeHTTPError(reqURL, resp.StatusCode, resp.Status)
+	}
+	return nil
 }
 
 func PostVolumeNativeReleaseDesc(ctx context.Context, client *http.Client, rawURL string, sessionID uint64) error {

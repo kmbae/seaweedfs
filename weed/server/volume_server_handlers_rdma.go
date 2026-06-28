@@ -51,7 +51,35 @@ type VolumeRdmaWriteRequest struct {
 	TimeoutMs    uint64             `json:"timeout_ms,omitempty"`
 }
 
+type VolumeRdmaWriteDescRequest struct {
+	ConnectionID uint64 `json:"connection_id,omitempty"`
+	FileID       string `json:"file_id"`
+	VolumeID     uint32 `json:"volume_id"`
+	NeedleID     uint64 `json:"needle_id"`
+	Cookie       uint32 `json:"cookie"`
+	Size         uint64 `json:"size"`
+}
+
+type VolumeRdmaWriteCommitRequest struct {
+	SessionID uint64 `json:"session_id"`
+	FileID    string `json:"file_id"`
+	VolumeID  uint32 `json:"volume_id"`
+	NeedleID  uint64 `json:"needle_id"`
+	Cookie    uint32 `json:"cookie"`
+	Size      uint64 `json:"size"`
+}
+
+type VolumeRdmaWriteAbortRequest struct {
+	SessionID uint64 `json:"session_id"`
+}
+
 type volumeRdmaReadDescResponse struct {
+	Desc         VolumeRdmaDataDesc `json:"desc"`
+	ConnectionID uint64             `json:"connection_id,omitempty"`
+	SessionID    uint64             `json:"session_id,omitempty"`
+}
+
+type volumeRdmaWriteDescResponse struct {
 	Desc         VolumeRdmaDataDesc `json:"desc"`
 	ConnectionID uint64             `json:"connection_id,omitempty"`
 	SessionID    uint64             `json:"session_id,omitempty"`
@@ -176,6 +204,129 @@ func (vs *VolumeServer) volumeRdmaWriteHandler(w http.ResponseWriter, r *http.Re
 	})
 }
 
+func (vs *VolumeServer) volumeRdmaWriteDescHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	registrar, ok := vs.rdmaWriteTargetEndpoint()
+	if !ok {
+		http.Error(w, "native RDMA write target endpoint is not configured", http.StatusNotImplemented)
+		return
+	}
+
+	var req VolumeRdmaWriteDescRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	if err := validateVolumeRdmaWriteDescRequest(req); err != nil {
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	buffer, err := registrar.RegisterWriteBufferFor(r.Context(), req.ConnectionID, req.Size)
+	if err != nil {
+		writeJsonError(w, r, http.StatusServiceUnavailable, err)
+		return
+	}
+	desc := buffer.Descriptor()
+	sessionID := uint64(0)
+	if withSession, ok := buffer.(interface{ SessionID() uint64 }); ok {
+		sessionID = withSession.SessionID()
+	}
+	if sessionID == 0 || desc.RemoteAddr == 0 || desc.RKey == 0 || desc.Length == 0 {
+		_ = buffer.Release(r.Context())
+		writeJsonError(w, r, http.StatusServiceUnavailable, fmt.Errorf("native RDMA write descriptor is not exportable"))
+		return
+	}
+	if uint64(desc.Length) < req.Size {
+		_ = buffer.Release(r.Context())
+		writeJsonError(w, r, http.StatusServiceUnavailable, fmt.Errorf("native RDMA write descriptor length %d is smaller than payload size %d", desc.Length, req.Size))
+		return
+	}
+	desc.Length = uint32(req.Size)
+	desc.Reserved[0] = sessionID
+	writeJsonQuiet(w, r, http.StatusOK, volumeRdmaWriteDescResponse{
+		Desc:         desc,
+		ConnectionID: req.ConnectionID,
+		SessionID:    sessionID,
+	})
+}
+
+func (vs *VolumeServer) volumeRdmaWriteCommitHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	reader, ok := vs.rdmaWriteTargetEndpoint()
+	if !ok {
+		http.Error(w, "native RDMA write target endpoint is not configured", http.StatusNotImplemented)
+		return
+	}
+
+	var req VolumeRdmaWriteCommitRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	if err := validateVolumeRdmaWriteCommitRequest(req); err != nil {
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	data, err := reader.ReadRegisteredBuffer(r.Context(), req.SessionID, req.Size)
+	if err != nil {
+		_ = reader.ReleaseSession(r.Context(), req.SessionID)
+		writeJsonError(w, r, http.StatusServiceUnavailable, err)
+		return
+	}
+	defer func() {
+		_ = reader.ReleaseSession(context.Background(), req.SessionID)
+	}()
+
+	fileID, err := vs.writeNeedleDataFromNativeRdma(r.Context(), VolumeRdmaWriteRequest{
+		FileID:   req.FileID,
+		VolumeID: req.VolumeID,
+		NeedleID: req.NeedleID,
+		Cookie:   req.Cookie,
+		Size:     req.Size,
+	}, data)
+	if err != nil {
+		writeJsonError(w, r, http.StatusInternalServerError, err)
+		return
+	}
+	writeJsonQuiet(w, r, http.StatusOK, volumeRdmaWriteResponse{
+		FileID: fileID,
+		Size:   req.Size,
+		Source: "native-volume-rdma-write-desc",
+	})
+}
+
+func (vs *VolumeServer) volumeRdmaWriteAbortHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	target, ok := vs.rdmaWriteTargetEndpoint()
+	if !ok {
+		http.Error(w, "native RDMA write target endpoint is not configured", http.StatusNotImplemented)
+		return
+	}
+	var req VolumeRdmaWriteAbortRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	if req.SessionID == 0 {
+		writeJsonError(w, r, http.StatusBadRequest, fmt.Errorf("session_id is required"))
+		return
+	}
+	if err := target.ReleaseSession(r.Context(), req.SessionID); err != nil {
+		writeJsonError(w, r, http.StatusServiceUnavailable, err)
+		return
+	}
+	writeJsonQuiet(w, r, http.StatusOK, map[string]bool{"aborted": true})
+}
+
 func volumeRdmaReadHTTPStatus(err error) int {
 	switch {
 	case err == nil:
@@ -206,6 +357,46 @@ func validateVolumeRdmaWriteRequest(req VolumeRdmaWriteRequest) error {
 		return fmt.Errorf("native RDMA write descriptor length %d is smaller than payload size %d", req.Desc.Length, req.Size)
 	}
 	return nil
+}
+
+func validateVolumeRdmaWriteDescRequest(req VolumeRdmaWriteDescRequest) error {
+	if req.VolumeID == 0 || req.NeedleID == 0 || req.Size == 0 {
+		return fmt.Errorf("volume_id, needle_id, and size are required")
+	}
+	if req.ConnectionID == 0 {
+		return fmt.Errorf("connection_id is required")
+	}
+	if req.Size > volumeRdmaEngineMaxFrameSize {
+		return fmt.Errorf("native RDMA write too large: %d > %d", req.Size, volumeRdmaEngineMaxFrameSize)
+	}
+	return nil
+}
+
+func validateVolumeRdmaWriteCommitRequest(req VolumeRdmaWriteCommitRequest) error {
+	if req.SessionID == 0 {
+		return fmt.Errorf("session_id is required")
+	}
+	if req.VolumeID == 0 || req.NeedleID == 0 || req.Size == 0 {
+		return fmt.Errorf("volume_id, needle_id, and size are required")
+	}
+	if req.Size > volumeRdmaEngineMaxFrameSize {
+		return fmt.Errorf("native RDMA write too large: %d > %d", req.Size, volumeRdmaEngineMaxFrameSize)
+	}
+	return nil
+}
+
+type volumeRdmaWriteTargetEndpoint interface {
+	RegisterWriteBufferFor(context.Context, uint64, uint64) (VolumeRdmaRegisteredBuffer, error)
+	ReadRegisteredBuffer(context.Context, uint64, uint64) ([]byte, error)
+	ReleaseSession(context.Context, uint64) error
+}
+
+func (vs *VolumeServer) rdmaWriteTargetEndpoint() (volumeRdmaWriteTargetEndpoint, bool) {
+	if vs == nil || vs.rdmaEndpoint == nil {
+		return nil, false
+	}
+	target, ok := vs.rdmaEndpoint.(volumeRdmaWriteTargetEndpoint)
+	return target, ok
 }
 
 func (vs *VolumeServer) writeNeedleDataFromNativeRdma(ctx context.Context, req VolumeRdmaWriteRequest, data []byte) (string, error) {

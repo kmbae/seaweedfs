@@ -2,7 +2,10 @@ package swvfsfiler
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path"
 	"sort"
@@ -21,6 +24,8 @@ type fakeStore struct {
 	lookupMisses map[string]bool
 	savedPath    string
 	assignedPath string
+	assignFileID string
+	assignServer string
 	totalSize    uint64
 	usedSize     uint64
 	fileCount    uint64
@@ -113,7 +118,15 @@ func (s *fakeStore) RenameEntry(ctx context.Context, oldPath, newPath string) er
 
 func (s *fakeStore) AssignVolume(ctx context.Context, fullPath string, size uint64) (string, string, error) {
 	s.assignedPath = fullPath
-	return "3,01637037d6", "http://vol:8080", nil
+	fileID := s.assignFileID
+	if fileID == "" {
+		fileID = "3,01637037d6"
+	}
+	server := s.assignServer
+	if server == "" {
+		server = "http://vol:8080"
+	}
+	return fileID, server, nil
 }
 
 func (s *fakeStore) LookupFileID(ctx context.Context, fileID string) ([]string, error) {
@@ -178,6 +191,27 @@ func (c *captureReadDescriptor) ReadFileRDMA(ctx context.Context, path string, o
 
 func (c *captureReadDescriptor) ReleaseReadDescriptor(ctx context.Context, leaseID uint64, status int32, bytes uint64) error {
 	c.calls++
+	return nil
+}
+
+type fakeNativeWriteControl struct {
+	connected swvfsproto.RDMARemoteInfo
+}
+
+func (f *fakeNativeWriteControl) GetLocal() (swvfsproto.RDMALocalInfo, error) {
+	return swvfsproto.RDMALocalInfo{
+		ABIVersion: swvfsproto.RDMAABIVersion,
+		Flags:      swvfsproto.RDMAFKernelEnabled | swvfsproto.RDMAFEndpointReady,
+		Port:       1,
+		QPNum:      10,
+		PSN:        20,
+		LID:        30,
+		LinkLayer:  swvfsproto.RDMALinkInfiniBand,
+	}, nil
+}
+
+func (f *fakeNativeWriteControl) Connect(remote swvfsproto.RDMARemoteInfo) error {
+	f.connected = remote
 	return nil
 }
 
@@ -339,6 +373,108 @@ func TestBackendWriteAssignsAndSavesChunk(t *testing.T) {
 	}
 	if attr.Size != 7 {
 		t.Fatalf("attr size = %d", attr.Size)
+	}
+}
+
+func TestBackendWriteRDMAPrefersNativeVolumeDescriptor(t *testing.T) {
+	var sawConnect, sawPrepare, sawCommit bool
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case swvfsdaemon.VolumeRDMALocalPath:
+			_ = json.NewEncoder(w).Encode(swvfsdaemon.RDMALocalEndpoint{
+				ConnectionID:  44,
+				ABIVersion:    swvfsproto.RDMAABIVersion,
+				KernelEnabled: true,
+				EndpointReady: true,
+				Port:          1,
+				QPNum:         123,
+				PSN:           456,
+				LID:           789,
+				LinkLayer:     swvfsproto.RDMALinkInfiniBand,
+			})
+		case swvfsdaemon.VolumeRDMAConnectPath:
+			sawConnect = true
+			if got := r.URL.Query().Get("connection_id"); got != "44" {
+				t.Errorf("connection_id = %q", got)
+			}
+			_ = json.NewEncoder(w).Encode(map[string]bool{"connected": true})
+		case swvfsdaemon.VolumeRDMAWriteDescPath:
+			sawPrepare = true
+			var req swvfsdaemon.VolumeRDMAWriteDescRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode write desc: %v", err)
+				return
+			}
+			if req.ConnectionID != 44 || req.FileID != "3,01637037d6" || req.VolumeID != 3 || req.Size != 4096 {
+				t.Errorf("write desc request = %+v", req)
+			}
+			_ = json.NewEncoder(w).Encode(swvfsdaemon.VolumeRDMAWriteDescResponse{
+				Desc: swvfsproto.RDMADataDesc{
+					RemoteAddr: 0xbeef,
+					RKey:       77,
+					Length:     4096,
+				},
+				ConnectionID: 44,
+				SessionID:    55,
+			})
+		case swvfsdaemon.VolumeRDMAWriteCommitPath:
+			sawCommit = true
+			var req swvfsdaemon.VolumeRDMAWriteCommitRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode write commit: %v", err)
+				return
+			}
+			if req.SessionID != 55 || req.FileID != "3,01637037d6" || req.Size != 4096 {
+				t.Errorf("write commit request = %+v", req)
+			}
+			_ = json.NewEncoder(w).Encode(swvfsdaemon.VolumeRDMAWriteResponse{
+				FileID: req.FileID,
+				Size:   req.Size,
+				Source: "native-volume-rdma-write-desc",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	store := &fakeStore{
+		entries:      map[string]*filer_pb.Entry{},
+		assignServer: server.URL,
+		assignFileID: "3,01637037d6",
+	}
+	control := &fakeNativeWriteControl{}
+	backend := &Backend{
+		Store: store,
+		NativeWriteDescriptor: &NativeVolumeWriteDescriptorClient{
+			Control: control,
+			Timeout: time.Second,
+		},
+	}
+
+	desc, _, err := backend.PrepareWriteRDMA(context.Background(), "/native", 0, 4096)
+	if err != nil {
+		t.Fatalf("PrepareWriteRDMA: %v", err)
+	}
+	if desc.RemoteAddr != 0xbeef || desc.RKey != 77 || desc.Length != 4096 || desc.Reserved[0] != 55 {
+		t.Fatalf("desc = %+v", desc)
+	}
+	attr, err := backend.CommitWriteRDMA(context.Background(), "/native", 0, 4096)
+	if err != nil {
+		t.Fatalf("CommitWriteRDMA: %v", err)
+	}
+	if attr.Size != 4096 {
+		t.Fatalf("attr size = %d", attr.Size)
+	}
+	if !sawConnect || !sawPrepare || !sawCommit {
+		t.Fatalf("saw connect/prepare/commit = %v/%v/%v", sawConnect, sawPrepare, sawCommit)
+	}
+	if control.connected.QPN != 123 || control.connected.PSN != 456 || control.connected.LID != 789 {
+		t.Fatalf("connected remote = %+v", control.connected)
+	}
+	entry := store.entries["/native"]
+	if entry == nil || len(entry.Chunks) != 1 || entry.Chunks[0].FileId != "3,01637037d6" || entry.Chunks[0].Size != 4096 {
+		t.Fatalf("saved entry = %+v", entry)
 	}
 }
 

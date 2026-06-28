@@ -69,7 +69,7 @@ func main() {
 	root.Flags().BoolVar(&enableReadRDMA, "enable-read-rdma", false, "prefer RDMA for legacy READ requests carrying the kernel RDMA hint")
 	root.Flags().BoolVar(&enableWriteRDMA, "enable-write-rdma", false, "prefer RDMA for legacy WRITE requests carrying the kernel RDMA hint")
 	root.Flags().BoolVar(&enablePayloadRDMA, "enable-payload-rdma", false, "enable real payload RDMA in the SeaweedFS data plane")
-	root.Flags().BoolVar(&enableVolumeNativeRDMA, "enable-volume-native-rdma", false, "try volume-server-native RDMA read descriptors before sidecar/kernel-MR staging")
+	root.Flags().BoolVar(&enableVolumeNativeRDMA, "enable-volume-native-rdma", false, "try volume-server-native RDMA read/write descriptors before sidecar/kernel-MR staging")
 	root.Flags().Uint64Var(&readRDMAMinSize, "rdma-read-min-size", defaultRDMAMinSize, "minimum READ size in bytes before RDMA descriptors are served; set 0 to allow all direct/hinted reads")
 	root.Flags().Uint64Var(&writeRDMAMinSize, "rdma-write-min-size", defaultRDMAMinSize, "minimum WRITE size in bytes before RDMA descriptors are served; set 0 to allow all direct/hinted writes")
 	root.Flags().BoolVar(&forceRDMA, "force-rdma", false, "prefer RDMA for READ and WRITE even when the kernel request has no RDMA hint")
@@ -164,6 +164,12 @@ func run(cmd *cobra.Command, args []string) error {
 	}
 	if enableVolumeNativeRDMA {
 		backend.NativeReadDescriptor = &swvfsdaemon.VolumeNativeRDMAReadDescriptorClient{
+			Control:      rdmaControl,
+			Timeout:      rdmaPeerTimeout,
+			ServiceLevel: rdmaPeerSL,
+			Stats:        stats,
+		}
+		backend.NativeWriteDescriptor = &swvfsfiler.NativeVolumeWriteDescriptorClient{
 			Control:      rdmaControl,
 			Timeout:      rdmaPeerTimeout,
 			ServiceLevel: rdmaPeerSL,

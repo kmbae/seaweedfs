@@ -132,6 +132,12 @@ pub trait VolumeRdmaProvider: std::fmt::Debug + Send + Sync {
         let data = read_frame(stream).await?;
         self.register_read(connection_id, data).await
     }
+    async fn register_write(
+        &self,
+        connection_id: u64,
+        size: usize,
+    ) -> Result<VolumeRdmaRegisteredRead>;
+    async fn read_registered(&self, session_id: u64, size: usize) -> Result<Vec<u8>>;
     async fn release_read(&self, session_id: u64) -> Result<()>;
 }
 
@@ -164,6 +170,8 @@ pub struct EngineRequest {
     pub session_id: u64,
     #[serde(default)]
     pub timeout_ms: u64,
+    #[serde(default)]
+    pub size: u64,
     #[serde(default)]
     pub data_sideband: bool,
     #[serde(default, deserialize_with = "deserialize_go_json_bytes")]
@@ -346,6 +354,47 @@ impl VolumeNativeEngine {
                 {
                     Ok(read) => EngineResponse::ok_registered_read(read),
                     Err(err) => EngineResponse::error(format!("register_read failed: {err:#}")),
+                }
+            }
+            "register_write" => {
+                if request.size == 0 {
+                    return EngineResponse::error("register_write requires size");
+                }
+                if request.size > MAX_FRAME_SIZE as u64 {
+                    return EngineResponse::error(format!(
+                        "register_write size too large: {}",
+                        request.size
+                    ));
+                }
+                match self
+                    .provider
+                    .register_write(request.connection_id, request.size as usize)
+                    .await
+                {
+                    Ok(write) => EngineResponse::ok_registered_read(write),
+                    Err(err) => EngineResponse::error(format!("register_write failed: {err:#}")),
+                }
+            }
+            "read_registered" => {
+                if request.session_id == 0 {
+                    return EngineResponse::error("read_registered requires session_id");
+                }
+                if request.size == 0 {
+                    return EngineResponse::error("read_registered requires size");
+                }
+                if request.size > MAX_FRAME_SIZE as u64 {
+                    return EngineResponse::error(format!(
+                        "read_registered size too large: {}",
+                        request.size
+                    ));
+                }
+                match self
+                    .provider
+                    .read_registered(request.session_id, request.size as usize)
+                    .await
+                {
+                    Ok(data) => EngineResponse::ok_data(data),
+                    Err(err) => EngineResponse::error(format!("read_registered failed: {err:#}")),
                 }
             }
             "release" => {
@@ -641,6 +690,72 @@ impl VolumeRdmaProvider for MockVolumeRdmaProvider {
         Ok(VolumeRdmaRegisteredRead { session_id, desc })
     }
 
+    async fn register_write(
+        &self,
+        connection_id: u64,
+        size: usize,
+    ) -> Result<VolumeRdmaRegisteredRead> {
+        if size == 0 {
+            return Err(anyhow!("register_write requires size"));
+        }
+        if size > u32::MAX as usize {
+            return Err(anyhow!("register_write size too large"));
+        }
+
+        let session_id = self.next_session_id.fetch_add(1, Ordering::Relaxed);
+        if session_id == 0 {
+            return Err(anyhow!("session id overflow"));
+        }
+        if connection_id == 0 {
+            return Err(anyhow!("register_write requires connection_id"));
+        }
+        let mut state = self.state.lock().await;
+        if !matches!(state.connections.get(&connection_id), Some(Some(_))) {
+            return Err(anyhow!(
+                "register_write requires connected connection_id {connection_id}"
+            ));
+        }
+
+        let remote_addr = self
+            .config
+            .mock_base_addr
+            .saturating_add(session_id.saturating_mul(self.config.mock_addr_stride));
+        let mut desc = VolumeRdmaDataDesc {
+            remote_addr,
+            rkey: self.config.mock_rkey,
+            length: size as u32,
+            reserved: [0; 4],
+        };
+        desc.reserved[0] = session_id;
+        desc.reserved[1] = connection_id;
+
+        state.leases.insert(
+            session_id,
+            ReadLease {
+                data: vec![0u8; size],
+                desc: desc.clone(),
+            },
+        );
+
+        Ok(VolumeRdmaRegisteredRead { session_id, desc })
+    }
+
+    async fn read_registered(&self, session_id: u64, size: usize) -> Result<Vec<u8>> {
+        let state = self.state.lock().await;
+        let lease = state
+            .leases
+            .get(&session_id)
+            .ok_or_else(|| anyhow!("unknown registered session_id {session_id}"))?;
+        if size > lease.data.len() {
+            return Err(anyhow!(
+                "registered buffer shorter than requested read: capacity={} size={}",
+                lease.data.len(),
+                size
+            ));
+        }
+        Ok(lease.data[..size].to_vec())
+    }
+
     async fn release_read(&self, session_id: u64) -> Result<()> {
         self.state.lock().await.leases.remove(&session_id);
         Ok(())
@@ -886,21 +1001,24 @@ mod tests {
         (engine, provider, requester)
     }
 
+    fn request(op: &str) -> EngineRequest {
+        EngineRequest {
+            op: op.to_string(),
+            connection_id: 0,
+            remote: None,
+            desc: None,
+            session_id: 0,
+            timeout_ms: 0,
+            size: 0,
+            data_sideband: false,
+            data: Vec::new(),
+        }
+    }
+
     #[tokio::test]
     async fn process_local_and_connect() {
         let (engine, provider, _) = mock_engine();
-        let local = engine
-            .process_request(EngineRequest {
-                op: "local".to_string(),
-                connection_id: 0,
-                remote: None,
-                desc: None,
-                session_id: 0,
-                timeout_ms: 0,
-                data_sideband: false,
-                data: Vec::new(),
-            })
-            .await;
+        let local = engine.process_request(request("local")).await;
         assert!(local.ok);
         let connection_id = local.connection_id;
         assert_ne!(connection_id, 0);
@@ -908,7 +1026,6 @@ mod tests {
 
         let connect = engine
             .process_request(EngineRequest {
-                op: "connect".to_string(),
                 connection_id,
                 remote: Some(VolumeRdmaRemoteInfo {
                     abi_version: ABI_VERSION,
@@ -922,11 +1039,7 @@ mod tests {
                     gid: [0; 16],
                     reserved: [0; 8],
                 }),
-                desc: None,
-                session_id: 0,
-                timeout_ms: 0,
-                data_sideband: false,
-                data: Vec::new(),
+                ..request("connect")
             })
             .await;
         assert!(connect.ok);
@@ -943,23 +1056,11 @@ mod tests {
     #[tokio::test]
     async fn register_read_and_release() {
         let (engine, provider, _) = mock_engine();
-        let local = engine
-            .process_request(EngineRequest {
-                op: "local".to_string(),
-                connection_id: 0,
-                remote: None,
-                desc: None,
-                session_id: 0,
-                timeout_ms: 0,
-                data_sideband: false,
-                data: Vec::new(),
-            })
-            .await;
+        let local = engine.process_request(request("local")).await;
         assert!(local.ok);
         let connection_id = local.connection_id;
         let connect = engine
             .process_request(EngineRequest {
-                op: "connect".to_string(),
                 connection_id,
                 remote: Some(VolumeRdmaRemoteInfo {
                     abi_version: ABI_VERSION,
@@ -973,24 +1074,15 @@ mod tests {
                     gid: [0; 16],
                     reserved: [0; 8],
                 }),
-                desc: None,
-                session_id: 0,
-                timeout_ms: 0,
-                data_sideband: false,
-                data: Vec::new(),
+                ..request("connect")
             })
             .await;
         assert!(connect.ok);
         let response = engine
             .process_request(EngineRequest {
-                op: "register_read".to_string(),
                 connection_id,
-                remote: None,
-                desc: None,
-                session_id: 0,
-                timeout_ms: 0,
-                data_sideband: false,
                 data: b"needle-data".to_vec(),
+                ..request("register_read")
             })
             .await;
         assert!(response.ok);
@@ -1009,14 +1101,8 @@ mod tests {
 
         let release = engine
             .process_request(EngineRequest {
-                op: "release".to_string(),
-                connection_id: 0,
-                remote: None,
-                desc: None,
                 session_id,
-                timeout_ms: 0,
-                data_sideband: false,
-                data: Vec::new(),
+                ..request("release")
             })
             .await;
         assert!(release.ok);
@@ -1024,47 +1110,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn engine_new_uses_mock_provider() {
-        let engine = VolumeNativeEngine::new(VolumeEngineConfig::mock("/tmp/test.sock"));
-        let local = engine
-            .process_request(EngineRequest {
-                op: "local".to_string(),
-                connection_id: 0,
-                remote: None,
-                desc: None,
-                session_id: 0,
-                timeout_ms: 0,
-                data_sideband: false,
-                data: Vec::new(),
-            })
-            .await;
-        assert!(local.ok);
-        assert_eq!(local.endpoint.unwrap().device, "mock-volume-rdma");
-    }
-
-    #[tokio::test]
-    async fn requester_local_connect_and_read_remote() {
-        let (engine, _, requester) = mock_engine();
-        let local = engine
-            .process_request(EngineRequest {
-                op: "requester_local".to_string(),
-                connection_id: 0,
-                remote: None,
-                desc: None,
-                session_id: 0,
-                timeout_ms: 0,
-                data_sideband: false,
-                data: Vec::new(),
-            })
-            .await;
+    async fn register_write_read_registered_and_release() {
+        let (engine, provider, _) = mock_engine();
+        let local = engine.process_request(request("local")).await;
         assert!(local.ok);
         let connection_id = local.connection_id;
-        assert_ne!(connection_id, 0);
-        assert_eq!(local.endpoint.unwrap().qp_num, 0x1002);
-
         let connect = engine
             .process_request(EngineRequest {
-                op: "requester_connect".to_string(),
                 connection_id,
                 remote: Some(VolumeRdmaRemoteInfo {
                     abi_version: ABI_VERSION,
@@ -1078,11 +1130,80 @@ mod tests {
                     gid: [0; 16],
                     reserved: [0; 8],
                 }),
-                desc: None,
-                session_id: 0,
-                timeout_ms: 0,
-                data_sideband: false,
-                data: Vec::new(),
+                ..request("connect")
+            })
+            .await;
+        assert!(connect.ok);
+
+        let registered = engine
+            .process_request(EngineRequest {
+                connection_id,
+                size: 16,
+                ..request("register_write")
+            })
+            .await;
+        assert!(registered.ok);
+        let session_id = registered.session_id;
+        assert_ne!(session_id, 0);
+        let desc = registered.desc.unwrap();
+        assert_eq!(desc.length, 16);
+        assert_eq!(desc.reserved[0], session_id);
+        assert_eq!(desc.reserved[1], connection_id);
+        assert_eq!(provider.lease_count().await, 1);
+
+        let data = engine
+            .process_request(EngineRequest {
+                session_id,
+                size: 16,
+                ..request("read_registered")
+            })
+            .await;
+        assert!(data.ok);
+        assert_eq!(data.data, vec![0u8; 16]);
+
+        let release = engine
+            .process_request(EngineRequest {
+                session_id,
+                ..request("release")
+            })
+            .await;
+        assert!(release.ok);
+        assert_eq!(provider.lease_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn engine_new_uses_mock_provider() {
+        let engine = VolumeNativeEngine::new(VolumeEngineConfig::mock("/tmp/test.sock"));
+        let local = engine.process_request(request("local")).await;
+        assert!(local.ok);
+        assert_eq!(local.endpoint.unwrap().device, "mock-volume-rdma");
+    }
+
+    #[tokio::test]
+    async fn requester_local_connect_and_read_remote() {
+        let (engine, _, requester) = mock_engine();
+        let local = engine.process_request(request("requester_local")).await;
+        assert!(local.ok);
+        let connection_id = local.connection_id;
+        assert_ne!(connection_id, 0);
+        assert_eq!(local.endpoint.unwrap().qp_num, 0x1002);
+
+        let connect = engine
+            .process_request(EngineRequest {
+                connection_id,
+                remote: Some(VolumeRdmaRemoteInfo {
+                    abi_version: ABI_VERSION,
+                    flags: 0,
+                    qpn: 10,
+                    lid: 1,
+                    psn: 2,
+                    port: 1,
+                    gid_index: 0,
+                    sl: 0,
+                    gid: [0; 16],
+                    reserved: [0; 8],
+                }),
+                ..request("requester_connect")
             })
             .await;
         assert!(connect.ok);
@@ -1097,19 +1218,15 @@ mod tests {
 
         let read = engine
             .process_request(EngineRequest {
-                op: "read_remote".to_string(),
                 connection_id,
-                remote: None,
                 desc: Some(VolumeRdmaDataDesc {
                     remote_addr: 0xbeef,
                     rkey: 0,
                     length: 4,
                     reserved: [0; 4],
                 }),
-                session_id: 0,
                 timeout_ms: 10,
-                data_sideband: false,
-                data: Vec::new(),
+                ..request("read_remote")
             })
             .await;
         assert!(read.ok);
@@ -1133,23 +1250,11 @@ mod tests {
     #[tokio::test]
     async fn handle_stream_accepts_register_read_data_sideband() {
         let (engine, provider, _) = mock_engine();
-        let local = engine
-            .process_request(EngineRequest {
-                op: "local".to_string(),
-                connection_id: 0,
-                remote: None,
-                desc: None,
-                session_id: 0,
-                timeout_ms: 0,
-                data_sideband: false,
-                data: Vec::new(),
-            })
-            .await;
+        let local = engine.process_request(request("local")).await;
         assert!(local.ok);
         let connection_id = local.connection_id;
         let connect = engine
             .process_request(EngineRequest {
-                op: "connect".to_string(),
                 connection_id,
                 remote: Some(VolumeRdmaRemoteInfo {
                     abi_version: ABI_VERSION,
@@ -1163,11 +1268,7 @@ mod tests {
                     gid: [0; 16],
                     reserved: [0; 8],
                 }),
-                desc: None,
-                session_id: 0,
-                timeout_ms: 0,
-                data_sideband: false,
-                data: Vec::new(),
+                ..request("connect")
             })
             .await;
         assert!(connect.ok);
@@ -1201,23 +1302,11 @@ mod tests {
     #[tokio::test]
     async fn handle_stream_accepts_register_read_stream_frame() {
         let (engine, provider, _) = mock_engine();
-        let local = engine
-            .process_request(EngineRequest {
-                op: "local".to_string(),
-                connection_id: 0,
-                remote: None,
-                desc: None,
-                session_id: 0,
-                timeout_ms: 0,
-                data_sideband: false,
-                data: Vec::new(),
-            })
-            .await;
+        let local = engine.process_request(request("local")).await;
         assert!(local.ok);
         let connection_id = local.connection_id;
         let connect = engine
             .process_request(EngineRequest {
-                op: "connect".to_string(),
                 connection_id,
                 remote: Some(VolumeRdmaRemoteInfo {
                     abi_version: ABI_VERSION,
@@ -1231,11 +1320,7 @@ mod tests {
                     gid: [0; 16],
                     reserved: [0; 8],
                 }),
-                desc: None,
-                session_id: 0,
-                timeout_ms: 0,
-                data_sideband: false,
-                data: Vec::new(),
+                ..request("connect")
             })
             .await;
         assert!(connect.ok);
@@ -1268,23 +1353,11 @@ mod tests {
     #[tokio::test]
     async fn handle_stream_emits_read_remote_data_sideband() {
         let (engine, _, _) = mock_engine();
-        let local = engine
-            .process_request(EngineRequest {
-                op: "requester_local".to_string(),
-                connection_id: 0,
-                remote: None,
-                desc: None,
-                session_id: 0,
-                timeout_ms: 0,
-                data_sideband: false,
-                data: Vec::new(),
-            })
-            .await;
+        let local = engine.process_request(request("requester_local")).await;
         assert!(local.ok);
         let connection_id = local.connection_id;
         let connect = engine
             .process_request(EngineRequest {
-                op: "requester_connect".to_string(),
                 connection_id,
                 remote: Some(VolumeRdmaRemoteInfo {
                     abi_version: ABI_VERSION,
@@ -1298,11 +1371,7 @@ mod tests {
                     gid: [0; 16],
                     reserved: [0; 8],
                 }),
-                desc: None,
-                session_id: 0,
-                timeout_ms: 0,
-                data_sideband: false,
-                data: Vec::new(),
+                ..request("requester_connect")
             })
             .await;
         assert!(connect.ok);

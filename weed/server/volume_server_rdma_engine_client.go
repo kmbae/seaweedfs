@@ -18,6 +18,8 @@ const (
 	volumeRdmaEngineOpConnect            = "connect"
 	volumeRdmaEngineOpRegisterRead       = "register_read"
 	volumeRdmaEngineOpRegisterReadStream = "register_read_stream"
+	volumeRdmaEngineOpRegisterWrite      = "register_write"
+	volumeRdmaEngineOpReadRegistered     = "read_registered"
 	volumeRdmaEngineOpRelease            = "release"
 	volumeRdmaEngineOpRequesterLocal     = "requester_local"
 	volumeRdmaEngineOpRequesterConnect   = "requester_connect"
@@ -40,6 +42,7 @@ type volumeRdmaEngineRequest struct {
 	Desc         *VolumeRdmaDataDesc   `json:"desc,omitempty"`
 	SessionID    uint64                `json:"session_id,omitempty"`
 	TimeoutMs    uint64                `json:"timeout_ms,omitempty"`
+	Size         uint64                `json:"size,omitempty"`
 	DataSideband bool                  `json:"data_sideband,omitempty"`
 	Data         []byte                `json:"data,omitempty"`
 }
@@ -238,11 +241,81 @@ func (c *VolumeRdmaEngineClient) RegisterReadStreamFor(ctx context.Context, conn
 	}, nil
 }
 
+func (c *VolumeRdmaEngineClient) RegisterWriteBufferFor(ctx context.Context, connectionID uint64, size uint64) (VolumeRdmaRegisteredBuffer, error) {
+	if size == 0 {
+		return nil, fmt.Errorf("native RDMA register_write requires size")
+	}
+	if size > volumeRdmaEngineMaxFrameSize {
+		return nil, fmt.Errorf("native RDMA register_write frame too large: %d bytes", size)
+	}
+	resp, err := c.roundTrip(ctx, volumeRdmaEngineRequest{
+		Op:           volumeRdmaEngineOpRegisterWrite,
+		ConnectionID: connectionID,
+		Size:         size,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if resp.Desc == nil {
+		return nil, fmt.Errorf("%w: register_write response missing descriptor", ErrVolumeRdmaEngineUnavailable)
+	}
+	if resp.SessionID == 0 {
+		return nil, fmt.Errorf("%w: register_write response missing session_id", ErrVolumeRdmaEngineUnavailable)
+	}
+	return &volumeRdmaEngineRegisteredBuffer{
+		client:    c,
+		sessionID: resp.SessionID,
+		desc:      *resp.Desc,
+	}, nil
+}
+
+func (c *VolumeRdmaEngineClient) ReadRegisteredBuffer(ctx context.Context, sessionID uint64, size uint64) ([]byte, error) {
+	if sessionID == 0 {
+		return nil, fmt.Errorf("native RDMA read_registered requires session_id")
+	}
+	if size == 0 {
+		return nil, fmt.Errorf("native RDMA read_registered requires size")
+	}
+	if size > volumeRdmaEngineMaxFrameSize {
+		return nil, fmt.Errorf("native RDMA read_registered frame too large: %d bytes", size)
+	}
+	resp, err := c.roundTrip(ctx, volumeRdmaEngineRequest{
+		Op:        volumeRdmaEngineOpReadRegistered,
+		SessionID: sessionID,
+		Size:      size,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if uint64(len(resp.Data)) < size {
+		return nil, fmt.Errorf("%w: read_registered returned %d bytes for %d byte descriptor", ErrVolumeRdmaEngineUnavailable, len(resp.Data), size)
+	}
+	return resp.Data[:size], nil
+}
+
+func (c *VolumeRdmaEngineClient) ReleaseSession(ctx context.Context, sessionID uint64) error {
+	if sessionID == 0 {
+		return nil
+	}
+	_, err := c.roundTrip(ctx, volumeRdmaEngineRequest{
+		Op:        volumeRdmaEngineOpRelease,
+		SessionID: sessionID,
+	})
+	return err
+}
+
 func (b *volumeRdmaEngineRegisteredBuffer) Descriptor() VolumeRdmaDataDesc {
 	if b == nil {
 		return VolumeRdmaDataDesc{}
 	}
 	return b.desc
+}
+
+func (b *volumeRdmaEngineRegisteredBuffer) SessionID() uint64 {
+	if b == nil {
+		return 0
+	}
+	return b.sessionID
 }
 
 func (b *volumeRdmaEngineRegisteredBuffer) Release(ctx context.Context) error {

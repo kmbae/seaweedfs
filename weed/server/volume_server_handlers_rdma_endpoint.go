@@ -20,6 +20,9 @@ const (
 	VolumeRdmaNativeRequesterLocalPath   = "/rdma/native/requester-local"
 	VolumeRdmaNativeRequesterConnectPath = "/rdma/native/requester-connect"
 	VolumeRdmaNativeWritePath            = "/rdma/native/write"
+	VolumeRdmaNativeWriteDescPath        = "/rdma/native/write-desc"
+	VolumeRdmaNativeWriteCommitPath      = "/rdma/native/write-commit"
+	VolumeRdmaNativeWriteAbortPath       = "/rdma/native/write-abort"
 
 	VolumeRdmaABIVersion         uint32 = 1
 	VolumeRdmaLinkUnknown        uint32 = 0
@@ -94,6 +97,9 @@ type volumeRdmaNativeStatusResponse struct {
 	RequesterLocalPath     string `json:"requester_local_path"`
 	RequesterConnectPath   string `json:"requester_connect_path"`
 	WritePath              string `json:"write_path"`
+	WriteDescPath          string `json:"write_desc_path"`
+	WriteCommitPath        string `json:"write_commit_path"`
+	WriteAbortPath         string `json:"write_abort_path"`
 }
 
 func (e VolumeRdmaEndpointInfo) ReadyForConnect() bool {
@@ -156,6 +162,9 @@ func (vs *VolumeServer) volumeRdmaStatusHandler(w http.ResponseWriter, r *http.R
 		RequesterLocalPath:     VolumeRdmaNativeRequesterLocalPath,
 		RequesterConnectPath:   VolumeRdmaNativeRequesterConnectPath,
 		WritePath:              VolumeRdmaNativeWritePath,
+		WriteDescPath:          VolumeRdmaNativeWriteDescPath,
+		WriteCommitPath:        VolumeRdmaNativeWriteCommitPath,
+		WriteAbortPath:         VolumeRdmaNativeWriteAbortPath,
 	})
 }
 

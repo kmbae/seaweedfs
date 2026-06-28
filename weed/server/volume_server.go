@@ -159,6 +159,9 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 	adminMux.HandleFunc(VolumeRdmaNativeRequesterLocalPath, requestIDMiddleware(vs.guard.WhiteList(vs.volumeRdmaRequesterLocalHandler)))
 	adminMux.HandleFunc(VolumeRdmaNativeRequesterConnectPath, requestIDMiddleware(vs.guard.WhiteList(vs.volumeRdmaRequesterConnectHandler)))
 	adminMux.HandleFunc(VolumeRdmaNativeWritePath, requestIDMiddleware(vs.guard.WhiteList(vs.volumeRdmaWriteHandler)))
+	adminMux.HandleFunc(VolumeRdmaNativeWriteDescPath, requestIDMiddleware(vs.guard.WhiteList(vs.volumeRdmaWriteDescHandler)))
+	adminMux.HandleFunc(VolumeRdmaNativeWriteCommitPath, requestIDMiddleware(vs.guard.WhiteList(vs.volumeRdmaWriteCommitHandler)))
+	adminMux.HandleFunc(VolumeRdmaNativeWriteAbortPath, requestIDMiddleware(vs.guard.WhiteList(vs.volumeRdmaWriteAbortHandler)))
 	adminMux.HandleFunc("/", requestIDMiddleware(vs.privateStoreHandler))
 	if publicMux != adminMux {
 		// separated admin and public port

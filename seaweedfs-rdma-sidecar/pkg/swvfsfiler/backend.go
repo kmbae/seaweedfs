@@ -39,11 +39,13 @@ type Backend struct {
 	Store                  MetadataStore
 	Router                 *swvfsdaemon.Router
 	NativeReadDescriptor   swvfsdaemon.NeedleReadDescriptorBackend
+	NativeWriteDescriptor  *NativeVolumeWriteDescriptorClient
 	ReadDescriptorBackend  swvfsdaemon.RDMAReadDescriptorBackend
 	WriteDescriptorBackend swvfsdaemon.RDMAWriteDescriptorBackend
 
-	mu      sync.Mutex
-	pending map[string]*pendingWrite
+	mu                sync.Mutex
+	pending           map[string]*pendingWrite
+	nativeWriteLeases map[nativeVolumeWriteKey]nativeVolumeWriteLease
 }
 
 const (
@@ -844,14 +846,34 @@ func isDescriptorFallback(err error) bool {
 }
 
 func (b *Backend) PrepareWriteRDMA(ctx context.Context, fullPath string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
-	if b == nil || b.WriteDescriptorBackend == nil {
+	if b == nil {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma write descriptor backend is not configured"}
+	}
+	if b.NativeWriteDescriptor != nil {
+		if desc, attr, err := b.prepareWriteNativeRDMA(ctx, fullPath, offset, size); err == nil && desc != nil {
+			return desc, attr, nil
+		} else if err != nil && !isDescriptorFallback(err) {
+			return nil, nil, err
+		}
+	}
+	if b.WriteDescriptorBackend == nil {
 		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma write descriptor backend is not configured"}
 	}
 	return b.WriteDescriptorBackend.PrepareWriteRDMA(ctx, cleanFullPath(fullPath), offset, size)
 }
 
 func (b *Backend) CommitWriteRDMA(ctx context.Context, fullPath string, offset, size uint64) (*swvfsproto.Attr, error) {
-	if b == nil || b.WriteDescriptorBackend == nil {
+	if b == nil {
+		return nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma write descriptor backend is not configured"}
+	}
+	if b.NativeWriteDescriptor != nil {
+		if attr, err := b.commitWriteNativeRDMA(ctx, fullPath, offset, size); err == nil && attr != nil {
+			return attr, nil
+		} else if err != nil && !isDescriptorFallback(err) {
+			return nil, err
+		}
+	}
+	if b.WriteDescriptorBackend == nil {
 		return nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma write descriptor backend is not configured"}
 	}
 	return b.WriteDescriptorBackend.CommitWriteRDMA(ctx, cleanFullPath(fullPath), offset, size)
@@ -964,7 +986,17 @@ func (b *Backend) persistPendingWrite(ctx context.Context, pending *pendingWrite
 	}); err != nil {
 		return nil, err
 	}
-	entry, err := b.lookupOrCreateEntry(ctx, pending.path, mode, pending.uid, pending.gid)
+	return b.appendChunkEntry(ctx, pending.path, pending.offset, uint64(len(pending.data)), mode, pending.uid, pending.gid, fileID)
+}
+
+func (b *Backend) appendChunkEntry(ctx context.Context, fullPath string, offset, size uint64, mode, uid, gid uint32, fileID string) (*swvfsproto.Attr, error) {
+	if size == 0 {
+		return nil, nil
+	}
+	if mode == 0 {
+		mode = defaultRegularMode
+	}
+	entry, err := b.lookupOrCreateEntry(ctx, fullPath, mode, uid, gid)
 	if err != nil {
 		return nil, err
 	}
@@ -972,22 +1004,22 @@ func (b *Backend) persistPendingWrite(ctx context.Context, pending *pendingWrite
 	tsNs := now.UnixNano()
 	entry.Chunks = append(entry.GetChunks(), &filer_pb.FileChunk{
 		FileId:       fileID,
-		Offset:       int64(pending.offset),
-		Size:         uint64(len(pending.data)),
+		Offset:       int64(offset),
+		Size:         size,
 		ModifiedTsNs: tsNs,
 	})
 	if entry.Attributes == nil {
 		entry.Attributes = &filer_pb.FuseAttributes{}
 	}
-	entry.Attributes.FileSize = maxUint64(entry.Attributes.FileSize, pending.end())
+	entry.Attributes.FileSize = maxUint64(entry.Attributes.FileSize, offset+size)
 	entry.Attributes.Mtime = now.Unix()
 	entry.Attributes.MtimeNs = int32(now.Nanosecond())
 	entry.Attributes.Ctime = now.Unix()
 	entry.Attributes.CtimeNs = int32(now.Nanosecond())
-	if err := b.Store.SaveEntry(ctx, pending.path, entry); err != nil {
+	if err := b.Store.SaveEntry(ctx, fullPath, entry); err != nil {
 		return nil, err
 	}
-	return AttrFromEntry(pending.path, entry), nil
+	return AttrFromEntry(fullPath, entry), nil
 }
 
 func (b *Backend) lookupOrCreateEntry(ctx context.Context, fullPath string, mode, uid, gid uint32) (*filer_pb.Entry, error) {
