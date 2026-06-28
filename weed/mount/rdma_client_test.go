@@ -1,6 +1,7 @@
 package mount
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -12,6 +13,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
+	storage_needle "github.com/seaweedfs/seaweedfs/weed/storage/needle"
 )
 
 func mockLookupFn(fileId string) func(ctx context.Context, fileId string) ([]string, error) {
@@ -36,6 +40,76 @@ func newTestClient(t *testing.T, handler http.Handler) (*RDMAMountClient, *httpt
 		},
 	}
 	return client, server
+}
+
+type fakeNativeRdmaRequester struct {
+	local       weed_server.VolumeRdmaEndpointInfo
+	readData    []byte
+	localCalls  atomic.Int64
+	connects    atomic.Int64
+	readCalls   atomic.Int64
+	lastReadID  atomic.Uint64
+	lastConnID  atomic.Uint64
+	lastReadLen atomic.Uint64
+}
+
+func (f *fakeNativeRdmaRequester) RequesterLocalEndpoint(ctx context.Context) (weed_server.VolumeRdmaEndpointInfo, error) {
+	local, _, err := f.RequesterLocalEndpointFor(ctx, 0)
+	return local, err
+}
+
+func (f *fakeNativeRdmaRequester) RequesterLocalEndpointFor(ctx context.Context, connectionID uint64) (weed_server.VolumeRdmaEndpointInfo, uint64, error) {
+	f.localCalls.Add(1)
+	if connectionID == 0 {
+		connectionID = 77
+	}
+	local := f.local
+	local.ConnectionID = connectionID
+	return local, connectionID, nil
+}
+
+func (f *fakeNativeRdmaRequester) RequesterConnectEndpoint(ctx context.Context, remote weed_server.VolumeRdmaRemoteInfo) error {
+	return f.RequesterConnectEndpointFor(ctx, 0, remote)
+}
+
+func (f *fakeNativeRdmaRequester) RequesterConnectEndpointFor(ctx context.Context, connectionID uint64, remote weed_server.VolumeRdmaRemoteInfo) error {
+	f.connects.Add(1)
+	f.lastConnID.Store(connectionID)
+	return nil
+}
+
+func (f *fakeNativeRdmaRequester) ReadRemoteFor(ctx context.Context, connectionID uint64, desc weed_server.VolumeRdmaDataDesc, timeout time.Duration) ([]byte, error) {
+	var out bytes.Buffer
+	if err := f.ReadRemoteToFor(ctx, connectionID, desc, timeout, &out); err != nil {
+		return nil, err
+	}
+	return out.Bytes(), nil
+}
+
+func (f *fakeNativeRdmaRequester) ReadRemoteToFor(ctx context.Context, connectionID uint64, desc weed_server.VolumeRdmaDataDesc, timeout time.Duration, dst io.Writer) error {
+	f.readCalls.Add(1)
+	f.lastReadID.Store(connectionID)
+	f.lastReadLen.Store(uint64(desc.Length))
+	if int(desc.Length) > len(f.readData) {
+		return fmt.Errorf("fake requester has %d bytes, descriptor asks for %d", len(f.readData), desc.Length)
+	}
+	_, err := dst.Write(f.readData[:desc.Length])
+	return err
+}
+
+func readyMountRdmaEndpoint(qpn uint32) weed_server.VolumeRdmaEndpointInfo {
+	return weed_server.VolumeRdmaEndpointInfo{
+		ABIVersion:    weed_server.VolumeRdmaABIVersion,
+		KernelEnabled: true,
+		EndpointReady: true,
+		Device:        "mlx5_0",
+		Port:          1,
+		QPNum:         qpn,
+		PSN:           0x123456,
+		LID:           0x42,
+		GIDIndex:      0,
+		LinkLayer:     weed_server.VolumeRdmaLinkInfiniBand,
+	}
 }
 
 func TestRDMAMountClient_HealthCheck(t *testing.T) {
@@ -205,6 +279,130 @@ func TestRDMAMountClient_ReadNeedle(t *testing.T) {
 			t.Fatalf("unexpected data: %q", data)
 		}
 	})
+}
+
+func TestRDMAMountClient_NativeReadNeedleTo(t *testing.T) {
+	fileID := storage_needle.NewFileId(7, 0x1234, 0x98765432).String()
+	readPayload := []byte("native-rdma-read-payload")
+	requester := &fakeNativeRdmaRequester{
+		local:    readyMountRdmaEndpoint(200),
+		readData: readPayload,
+	}
+
+	var providerConnects atomic.Int64
+	var readDescCalls atomic.Int64
+	var releases atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc(weed_server.VolumeRdmaNativeLocalPath, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		local := readyMountRdmaEndpoint(100)
+		local.ConnectionID = 11
+		_ = json.NewEncoder(w).Encode(local)
+	})
+	mux.HandleFunc(weed_server.VolumeRdmaNativeConnectPath, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		var peer weed_server.VolumeRdmaEndpointInfo
+		if err := json.NewDecoder(r.Body).Decode(&peer); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if !peer.ReadyForConnect() {
+			http.Error(w, "peer not ready", http.StatusBadRequest)
+			return
+		}
+		providerConnects.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]bool{"connected": true})
+	})
+	mux.HandleFunc(weed_server.VolumeRdmaNativeReadDescPath, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		var req weed_server.VolumeRdmaReadRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.ConnectionID != 11 {
+			http.Error(w, fmt.Sprintf("connection_id=%d", req.ConnectionID), http.StatusBadRequest)
+			return
+		}
+		if req.FileID != fileID || req.VolumeID != 7 || req.NeedleID != 0x1234 || req.Cookie != 0x98765432 || req.Size != uint64(len(readPayload)) {
+			http.Error(w, fmt.Sprintf("unexpected read request: %+v", req), http.StatusBadRequest)
+			return
+		}
+		readDescCalls.Add(1)
+		_ = json.NewEncoder(w).Encode(volumeRdmaReadDescResponse{
+			Desc: weed_server.VolumeRdmaDataDesc{
+				RemoteAddr: 0x100000,
+				RKey:       99,
+				Length:     uint32(req.Size),
+			},
+			ConnectionID: req.ConnectionID,
+			SessionID:    uint64(700 + readDescCalls.Load()),
+		})
+	})
+	mux.HandleFunc(weed_server.VolumeRdmaNativeReleaseDescPath, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		var req volumeRdmaReleaseDescRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if req.SessionID == 0 {
+			http.Error(w, "missing session", http.StatusBadRequest)
+			return
+		}
+		releases.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]bool{"released": true})
+	})
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client := newRDMAMountClientBase(rdmaMountModeNative, "", func(ctx context.Context, fid string) ([]string, error) {
+		if fid != fileID {
+			t.Fatalf("lookup fid = %s, want %s", fid, fileID)
+		}
+		return []string{server.URL + "/" + fid}, nil
+	}, 4, 1000)
+	client.httpClient = server.Client()
+	client.nativeRequester = requester
+
+	for i := 0; i < 2; i++ {
+		var out bytes.Buffer
+		n, isRDMA, err := client.ReadNeedleTo(context.Background(), fileID, 0, uint64(len(readPayload)), &out)
+		if err != nil {
+			t.Fatalf("ReadNeedleTo attempt %d: %v", i+1, err)
+		}
+		if !isRDMA {
+			t.Fatalf("ReadNeedleTo attempt %d did not report RDMA", i+1)
+		}
+		if n != int64(len(readPayload)) || out.String() != string(readPayload) {
+			t.Fatalf("attempt %d data mismatch: n=%d data=%q", i+1, n, out.String())
+		}
+	}
+
+	if requester.localCalls.Load() != 1 || requester.connects.Load() != 1 || providerConnects.Load() != 1 {
+		t.Fatalf("handshake was not cached: requesterLocal=%d requesterConnect=%d providerConnect=%d",
+			requester.localCalls.Load(), requester.connects.Load(), providerConnects.Load())
+	}
+	if readDescCalls.Load() != 2 || requester.readCalls.Load() != 2 || releases.Load() != 2 {
+		t.Fatalf("read/release counts: readDesc=%d requesterRead=%d releases=%d",
+			readDescCalls.Load(), requester.readCalls.Load(), releases.Load())
+	}
+	if requester.lastReadID.Load() != 1 {
+		t.Fatalf("requester read connection id = %d, want 1", requester.lastReadID.Load())
+	}
 }
 
 func TestRDMAMountClient_WriteNeedle(t *testing.T) {

@@ -46,18 +46,23 @@ type MountOptions struct {
 
 	// RDMA acceleration options
 	rdmaEnabled       *bool
+	rdmaMode          *string
 	rdmaSidecarAddr   *string
 	rdmaFallback      *bool
 	rdmaReadOnly      *bool
 	rdmaMaxConcurrent *int
 	rdmaTimeoutMs     *int
+	rdmaDevice        *string
+	rdmaPort          *int
+	rdmaGIDIndex      *int
+	rdmaServiceLevel  *int
 
 	// Peer chunk sharing options (design-weed-mount-peer-chunk-sharing.md).
-	peerEnabled      *bool
-	peerListen       *string
-	peerAdvertise    *string
-	peerDataCenter   *string
-	peerRack         *string
+	peerEnabled    *bool
+	peerListen     *string
+	peerAdvertise  *string
+	peerDataCenter *string
+	peerRack       *string
 
 	dirIdleEvictSec *int
 
@@ -132,11 +137,16 @@ func init() {
 
 	// RDMA acceleration flags
 	mountOptions.rdmaEnabled = cmdMount.Flag.Bool("rdma.enabled", false, "enable RDMA acceleration for reads")
+	mountOptions.rdmaMode = cmdMount.Flag.String("rdma.mode", "sidecar", "<experimental> RDMA mount mode: sidecar or native")
 	mountOptions.rdmaSidecarAddr = cmdMount.Flag.String("rdma.sidecar", "", "RDMA sidecar address (e.g., localhost:8081)")
 	mountOptions.rdmaFallback = cmdMount.Flag.Bool("rdma.fallback", true, "fallback to HTTP when RDMA fails")
 	mountOptions.rdmaReadOnly = cmdMount.Flag.Bool("rdma.readOnly", false, "use RDMA for reads only (writes use HTTP)")
 	mountOptions.rdmaMaxConcurrent = cmdMount.Flag.Int("rdma.maxConcurrent", 64, "max concurrent RDMA operations")
 	mountOptions.rdmaTimeoutMs = cmdMount.Flag.Int("rdma.timeoutMs", 5000, "RDMA operation timeout in milliseconds")
+	mountOptions.rdmaDevice = cmdMount.Flag.String("rdma.device", "auto", "<experimental> RDMA device name for native mount mode")
+	mountOptions.rdmaPort = cmdMount.Flag.Int("rdma.port", 1, "<experimental> RDMA HCA port for native mount mode")
+	mountOptions.rdmaGIDIndex = cmdMount.Flag.Int("rdma.gidIndex", 0, "<experimental> RDMA GID index for native mount mode")
+	mountOptions.rdmaServiceLevel = cmdMount.Flag.Int("rdma.serviceLevel", 0, "<experimental> RDMA service level for native mount mode")
 
 	// Peer chunk sharing flags.
 	mountOptions.peerEnabled = cmdMount.Flag.Bool("peer.enable", false, "opt in to peer chunk sharing — mount serves its chunk cache to other mounts and fetches from peers instead of volume servers when available")

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -70,6 +71,11 @@ func (e *fakeVolumeRdmaEndpoint) RequesterConnectEndpointFor(ctx context.Context
 
 func (e *fakeVolumeRdmaEndpoint) ReadRemoteFor(ctx context.Context, connectionID uint64, desc VolumeRdmaDataDesc, timeout time.Duration) ([]byte, error) {
 	return append([]byte(nil), e.requesterReadData...), nil
+}
+
+func (e *fakeVolumeRdmaEndpoint) ReadRemoteToFor(ctx context.Context, connectionID uint64, desc VolumeRdmaDataDesc, timeout time.Duration, dst io.Writer) error {
+	_, err := dst.Write(e.requesterReadData)
+	return err
 }
 
 func (e *fakeVolumeRdmaEndpoint) RegisterWriteBufferFor(ctx context.Context, connectionID uint64, size uint64) (VolumeRdmaRegisteredBuffer, error) {

@@ -10,16 +10,27 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
+	weed_server "github.com/seaweedfs/seaweedfs/weed/server"
+	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/wdclient"
+)
+
+const (
+	rdmaMountModeSidecar = "sidecar"
+	rdmaMountModeNative  = "native"
+	maxInt               = int(^uint(0) >> 1)
+	maxUint32            = uint64(^uint32(0))
 )
 
 // RDMAMountClient provides RDMA acceleration for SeaweedFS mount operations
 type RDMAMountClient struct {
 	sidecarAddr   string
+	mode          string
 	httpClient    *http.Client
 	maxConcurrent int
 	timeout       time.Duration
@@ -27,6 +38,12 @@ type RDMAMountClient struct {
 
 	// Volume lookup
 	lookupFileIdFn wdclient.LookupFileIdFunctionType
+
+	nativeRequester    weed_server.VolumeRdmaRequesterEndpoint
+	nativeServiceLevel uint32
+	nativeConnMu       sync.Mutex
+	nativeConnections  map[string]*rdmaNativeConnection
+	nativeNextConnID   atomic.Uint64
 
 	// Read statistics
 	totalRequests   atomic.Int64
@@ -41,6 +58,23 @@ type RDMAMountClient struct {
 	failedWrites        atomic.Int64
 	totalBytesWritten   atomic.Int64
 	totalWriteLatencyNs atomic.Int64
+}
+
+type rdmaNativeConnection struct {
+	volumeServer          string
+	providerConnectionID  uint64
+	requesterConnectionID uint64
+	connectedAt           time.Time
+}
+
+type volumeRdmaReadDescResponse struct {
+	Desc         weed_server.VolumeRdmaDataDesc `json:"desc"`
+	ConnectionID uint64                         `json:"connection_id,omitempty"`
+	SessionID    uint64                         `json:"session_id,omitempty"`
+}
+
+type volumeRdmaReleaseDescRequest struct {
+	SessionID uint64 `json:"session_id"`
 }
 
 // RDMAReadRequest represents a request to read data via RDMA
@@ -88,26 +122,73 @@ type RDMAHealthResponse struct {
 
 // NewRDMAMountClient creates a new RDMA client for mount operations
 func NewRDMAMountClient(sidecarAddr string, lookupFileIdFn wdclient.LookupFileIdFunctionType, maxConcurrent int, timeoutMs int) (*RDMAMountClient, error) {
-	client := &RDMAMountClient{
-		sidecarAddr:   sidecarAddr,
-		maxConcurrent: maxConcurrent,
-		timeout:       time.Duration(timeoutMs) * time.Millisecond,
-		httpClient: &http.Client{
-			Timeout: time.Duration(timeoutMs) * time.Millisecond,
-		},
-		semaphore:      make(chan struct{}, maxConcurrent),
-		lookupFileIdFn: lookupFileIdFn,
-	}
+	client := newRDMAMountClientBase(rdmaMountModeSidecar, sidecarAddr, lookupFileIdFn, maxConcurrent, timeoutMs)
 
 	// Test connectivity and RDMA availability
 	if err := client.healthCheck(); err != nil {
 		return nil, fmt.Errorf("RDMA sidecar health check failed: %w", err)
 	}
 
-	glog.Infof("RDMA mount client initialized: sidecar=%s, maxConcurrent=%d, timeout=%v",
-		sidecarAddr, maxConcurrent, client.timeout)
+	glog.Infof("RDMA mount client initialized: mode=%s, sidecar=%s, maxConcurrent=%d, timeout=%v",
+		client.mode, sidecarAddr, maxConcurrent, client.timeout)
 
 	return client, nil
+}
+
+// NewNativeRDMAMountClient creates an in-process native RDMA requester for mount reads.
+func NewNativeRDMAMountClient(lookupFileIdFn wdclient.LookupFileIdFunctionType, maxConcurrent int, timeoutMs int, device string, port uint32, gidIndex uint32, serviceLevel uint32) (*RDMAMountClient, error) {
+	if serviceLevel > 15 {
+		return nil, fmt.Errorf("RDMA service level must be 0..15")
+	}
+	endpoint, _, err := weed_server.NewEmbeddedVolumeRdmaTransport(weed_server.VolumeRdmaEmbeddedConfig{
+		Device:   strings.TrimSpace(device),
+		Port:     port,
+		GIDIndex: gidIndex,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("native RDMA mount requester init failed: %w", err)
+	}
+	requester, ok := endpoint.(weed_server.VolumeRdmaRequesterEndpoint)
+	if !ok {
+		if closer, closeOK := endpoint.(interface{ Close() error }); closeOK {
+			_ = closer.Close()
+		}
+		return nil, fmt.Errorf("native RDMA endpoint %T does not support requester reads", endpoint)
+	}
+
+	client := newRDMAMountClientBase(rdmaMountModeNative, "", lookupFileIdFn, maxConcurrent, timeoutMs)
+	client.nativeRequester = requester
+	client.nativeServiceLevel = serviceLevel
+
+	glog.Infof("RDMA mount client initialized: mode=%s, device=%s, port=%d, gidIndex=%d, serviceLevel=%d, maxConcurrent=%d, timeout=%v",
+		client.mode, strings.TrimSpace(device), port, gidIndex, serviceLevel, client.maxConcurrent, client.timeout)
+
+	return client, nil
+}
+
+func newRDMAMountClientBase(mode string, sidecarAddr string, lookupFileIdFn wdclient.LookupFileIdFunctionType, maxConcurrent int, timeoutMs int) *RDMAMountClient {
+	if maxConcurrent <= 0 {
+		maxConcurrent = 64
+	}
+	if timeoutMs <= 0 {
+		timeoutMs = 5000
+	}
+	mode = strings.TrimSpace(mode)
+	if mode == "" {
+		mode = rdmaMountModeSidecar
+	}
+	return &RDMAMountClient{
+		sidecarAddr:   sidecarAddr,
+		mode:          mode,
+		maxConcurrent: maxConcurrent,
+		timeout:       time.Duration(timeoutMs) * time.Millisecond,
+		httpClient: &http.Client{
+			Timeout: time.Duration(timeoutMs) * time.Millisecond,
+		},
+		semaphore:         make(chan struct{}, maxConcurrent),
+		lookupFileIdFn:    lookupFileIdFn,
+		nativeConnections: make(map[string]*rdmaNativeConnection),
+	}
 }
 
 // lookupVolumeLocationByFileID finds the best volume server for a given file ID
@@ -180,12 +261,28 @@ func (c *RDMAMountClient) healthCheck() error {
 
 // ReadNeedle reads data from a specific needle using RDMA acceleration
 func (c *RDMAMountClient) ReadNeedle(ctx context.Context, fileID string, offset, size uint64) ([]byte, bool, error) {
+	var buf bytes.Buffer
+	if size <= uint64(maxInt) {
+		buf.Grow(int(size))
+	}
+	_, isRDMA, err := c.ReadNeedleTo(ctx, fileID, offset, size, &buf)
+	if err != nil {
+		return nil, false, err
+	}
+	return buf.Bytes(), isRDMA, nil
+}
+
+// ReadNeedleTo streams data from a specific needle into dst using RDMA acceleration.
+func (c *RDMAMountClient) ReadNeedleTo(ctx context.Context, fileID string, offset, size uint64, dst io.Writer) (int64, bool, error) {
+	if dst == nil {
+		return 0, false, fmt.Errorf("RDMA read requires destination writer")
+	}
 	// Acquire semaphore for concurrency control
 	select {
 	case c.semaphore <- struct{}{}:
 		defer func() { <-c.semaphore }()
 	case <-ctx.Done():
-		return nil, false, ctx.Err()
+		return 0, false, ctx.Err()
 	}
 
 	c.totalRequests.Add(1)
@@ -195,7 +292,38 @@ func (c *RDMAMountClient) ReadNeedle(ctx context.Context, fileID string, offset,
 	volumeServer, err := c.lookupVolumeLocationByFileID(ctx, fileID)
 	if err != nil {
 		c.failedReads.Add(1)
-		return nil, false, fmt.Errorf("failed to lookup volume for file %s: %w", fileID, err)
+		return 0, false, fmt.Errorf("failed to lookup volume for file %s: %w", fileID, err)
+	}
+
+	var written int64
+	var isRDMA bool
+	switch c.mode {
+	case rdmaMountModeNative:
+		written, err = c.readNeedleNativeTo(ctx, volumeServer, fileID, offset, size, dst)
+		isRDMA = err == nil
+	default:
+		written, isRDMA, err = c.readNeedleSidecarTo(ctx, volumeServer, fileID, offset, size, dst)
+	}
+
+	duration := time.Since(startTime)
+	c.totalLatencyNs.Add(duration.Nanoseconds())
+	if err != nil {
+		c.failedReads.Add(1)
+		return written, false, err
+	}
+
+	c.successfulReads.Add(1)
+	c.totalBytesRead.Add(written)
+
+	glog.V(4).Infof("RDMA read completed: mode=%s, fileID=%s, offset=%d, requested=%d, read=%d, duration=%v, rdma=%v, volumeServer=%s",
+		c.mode, fileID, offset, size, written, duration, isRDMA, volumeServer)
+
+	return written, isRDMA, nil
+}
+
+func (c *RDMAMountClient) readNeedleSidecarTo(ctx context.Context, volumeServer string, fileID string, offset, size uint64, dst io.Writer) (int64, bool, error) {
+	if strings.TrimSpace(c.sidecarAddr) == "" {
+		return 0, false, fmt.Errorf("RDMA sidecar address is required")
 	}
 
 	// Prepare request URL with file_id parameter (simpler than individual components)
@@ -204,80 +332,283 @@ func (c *RDMAMountClient) ReadNeedle(ctx context.Context, fileID string, offset,
 
 	req, err := http.NewRequestWithContext(ctx, "GET", reqURL, nil)
 	if err != nil {
-		c.failedReads.Add(1)
-		return nil, false, fmt.Errorf("failed to create RDMA request: %w", err)
+		return 0, false, fmt.Errorf("failed to create RDMA request: %w", err)
 	}
 
 	// Execute request
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		c.failedReads.Add(1)
-		return nil, false, fmt.Errorf("RDMA request failed: %w", err)
+		return 0, false, fmt.Errorf("RDMA request failed: %w", err)
 	}
 	defer resp.Body.Close()
 
-	duration := time.Since(startTime)
-	c.totalLatencyNs.Add(duration.Nanoseconds())
-
 	if resp.StatusCode != http.StatusOK {
-		c.failedReads.Add(1)
 		body, _ := io.ReadAll(resp.Body)
-		return nil, false, fmt.Errorf("RDMA read failed with status %s: %s", resp.Status, string(body))
+		return 0, false, fmt.Errorf("RDMA read failed with status %s: %s", resp.Status, string(body))
 	}
 
 	// Check if response indicates RDMA was used
-	contentType := resp.Header.Get("Content-Type")
 	isRDMA := resp.Header.Get("X-RDMA-Used") == "true"
 
 	// Check for zero-copy temp file optimization
 	tempFilePath := resp.Header.Get("X-Temp-File")
 	useTempFile := resp.Header.Get("X-Use-Temp-File") == "true"
 
-	var data []byte
-
-	var n int
 	if useTempFile && tempFilePath != "" {
 		// Zero-copy path: read from temp file (page cache)
 		glog.V(4).Infof("🔥 Using zero-copy temp file: %s", tempFilePath)
 
-		// Allocate buffer for temp file read
-		var bufferSize uint64 = 1024 * 1024 // Default 1MB
-		if size > 0 {
-			bufferSize = size
-		}
-		buffer := make([]byte, bufferSize)
-
-		n, err = c.readFromTempFile(tempFilePath, buffer)
+		n, err := c.copyFromTempFile(tempFilePath, dst)
 		if err != nil {
 			glog.V(2).Infof("Zero-copy failed, falling back to HTTP body: %v", err)
 			// Fall back to reading HTTP body
-			data, err = io.ReadAll(resp.Body)
-		} else {
-			data = buffer[:n]
-			glog.V(4).Infof("🔥 Zero-copy successful: %d bytes from page cache", n)
+			n, err = io.Copy(dst, resp.Body)
 		}
-
-		// Important: Cleanup temp file after reading (consumer responsibility)
-		// This prevents accumulation of temp files in /tmp/rdma-cache
 		go c.cleanupTempFile(tempFilePath)
-	} else {
-		// Regular path: read from HTTP response body
-		data, err = io.ReadAll(resp.Body)
+		if err != nil {
+			return n, false, fmt.Errorf("failed to read RDMA response: %w", err)
+		}
+		return n, isRDMA, nil
 	}
 
+	n, err := io.Copy(dst, resp.Body)
 	if err != nil {
-		c.failedReads.Add(1)
-		return nil, false, fmt.Errorf("failed to read RDMA response: %w", err)
+		return n, false, fmt.Errorf("failed to read RDMA response: %w", err)
+	}
+	return n, isRDMA, nil
+}
+
+func (c *RDMAMountClient) readNeedleNativeTo(ctx context.Context, volumeServer string, fileID string, offset, size uint64, dst io.Writer) (int64, error) {
+	if c.nativeRequester == nil {
+		return 0, fmt.Errorf("native RDMA requester is not configured")
+	}
+	if size == 0 {
+		return 0, nil
+	}
+	if size > maxUint32 {
+		return 0, fmt.Errorf("native RDMA read is too large for one descriptor: %d", size)
 	}
 
-	c.successfulReads.Add(1)
-	c.totalBytesRead.Add(int64(len(data)))
+	fid, err := needle.ParseFileIdFromString(fileID)
+	if err != nil {
+		return 0, fmt.Errorf("parse file id %s: %w", fileID, err)
+	}
 
-	// Log successful operation
-	glog.V(4).Infof("RDMA read completed: fileID=%s, size=%d, duration=%v, rdma=%v, session=%s, source=%s, dataSource=%s, contentType=%s",
-		fileID, size, duration, isRDMA, resp.Header.Get("X-RDMA-Session-Used"), resp.Header.Get("X-Source"), resp.Header.Get("X-Data-Source"), contentType)
+	conn, err := c.ensureNativeConnection(ctx, volumeServer)
+	if err != nil {
+		return 0, err
+	}
 
-	return data, isRDMA, nil
+	var readDesc volumeRdmaReadDescResponse
+	err = c.doNativeJSON(ctx, http.MethodPost, volumeServer, weed_server.VolumeRdmaNativeReadDescPath, nil, weed_server.VolumeRdmaReadRequest{
+		ConnectionID: conn.providerConnectionID,
+		FileID:       fileID,
+		VolumeID:     uint32(fid.VolumeId),
+		NeedleID:     uint64(fid.Key),
+		Cookie:       uint32(fid.Cookie),
+		Offset:       offset,
+		Size:         size,
+	}, &readDesc)
+	if err != nil {
+		return 0, fmt.Errorf("native RDMA read descriptor failed: %w", err)
+	}
+	if readDesc.SessionID == 0 {
+		return 0, fmt.Errorf("native RDMA read descriptor missing session_id")
+	}
+	if readDesc.Desc.RemoteAddr == 0 || readDesc.Desc.RKey == 0 || readDesc.Desc.Length == 0 {
+		_ = c.releaseNativeReadDesc(context.Background(), volumeServer, readDesc.SessionID)
+		return 0, fmt.Errorf("native RDMA read descriptor is not exportable")
+	}
+	if uint64(readDesc.Desc.Length) < size {
+		_ = c.releaseNativeReadDesc(context.Background(), volumeServer, readDesc.SessionID)
+		return 0, fmt.Errorf("native RDMA read descriptor length %d is smaller than requested size %d", readDesc.Desc.Length, size)
+	}
+	readDesc.Desc.Length = uint32(size)
+
+	counter := &countingWriter{w: dst}
+	readErr := c.nativeRequester.ReadRemoteToFor(ctx, conn.requesterConnectionID, readDesc.Desc, c.timeout, counter)
+	releaseErr := c.releaseNativeReadDesc(context.Background(), volumeServer, readDesc.SessionID)
+	if readErr != nil {
+		c.dropNativeConnection(volumeServer, conn)
+		return counter.n, fmt.Errorf("native RDMA READ failed: %w", readErr)
+	}
+	if releaseErr != nil {
+		glog.V(2).Infof("native RDMA read descriptor release failed for %s session=%d: %v", volumeServer, readDesc.SessionID, releaseErr)
+	}
+	if counter.n != int64(size) {
+		return counter.n, fmt.Errorf("native RDMA READ copied %d bytes, expected %d", counter.n, size)
+	}
+	return counter.n, nil
+}
+
+func (c *RDMAMountClient) ensureNativeConnection(ctx context.Context, volumeServer string) (*rdmaNativeConnection, error) {
+	c.nativeConnMu.Lock()
+	defer c.nativeConnMu.Unlock()
+
+	if conn := c.nativeConnections[volumeServer]; conn != nil {
+		return conn, nil
+	}
+
+	connectionID := c.nextNativeConnectionID()
+	providerLocal, err := c.getNativeLocalEndpoint(ctx, volumeServer, connectionID)
+	if err != nil {
+		return nil, fmt.Errorf("native RDMA provider local endpoint failed: %w", err)
+	}
+	providerConnectionID := connectionID
+	if providerLocal.ConnectionID != 0 {
+		providerConnectionID = providerLocal.ConnectionID
+	}
+
+	requesterLocal, requesterConnectionID, err := c.nativeRequester.RequesterLocalEndpointFor(ctx, connectionID)
+	if err != nil {
+		return nil, fmt.Errorf("native RDMA requester local endpoint failed: %w", err)
+	}
+	if requesterConnectionID == 0 {
+		requesterConnectionID = connectionID
+	}
+	if !requesterLocal.ReadyForConnect() {
+		return nil, fmt.Errorf("native RDMA requester endpoint is not ready")
+	}
+
+	if err := c.connectNativeProvider(ctx, volumeServer, providerConnectionID, requesterLocal); err != nil {
+		c.dropNativeConnectionLocked(volumeServer, requesterConnectionID, providerConnectionID)
+		return nil, fmt.Errorf("native RDMA provider connect failed: %w", err)
+	}
+	providerRemote, err := providerLocal.RemoteInfo(c.nativeServiceLevel)
+	if err != nil {
+		c.dropNativeConnectionLocked(volumeServer, requesterConnectionID, providerConnectionID)
+		return nil, fmt.Errorf("native RDMA provider endpoint metadata failed: %w", err)
+	}
+	if err := c.nativeRequester.RequesterConnectEndpointFor(ctx, requesterConnectionID, providerRemote); err != nil {
+		c.dropNativeConnectionLocked(volumeServer, requesterConnectionID, providerConnectionID)
+		return nil, fmt.Errorf("native RDMA requester connect failed: %w", err)
+	}
+
+	conn := &rdmaNativeConnection{
+		volumeServer:          volumeServer,
+		providerConnectionID:  providerConnectionID,
+		requesterConnectionID: requesterConnectionID,
+		connectedAt:           time.Now(),
+	}
+	c.nativeConnections[volumeServer] = conn
+	glog.Infof("native RDMA mount connected: volumeServer=%s providerConnectionID=%d requesterConnectionID=%d", volumeServer, providerConnectionID, requesterConnectionID)
+	return conn, nil
+}
+
+func (c *RDMAMountClient) nextNativeConnectionID() uint64 {
+	id := c.nativeNextConnID.Add(1)
+	if id == 0 {
+		id = c.nativeNextConnID.Add(1)
+	}
+	return id
+}
+
+func (c *RDMAMountClient) getNativeLocalEndpoint(ctx context.Context, volumeServer string, connectionID uint64) (weed_server.VolumeRdmaEndpointInfo, error) {
+	var endpoint weed_server.VolumeRdmaEndpointInfo
+	q := url.Values{}
+	if connectionID != 0 {
+		q.Set("connection_id", fmt.Sprintf("%d", connectionID))
+	}
+	if err := c.doNativeJSON(ctx, http.MethodGet, volumeServer, weed_server.VolumeRdmaNativeLocalPath, q, nil, &endpoint); err != nil {
+		return endpoint, err
+	}
+	if !endpoint.ReadyForConnect() {
+		return endpoint, fmt.Errorf("native RDMA provider endpoint is not ready")
+	}
+	return endpoint, nil
+}
+
+func (c *RDMAMountClient) connectNativeProvider(ctx context.Context, volumeServer string, connectionID uint64, requesterLocal weed_server.VolumeRdmaEndpointInfo) error {
+	q := url.Values{}
+	if connectionID != 0 {
+		q.Set("connection_id", fmt.Sprintf("%d", connectionID))
+	}
+	if c.nativeServiceLevel != 0 {
+		q.Set("sl", fmt.Sprintf("%d", c.nativeServiceLevel))
+	}
+	var resp map[string]bool
+	return c.doNativeJSON(ctx, http.MethodPost, volumeServer, weed_server.VolumeRdmaNativeConnectPath, q, requesterLocal, &resp)
+}
+
+func (c *RDMAMountClient) releaseNativeReadDesc(ctx context.Context, volumeServer string, sessionID uint64) error {
+	if sessionID == 0 {
+		return nil
+	}
+	releaseCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+	var resp map[string]bool
+	return c.doNativeJSON(releaseCtx, http.MethodPost, volumeServer, weed_server.VolumeRdmaNativeReleaseDescPath, nil, volumeRdmaReleaseDescRequest{SessionID: sessionID}, &resp)
+}
+
+func (c *RDMAMountClient) doNativeJSON(ctx context.Context, method string, volumeServer string, endpointPath string, query url.Values, body interface{}, out interface{}) error {
+	base := strings.TrimRight(volumeServer, "/")
+	reqURL := base + endpointPath
+	if len(query) != 0 {
+		reqURL += "?" + query.Encode()
+	}
+
+	var bodyReader io.Reader
+	if body != nil {
+		payload, err := json.Marshal(body)
+		if err != nil {
+			return err
+		}
+		bodyReader = bytes.NewReader(payload)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, reqURL, bodyReader)
+	if err != nil {
+		return err
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		payload, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("%s %s failed with status %s: %s", method, endpointPath, resp.Status, strings.TrimSpace(string(payload)))
+	}
+	if out == nil {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return nil
+	}
+	if err := json.NewDecoder(resp.Body).Decode(out); err != nil {
+		return fmt.Errorf("decode %s response: %w", endpointPath, err)
+	}
+	return nil
+}
+
+func (c *RDMAMountClient) dropNativeConnection(volumeServer string, conn *rdmaNativeConnection) {
+	c.nativeConnMu.Lock()
+	defer c.nativeConnMu.Unlock()
+	if conn == nil {
+		delete(c.nativeConnections, volumeServer)
+		return
+	}
+	c.dropNativeConnectionLocked(volumeServer, conn.requesterConnectionID, conn.providerConnectionID)
+}
+
+func (c *RDMAMountClient) dropNativeConnectionLocked(volumeServer string, requesterConnectionID uint64, providerConnectionID uint64) {
+	if existing := c.nativeConnections[volumeServer]; existing != nil {
+		if requesterConnectionID == 0 || existing.requesterConnectionID == requesterConnectionID {
+			delete(c.nativeConnections, volumeServer)
+		}
+	}
+	glog.V(2).Infof("native RDMA mount connection dropped: volumeServer=%s providerConnectionID=%d requesterConnectionID=%d", volumeServer, providerConnectionID, requesterConnectionID)
+}
+
+type countingWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (w *countingWriter) Write(p []byte) (int, error) {
+	n, err := w.w.Write(p)
+	w.n += int64(n)
+	return n, err
 }
 
 // WriteNeedle writes data to a volume server via the RDMA sidecar
@@ -397,6 +728,9 @@ func (c *RDMAMountClient) GetStats() map[string]interface{} {
 	failedWrites := c.failedWrites.Load()
 	totalBytesWritten := c.totalBytesWritten.Load()
 	totalWriteLatencyNs := c.totalWriteLatencyNs.Load()
+	c.nativeConnMu.Lock()
+	nativeConnections := len(c.nativeConnections)
+	c.nativeConnMu.Unlock()
 
 	readSuccessRate := float64(0)
 	avgReadLatencyNs := int64(0)
@@ -413,9 +747,11 @@ func (c *RDMAMountClient) GetStats() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
+		"mode":                   c.mode,
 		"sidecar_addr":           c.sidecarAddr,
 		"max_concurrent":         c.maxConcurrent,
 		"timeout_ms":             int(c.timeout / time.Millisecond),
+		"native_connections":     nativeConnections,
 		"total_read_requests":    totalRequests,
 		"successful_reads":       successfulReads,
 		"failed_reads":           failedReads,
@@ -440,17 +776,29 @@ func (c *RDMAMountClient) Close() error {
 	stats := c.GetStats()
 	glog.Infof("RDMA mount client closing: %+v", stats)
 
+	if closer, ok := c.nativeRequester.(interface{ Close() error }); ok {
+		return closer.Close()
+	}
 	return nil
 }
 
 // IsHealthy checks if the RDMA sidecar is currently healthy
 func (c *RDMAMountClient) IsHealthy() bool {
+	if c.mode == rdmaMountModeNative {
+		if c.nativeRequester == nil {
+			return false
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), c.timeout)
+		defer cancel()
+		local, _, err := c.nativeRequester.RequesterLocalEndpointFor(ctx, 0)
+		return err == nil && local.ReadyForConnect()
+	}
 	err := c.healthCheck()
 	return err == nil
 }
 
-// readFromTempFile performs zero-copy read from temp file using page cache
-func (c *RDMAMountClient) readFromTempFile(tempFilePath string, buffer []byte) (int, error) {
+// copyFromTempFile performs zero-copy-ish read from temp file using page cache
+func (c *RDMAMountClient) copyFromTempFile(tempFilePath string, dst io.Writer) (int64, error) {
 	if tempFilePath == "" {
 		return 0, fmt.Errorf("empty temp file path")
 	}
@@ -462,9 +810,9 @@ func (c *RDMAMountClient) readFromTempFile(tempFilePath string, buffer []byte) (
 	}
 	defer file.Close()
 
-	// Read from temp file (this should be served from page cache)
-	n, err := file.Read(buffer)
-	if err != nil && err != io.EOF {
+	// Copy from temp file (this should be served from page cache)
+	n, err := io.Copy(dst, file)
+	if err != nil {
 		return n, fmt.Errorf("failed to read from temp file: %w", err)
 	}
 

@@ -177,6 +177,29 @@ func (c *VolumeRdmaEngineClient) ReadRemoteFor(ctx context.Context, connectionID
 	return resp.Data, nil
 }
 
+func (c *VolumeRdmaEngineClient) ReadRemoteToFor(ctx context.Context, connectionID uint64, desc VolumeRdmaDataDesc, timeout time.Duration, dst io.Writer) error {
+	if dst == nil {
+		return fmt.Errorf("native RDMA read_remote requires destination writer")
+	}
+	timeoutMs := uint64(timeout.Milliseconds())
+	if timeoutMs == 0 && timeout > 0 {
+		timeoutMs = 1
+	}
+	written, err := c.roundTripSidebandToWriter(ctx, volumeRdmaEngineRequest{
+		Op:           volumeRdmaEngineOpReadRemote,
+		ConnectionID: connectionID,
+		Desc:         &desc,
+		TimeoutMs:    timeoutMs,
+	}, dst)
+	if err != nil {
+		return err
+	}
+	if written != uint64(desc.Length) {
+		return fmt.Errorf("%w: read_remote streamed %d bytes for %d byte descriptor", ErrVolumeRdmaEngineUnavailable, written, desc.Length)
+	}
+	return nil
+}
+
 func (c *VolumeRdmaEngineClient) RegisterReadBuffer(ctx context.Context, data []byte) (VolumeRdmaRegisteredBuffer, error) {
 	return c.RegisterReadBufferFor(ctx, 0, data)
 }

@@ -148,7 +148,8 @@ func (fh *FileHandle) tryRDMARead(ctx context.Context, fileSize int64, buff []by
 		targetChunk.FileId, targetChunk.FileId, chunkOffset, readSize)
 
 	// Try RDMA read using file ID directly (more efficient)
-	data, isRDMA, err := fh.wfs.rdmaClient.ReadNeedle(ctx, targetChunk.FileId, uint64(chunkOffset), uint64(readSize))
+	writer := &fixedBufferWriter{buf: buff[:readSize]}
+	totalRead, isRDMA, err := fh.wfs.rdmaClient.ReadNeedleTo(ctx, targetChunk.FileId, uint64(chunkOffset), uint64(readSize), writer)
 	if err != nil {
 		return 0, 0, fmt.Errorf("RDMA read failed: %w", err)
 	}
@@ -157,9 +158,30 @@ func (fh *FileHandle) tryRDMARead(ctx context.Context, fileSize int64, buff []by
 		return 0, 0, fmt.Errorf("RDMA not available for chunk")
 	}
 
-	// Copy data to buffer
-	copied := copy(buff, data)
-	return int64(copied), targetChunk.ModifiedTsNs, nil
+	return totalRead, targetChunk.ModifiedTsNs, nil
+}
+
+type fixedBufferWriter struct {
+	buf []byte
+	n   int
+}
+
+func (w *fixedBufferWriter) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	remaining := len(w.buf) - w.n
+	if remaining <= 0 {
+		return 0, io.ErrShortWrite
+	}
+	if len(p) > remaining {
+		copied := copy(w.buf[w.n:], p[:remaining])
+		w.n += copied
+		return copied, io.ErrShortWrite
+	}
+	copied := copy(w.buf[w.n:], p)
+	w.n += copied
+	return copied, nil
 }
 
 func (fh *FileHandle) downloadRemoteEntry(entry *LockedEntry) error {

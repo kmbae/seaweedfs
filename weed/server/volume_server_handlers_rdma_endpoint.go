@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"strconv"
 	"strings"
@@ -49,6 +50,7 @@ type VolumeRdmaRequesterEndpoint interface {
 	RequesterConnectEndpoint(context.Context, VolumeRdmaRemoteInfo) error
 	RequesterConnectEndpointFor(context.Context, uint64, VolumeRdmaRemoteInfo) error
 	ReadRemoteFor(context.Context, uint64, VolumeRdmaDataDesc, time.Duration) ([]byte, error)
+	ReadRemoteToFor(context.Context, uint64, VolumeRdmaDataDesc, time.Duration, io.Writer) error
 }
 
 type VolumeRdmaEndpointInfo struct {

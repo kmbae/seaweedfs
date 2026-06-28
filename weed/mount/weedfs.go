@@ -2,10 +2,12 @@ package mount
 
 import (
 	"context"
+	"fmt"
 	"math/rand/v2"
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -76,11 +78,16 @@ type Option struct {
 
 	// RDMA acceleration options
 	RdmaEnabled       bool
+	RdmaMode          string
 	RdmaSidecarAddr   string
 	RdmaFallback      bool
 	RdmaReadOnly      bool
 	RdmaMaxConcurrent int
 	RdmaTimeoutMs     int
+	RdmaDevice        string
+	RdmaPort          int
+	RdmaGIDIndex      int
+	RdmaServiceLevel  int
 
 	// Peer chunk sharing options (design-weed-mount-peer-chunk-sharing.md).
 	// When PeerEnabled is false (default), the mount runs exactly as today.
@@ -121,43 +128,43 @@ type WFS struct {
 	fuse.RawFileSystem
 	mount_pb.UnimplementedSeaweedMountServer
 	fs.Inode
-	option               *Option
-	metaCache            *meta_cache.MetaCache
-	stats                statsCache
-	chunkCache           *chunk_cache.TieredChunkCache
+	option                *Option
+	metaCache             *meta_cache.MetaCache
+	stats                 statsCache
+	chunkCache            *chunk_cache.TieredChunkCache
 	writeBufferAccountant *page_writer.WriteBufferAccountant
-	signature            int32
-	concurrentWriters    *util.LimitedConcurrentExecutor
-	copyBufferPool       sync.Pool
-	concurrentCopiersSem chan struct{}
-	inodeToPath          *InodeToPath
-	fhMap                *FileHandleToInode
-	dhMap                *DirectoryHandleToInode
-	fuseServer           *fuse.Server
-	IsOverQuota          bool
-	fhLockTable          *util.LockTable[FileHandleId]
-	hardLinkLockTable    *util.LockTable[string]
-	posixLocks           *PosixLockTable
-	rdmaClient           *RDMAMountClient
-	peerRegistrar        *PeerRegistrar
-	peerDirectory        *PeerDirectory
-	peerGrpcServer       *PeerGrpcServer
-	peerAnnouncer        *PeerAnnouncer
-	peerConnPool         *PeerConnPool
-	peerDirectoryStop    chan struct{} // closed on unmount to stop the sweeper goroutine
-	FilerConf            *filer.FilerConf
-	filerClient          *wdclient.FilerClient // Cached volume location client
-	refreshMu            sync.Mutex
-	refreshingDirs       map[util.FullPath]struct{}
-	atimeMu              sync.Mutex
-	atimeMap             map[uint64]time.Time // inode -> atime, in-memory only, bounded
-	dirMtimeMu           sync.Mutex
-	dirMtimeMap          map[uint64]time.Time // inode -> mtime/ctime, in-memory overlay for dirs
-	entryValidSec        uint64 // kernel FUSE entry cache TTL in seconds
-	attrValidSec         uint64 // kernel FUSE attr cache TTL in seconds
-	dirHotWindow         time.Duration
-	dirHotThreshold      int
-	dirIdleEvict         time.Duration
+	signature             int32
+	concurrentWriters     *util.LimitedConcurrentExecutor
+	copyBufferPool        sync.Pool
+	concurrentCopiersSem  chan struct{}
+	inodeToPath           *InodeToPath
+	fhMap                 *FileHandleToInode
+	dhMap                 *DirectoryHandleToInode
+	fuseServer            *fuse.Server
+	IsOverQuota           bool
+	fhLockTable           *util.LockTable[FileHandleId]
+	hardLinkLockTable     *util.LockTable[string]
+	posixLocks            *PosixLockTable
+	rdmaClient            *RDMAMountClient
+	peerRegistrar         *PeerRegistrar
+	peerDirectory         *PeerDirectory
+	peerGrpcServer        *PeerGrpcServer
+	peerAnnouncer         *PeerAnnouncer
+	peerConnPool          *PeerConnPool
+	peerDirectoryStop     chan struct{} // closed on unmount to stop the sweeper goroutine
+	FilerConf             *filer.FilerConf
+	filerClient           *wdclient.FilerClient // Cached volume location client
+	refreshMu             sync.Mutex
+	refreshingDirs        map[util.FullPath]struct{}
+	atimeMu               sync.Mutex
+	atimeMap              map[uint64]time.Time // inode -> atime, in-memory only, bounded
+	dirMtimeMu            sync.Mutex
+	dirMtimeMap           map[uint64]time.Time // inode -> mtime/ctime, in-memory overlay for dirs
+	entryValidSec         uint64               // kernel FUSE entry cache TTL in seconds
+	attrValidSec          uint64               // kernel FUSE attr cache TTL in seconds
+	dirHotWindow          time.Duration
+	dirHotThreshold       int
+	dirIdleEvict          time.Duration
 
 	// openMtimeCache maps inode -> [mtime_sec, mtime_ns] from the last Open.
 	// Used to decide whether to set FOPEN_KEEP_CACHE on subsequent opens.
@@ -246,8 +253,8 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 		atimeMap:          make(map[uint64]time.Time, 8192),
 		openMtimeCache:    make(map[uint64][2]int64, 8192),
 		dirMtimeMap:       make(map[uint64]time.Time, 1024),
-		entryValidSec:    1,
-		attrValidSec:     1,
+		entryValidSec:     1,
+		attrValidSec:      1,
 		dirHotWindow:      dirHotWindow,
 		dirHotThreshold:   dirHotThreshold,
 		dirIdleEvict:      dirIdleEvict,
@@ -370,19 +377,44 @@ func NewSeaweedFileSystem(option *Option) *WFS {
 	})
 
 	// Initialize RDMA client if enabled
-	if option.RdmaEnabled && option.RdmaSidecarAddr != "" {
-		rdmaClient, err := NewRDMAMountClient(
-			option.RdmaSidecarAddr,
-			wfs.LookupFn(),
-			option.RdmaMaxConcurrent,
-			option.RdmaTimeoutMs,
-		)
+	if option.RdmaEnabled {
+		mode := strings.ToLower(strings.TrimSpace(option.RdmaMode))
+		if mode == "" {
+			mode = rdmaMountModeSidecar
+		}
+		var rdmaClient *RDMAMountClient
+		var err error
+		switch mode {
+		case rdmaMountModeNative:
+			rdmaClient, err = NewNativeRDMAMountClient(
+				wfs.LookupFn(),
+				option.RdmaMaxConcurrent,
+				option.RdmaTimeoutMs,
+				option.RdmaDevice,
+				uint32(nonNegativeMountInt(option.RdmaPort)),
+				uint32(nonNegativeMountInt(option.RdmaGIDIndex)),
+				uint32(nonNegativeMountInt(option.RdmaServiceLevel)),
+			)
+		case rdmaMountModeSidecar:
+			if option.RdmaSidecarAddr == "" {
+				err = fmt.Errorf("rdma.sidecar is required for sidecar RDMA mode")
+			} else {
+				rdmaClient, err = NewRDMAMountClient(
+					option.RdmaSidecarAddr,
+					wfs.LookupFn(),
+					option.RdmaMaxConcurrent,
+					option.RdmaTimeoutMs,
+				)
+			}
+		default:
+			err = fmt.Errorf("unsupported RDMA mount mode %q", option.RdmaMode)
+		}
 		if err != nil {
 			glog.Warningf("Failed to initialize RDMA client: %v", err)
 		} else {
 			wfs.rdmaClient = rdmaClient
-			glog.Infof("RDMA acceleration enabled: sidecar=%s, maxConcurrent=%d, timeout=%dms",
-				option.RdmaSidecarAddr, option.RdmaMaxConcurrent, option.RdmaTimeoutMs)
+			glog.Infof("RDMA acceleration enabled: mode=%s, sidecar=%s, device=%s, port=%d, gidIndex=%d, maxConcurrent=%d, timeout=%dms",
+				mode, option.RdmaSidecarAddr, option.RdmaDevice, option.RdmaPort, option.RdmaGIDIndex, option.RdmaMaxConcurrent, option.RdmaTimeoutMs)
 		}
 	}
 
@@ -662,6 +694,13 @@ func (wfs *WFS) LookupFn() wdclient.LookupFileIdFunctionType {
 	}
 	// Use the cached FilerClient for efficient lookups with singleflight and cache history
 	return wfs.filerClient.GetLookupFileIdFunction()
+}
+
+func nonNegativeMountInt(v int) int {
+	if v < 0 {
+		return 0
+	}
+	return v
 }
 
 func (wfs *WFS) getCurrentFiler() pb.ServerAddress {
