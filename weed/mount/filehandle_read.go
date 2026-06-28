@@ -11,9 +11,9 @@ import (
 )
 
 const (
-	rdmaReadAheadChunkCount    = 4
-	rdmaReadAheadMaxChunks     = 16
-	rdmaReadAheadMaxBytes      = 64 << 20
+	rdmaReadAheadChunkCount    = 8
+	rdmaReadAheadMaxChunks     = 256
+	rdmaReadAheadMaxBytes      = 512 << 20
 	rdmaReadAheadMaxChunkBytes = 16 << 20
 )
 
