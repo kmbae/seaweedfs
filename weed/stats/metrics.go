@@ -394,6 +394,63 @@ var (
 			Help:      "Counter of overall failed file write requests from clients.",
 		})
 
+	VolumeServerRdmaTransferBytes = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: Namespace,
+			Subsystem: "volumeServer",
+			Name:      "rdma_transfer_bytes_total",
+			Help:      "Total bytes transferred by the native volume RDMA data path.",
+		}, []string{"op"})
+
+	VolumeServerRdmaTransferChunks = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: Namespace,
+			Subsystem: "volumeServer",
+			Name:      "rdma_transfer_chunks_total",
+			Help:      "Total chunks transferred by the native volume RDMA data path.",
+		}, []string{"op"})
+
+	VolumeServerRdmaMRPoolOps = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: Namespace,
+			Subsystem: "volumeServer",
+			Name:      "rdma_mr_pool_ops_total",
+			Help:      "Registered memory pool operations for the native volume RDMA data path.",
+		}, []string{"pool", "op"})
+
+	VolumeServerRdmaInFlightWRs = prometheus.NewGaugeVec(
+		prometheus.GaugeOpts{
+			Namespace: Namespace,
+			Subsystem: "volumeServer",
+			Name:      "rdma_inflight_wrs",
+			Help:      "Current in-flight work requests in the native volume RDMA data path.",
+		}, []string{"op"})
+
+	VolumeServerRdmaCompletionLatencySeconds = prometheus.NewHistogramVec(
+		prometheus.HistogramOpts{
+			Namespace: Namespace,
+			Subsystem: "volumeServer",
+			Name:      "rdma_completion_seconds",
+			Help:      "Completion latency for native volume RDMA work requests.",
+			Buckets:   prometheus.ExponentialBuckets(0.00001, 2, 24),
+		}, []string{"op"})
+
+	VolumeServerRdmaErrors = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: Namespace,
+			Subsystem: "volumeServer",
+			Name:      "rdma_errors_total",
+			Help:      "Errors from the native volume RDMA data path.",
+		}, []string{"op"})
+
+	VolumeServerRdmaFallbacks = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Namespace: Namespace,
+			Subsystem: "volumeServer",
+			Name:      "rdma_fallbacks_total",
+			Help:      "Fallbacks from optimized native volume RDMA paths.",
+		}, []string{"path"})
+
 	VolumeServerScrubLastTimeSeconds = prometheus.NewGaugeVec(
 		prometheus.GaugeOpts{
 			Namespace: Namespace,
@@ -694,6 +751,13 @@ func init() {
 	Gather.MustRegister(VolumeServerFileReadFailures)
 	Gather.MustRegister(VolumeServerFileReadInvalidNeedles)
 	Gather.MustRegister(VolumeServerFileWriteFailures)
+	Gather.MustRegister(VolumeServerRdmaTransferBytes)
+	Gather.MustRegister(VolumeServerRdmaTransferChunks)
+	Gather.MustRegister(VolumeServerRdmaMRPoolOps)
+	Gather.MustRegister(VolumeServerRdmaInFlightWRs)
+	Gather.MustRegister(VolumeServerRdmaCompletionLatencySeconds)
+	Gather.MustRegister(VolumeServerRdmaErrors)
+	Gather.MustRegister(VolumeServerRdmaFallbacks)
 	Gather.MustRegister(VolumeServerScrubLastTimeSeconds)
 	Gather.MustRegister(VolumeServerScrubVolumeFailures)
 	Gather.MustRegister(VolumeServerScrubShardFailures)

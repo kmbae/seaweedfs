@@ -21,6 +21,7 @@ package weed_server
 #define SWRDMA_MR_READ 1
 #define SWRDMA_MR_WRITE 2
 #define SWRDMA_MR_LOCAL 3
+#define SWRDMA_MAX_READ_PIPELINE 16
 
 typedef struct swrdma_endpoint {
 	uint32_t abi_version;
@@ -64,6 +65,8 @@ typedef struct swrdma_conn {
 	int gid_index;
 	uint32_t psn;
 	uint32_t qp_state;
+	uint32_t max_rd_atomic;
+	uint32_t max_dest_rd_atomic;
 	int connected;
 	swrdma_endpoint endpoint;
 } swrdma_conn;
@@ -78,6 +81,16 @@ typedef struct swrdma_mr {
 
 static void swrdma_close_conn(swrdma_conn *conn);
 static void swrdma_free_mr(swrdma_mr *mr);
+
+static uint32_t swrdma_min_nonzero_u32(uint32_t a, uint32_t b) {
+	if (a == 0) {
+		return 1;
+	}
+	if (b == 0) {
+		return 1;
+	}
+	return a < b ? a : b;
+}
 
 static void swrdma_set_error(char *err, size_t err_len, const char *fmt, ...) {
 	if (err == NULL || err_len == 0) {
@@ -217,17 +230,37 @@ static swrdma_conn *swrdma_open_conn(const char *preferred_device, uint8_t port,
 			ibv_close_device(context);
 			swrdma_set_error(err, err_len, "calloc swrdma_conn failed");
 			break;
+			}
+			conn->context = context;
+			conn->port = port;
+			conn->gid_index = gid_index;
+			conn->psn = psn & 0x00ffffff;
+			if (conn->psn == 0) {
+				conn->psn = 1;
+			}
+			struct ibv_device_attr device_attr;
+			memset(&device_attr, 0, sizeof(device_attr));
+			if (ibv_query_device(context, &device_attr) != 0) {
+				free(conn);
+				conn = NULL;
+				ibv_close_device(context);
+				if (!want_auto) {
+					swrdma_set_error(err, err_len, "ibv_query_device(%s) failed: %s", name, strerror(errno));
+					break;
+				}
+				continue;
+			}
+			conn->max_rd_atomic = swrdma_min_nonzero_u32((uint32_t)device_attr.max_qp_rd_atom, SWRDMA_MAX_READ_PIPELINE);
+			conn->max_dest_rd_atomic = swrdma_min_nonzero_u32((uint32_t)device_attr.max_qp_init_rd_atom, SWRDMA_MAX_READ_PIPELINE);
+			if (conn->max_rd_atomic == 0) {
+				conn->max_rd_atomic = 1;
+			}
+			if (conn->max_dest_rd_atomic == 0) {
+				conn->max_dest_rd_atomic = 1;
+			}
+			chosen_name = name;
+			break;
 		}
-		conn->context = context;
-		conn->port = port;
-		conn->gid_index = gid_index;
-		conn->psn = psn & 0x00ffffff;
-		if (conn->psn == 0) {
-			conn->psn = 1;
-		}
-		chosen_name = name;
-		break;
-	}
 
 	if (conn == NULL) {
 		if (err != NULL && err[0] == '\0') {
@@ -332,7 +365,7 @@ static int swrdma_connect(swrdma_conn *conn, swrdma_remote *remote, char *err, s
 	attr.path_mtu = conn->endpoint.active_mtu >= IBV_MTU_256 && conn->endpoint.active_mtu <= IBV_MTU_4096 ? conn->endpoint.active_mtu : IBV_MTU_1024;
 	attr.dest_qp_num = remote->qpn;
 	attr.rq_psn = remote->psn;
-	attr.max_dest_rd_atomic = 1;
+	attr.max_dest_rd_atomic = conn->max_dest_rd_atomic;
 	attr.min_rnr_timer = 12;
 	attr.ah_attr.dlid = remote->lid;
 	attr.ah_attr.sl = remote->sl;
@@ -360,7 +393,7 @@ static int swrdma_connect(swrdma_conn *conn, swrdma_remote *remote, char *err, s
 	attr.retry_cnt = 7;
 	attr.rnr_retry = 7;
 	attr.sq_psn = conn->psn;
-	attr.max_rd_atomic = 1;
+	attr.max_rd_atomic = conn->max_rd_atomic;
 	int rts_mask = IBV_QP_STATE | IBV_QP_TIMEOUT | IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_SQ_PSN | IBV_QP_MAX_QP_RD_ATOMIC;
 	if (ibv_modify_qp(conn->qp, &attr, rts_mask) != 0) {
 		swrdma_set_error(err, err_len, "ibv_modify_qp RTS failed: %s", strerror(errno));
@@ -464,7 +497,42 @@ static int swrdma_poll_completion(swrdma_conn *conn, uint64_t wr_id, uint64_t ti
 	}
 }
 
-static int swrdma_read_remote_into(swrdma_conn *conn, swrdma_mr *local, uint64_t remote_addr, uint32_t rkey, size_t length, uint64_t timeout_ms, char *err, size_t err_len) {
+static int swrdma_poll_completion_any(swrdma_conn *conn, uint64_t timeout_ms, enum ibv_wc_opcode expected_opcode, uint64_t *wr_id, char *err, size_t err_len) {
+	uint64_t deadline = swrdma_now_ms() + (timeout_ms == 0 ? 5000 : timeout_ms);
+	struct timespec sleep_time;
+	sleep_time.tv_sec = 0;
+	sleep_time.tv_nsec = 50000;
+	for (;;) {
+		struct ibv_wc wc;
+		memset(&wc, 0, sizeof(wc));
+		int n = ibv_poll_cq(conn->cq, 1, &wc);
+		if (n < 0) {
+			swrdma_set_error(err, err_len, "ibv_poll_cq failed");
+			return -1;
+		}
+		if (n > 0) {
+			if (wc.status != IBV_WC_SUCCESS) {
+				swrdma_set_error(err, err_len, "RDMA completion failed wr_id=%llu status=%d vendor_err=%u", (unsigned long long)wc.wr_id, wc.status, wc.vendor_err);
+				return -1;
+			}
+			if (wc.opcode != expected_opcode) {
+				swrdma_set_error(err, err_len, "unexpected RDMA completion wr_id=%llu opcode=%d expected=%d", (unsigned long long)wc.wr_id, wc.opcode, expected_opcode);
+				return -1;
+			}
+			if (wr_id != NULL) {
+				*wr_id = wc.wr_id;
+			}
+			return 0;
+		}
+		if (swrdma_now_ms() > deadline) {
+			swrdma_set_error(err, err_len, "timed out waiting for RDMA completion");
+			return -1;
+		}
+		nanosleep(&sleep_time, NULL);
+	}
+}
+
+static int swrdma_post_read_remote_into(swrdma_conn *conn, swrdma_mr *local, uint64_t remote_addr, uint32_t rkey, size_t length, uint64_t wr_id, char *err, size_t err_len) {
 	if (conn == NULL || conn->qp == NULL) {
 		swrdma_set_error(err, err_len, "RDMA connection is not open");
 		return -1;
@@ -481,6 +549,10 @@ static int swrdma_read_remote_into(swrdma_conn *conn, swrdma_mr *local, uint64_t
 		swrdma_set_error(err, err_len, "RDMA READ local MR is too small");
 		return -1;
 	}
+	if (length > UINT32_MAX) {
+		swrdma_set_error(err, err_len, "RDMA READ length is too large: %zu", length);
+		return -1;
+	}
 
 	struct ibv_sge sge;
 	memset(&sge, 0, sizeof(sge));
@@ -491,7 +563,7 @@ static int swrdma_read_remote_into(swrdma_conn *conn, swrdma_mr *local, uint64_t
 	struct ibv_send_wr wr;
 	memset(&wr, 0, sizeof(wr));
 	struct ibv_send_wr *bad_wr = NULL;
-	wr.wr_id = (uint64_t)(uintptr_t)local;
+	wr.wr_id = wr_id;
 	wr.sg_list = &sge;
 	wr.num_sge = 1;
 	wr.opcode = IBV_WR_RDMA_READ;
@@ -503,7 +575,15 @@ static int swrdma_read_remote_into(swrdma_conn *conn, swrdma_mr *local, uint64_t
 		swrdma_set_error(err, err_len, "ibv_post_send RDMA_READ failed: %s", strerror(errno));
 		return -1;
 	}
-	if (swrdma_poll_completion(conn, wr.wr_id, timeout_ms, IBV_WC_RDMA_READ, err, err_len) != 0) {
+	return 0;
+}
+
+static int swrdma_read_remote_into(swrdma_conn *conn, swrdma_mr *local, uint64_t remote_addr, uint32_t rkey, size_t length, uint64_t timeout_ms, char *err, size_t err_len) {
+	uint64_t wr_id = (uint64_t)(uintptr_t)local;
+	if (swrdma_post_read_remote_into(conn, local, remote_addr, rkey, length, wr_id, err, err_len) != 0) {
+		return -1;
+	}
+	if (swrdma_poll_completion(conn, wr_id, timeout_ms, IBV_WC_RDMA_READ, err, err_len) != 0) {
 		return -1;
 	}
 	return 0;
@@ -544,15 +624,18 @@ import (
 	"sync"
 	"time"
 	"unsafe"
+
+	"github.com/seaweedfs/seaweedfs/weed/stats"
 )
 
 const (
 	embeddedVolumeRdmaDefaultPSN = 0xabcdef
 	embeddedVolumeRdmaErrLen     = 512
 
-	embeddedVolumeRdmaReadMRPoolLimit = 4
-	embeddedVolumeRdmaReadMRMinSize   = 64 << 10
-	embeddedVolumeRdmaReadMRAlign     = 1 << 20
+	embeddedVolumeRdmaReadMRPoolLimit    = 8
+	embeddedVolumeRdmaSessionMRPoolLimit = 8
+	embeddedVolumeRdmaReadMRMinSize      = 64 << 10
+	embeddedVolumeRdmaReadMRAlign        = 1 << 20
 )
 
 type embeddedVolumeRdmaTransport struct {
@@ -573,7 +656,8 @@ type embeddedVolumeRdmaConnection struct {
 	remote    VolumeRdmaRemoteInfo
 	connected bool
 
-	readMRPool map[uint64][]*C.swrdma_mr
+	readMRPool    map[uint64][]*C.swrdma_mr
+	sessionMRPool map[embeddedVolumeRdmaMRPoolKey][]*C.swrdma_mr
 }
 
 type embeddedVolumeRdmaBuffer struct {
@@ -581,7 +665,21 @@ type embeddedVolumeRdmaBuffer struct {
 	sessionID    uint64
 	connectionID uint64
 	mr           *C.swrdma_mr
+	poolKey      embeddedVolumeRdmaMRPoolKey
 	desc         VolumeRdmaDataDesc
+}
+
+type embeddedVolumeRdmaMRPoolKey struct {
+	Kind int
+	Size uint64
+}
+
+type embeddedVolumeRdmaReadChunk struct {
+	index   int
+	length  uint32
+	poolKey uint64
+	mr      *C.swrdma_mr
+	done    bool
 }
 
 func NewEmbeddedVolumeRdmaTransport(cfg VolumeRdmaEmbeddedConfig) (VolumeRdmaEndpoint, VolumeRdmaReadRegistrar, error) {
@@ -694,17 +792,7 @@ func (t *embeddedVolumeRdmaTransport) ReadRemoteToFor(ctx context.Context, conne
 	if dst == nil {
 		return fmt.Errorf("embedded RDMA read_remote_to requires destination writer")
 	}
-	mr, poolKey, err := t.readRemoteMR(ctx, connectionID, desc, timeout)
-	if err != nil {
-		return err
-	}
-	defer t.releaseReadMR(connectionID, poolKey, mr, true)
-	payload := unsafe.Slice((*byte)(mr.addr), int(desc.Length))
-	n, err := dst.Write(payload)
-	if err == nil && n != len(payload) {
-		err = io.ErrShortWrite
-	}
-	return err
+	return t.readRemotePipelineTo(ctx, connectionID, desc, timeout, dst)
 }
 
 func (t *embeddedVolumeRdmaTransport) readRemoteMR(ctx context.Context, connectionID uint64, desc VolumeRdmaDataDesc, timeout time.Duration) (*C.swrdma_mr, uint64, error) {
@@ -756,6 +844,181 @@ func (t *embeddedVolumeRdmaTransport) readRemoteMR(ctx context.Context, connecti
 	return mr, poolKey, nil
 }
 
+func (t *embeddedVolumeRdmaTransport) readRemotePipelineTo(ctx context.Context, connectionID uint64, desc VolumeRdmaDataDesc, timeout time.Duration, dst io.Writer) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if connectionID == 0 {
+		return fmt.Errorf("embedded RDMA read_remote pipeline requires connection_id")
+	}
+	if desc.RemoteAddr == 0 || desc.Length == 0 {
+		return fmt.Errorf("embedded RDMA read_remote pipeline requires non-empty descriptor")
+	}
+	if desc.Length > volumeRdmaEngineMaxFrameSize {
+		return fmt.Errorf("embedded RDMA read_remote pipeline frame too large: %d bytes", desc.Length)
+	}
+	chunks := planVolumeRdmaChunks(desc.Length, volumeRdmaPipelineChunkSize)
+	if len(chunks) == 0 {
+		return nil
+	}
+	timeoutMs := uint64(timeout.Milliseconds())
+	if timeoutMs == 0 && timeout > 0 {
+		timeoutMs = 1
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	conn, err := t.ensureConnectionLocked(connectionID)
+	if err != nil {
+		return err
+	}
+	if !conn.connected {
+		return fmt.Errorf("embedded RDMA connection %d is not connected", connectionID)
+	}
+
+	inFlight := make(map[uint64]*embeddedVolumeRdmaReadChunk, volumeRdmaPipelineDepth)
+	completed := make([]*embeddedVolumeRdmaReadChunk, len(chunks))
+	defer stats.VolumeServerRdmaInFlightWRs.WithLabelValues("read_remote").Set(0)
+
+	nextPost := 0
+	nextWrite := 0
+	completedCount := 0
+	var writeErr error
+
+	cleanup := func(reusable bool) {
+		for _, ch := range completed {
+			if ch != nil && ch.mr != nil {
+				t.releaseReadMRLocked(conn, ch.poolKey, ch.mr, reusable && ch.done)
+				ch.mr = nil
+			}
+		}
+		for _, ch := range inFlight {
+			if ch != nil && ch.mr != nil {
+				t.releaseReadMRLocked(conn, ch.poolKey, ch.mr, false)
+				ch.mr = nil
+			}
+		}
+	}
+
+	for (writeErr == nil && nextPost < len(chunks)) || len(inFlight) > 0 {
+		if err := ctx.Err(); err != nil {
+			stats.VolumeServerRdmaErrors.WithLabelValues("read_remote_pipeline").Inc()
+			cleanup(false)
+			return err
+		}
+
+		for writeErr == nil && nextPost < len(chunks) && len(inFlight) < volumeRdmaPipelineDepth {
+			chunk := chunks[nextPost]
+			if desc.RemoteAddr+chunk.Offset < desc.RemoteAddr {
+				stats.VolumeServerRdmaErrors.WithLabelValues("read_remote_pipeline").Inc()
+				cleanup(false)
+				return fmt.Errorf("embedded RDMA read_remote pipeline address overflow")
+			}
+			poolKey := embeddedVolumeRdmaReadMRPoolKey(chunk.Length)
+			mr, err := t.acquireReadMRLocked(conn, poolKey)
+			if err != nil {
+				stats.VolumeServerRdmaErrors.WithLabelValues("read_remote_pipeline").Inc()
+				cleanup(false)
+				return err
+			}
+			wrID := uint64(chunk.Index + 1)
+			var errBuf [embeddedVolumeRdmaErrLen]C.char
+			if C.swrdma_post_read_remote_into(
+				conn.handle,
+				mr,
+				C.uint64_t(desc.RemoteAddr+chunk.Offset),
+				C.uint32_t(desc.RKey),
+				C.size_t(chunk.Length),
+				C.uint64_t(wrID),
+				&errBuf[0],
+				C.size_t(len(errBuf)),
+			) != 0 {
+				t.releaseReadMRLocked(conn, poolKey, mr, false)
+				stats.VolumeServerRdmaErrors.WithLabelValues("read_remote_pipeline").Inc()
+				cleanup(false)
+				return fmt.Errorf("embedded RDMA post read_remote pipeline: %s", cErrorString(&errBuf[0]))
+			}
+			readChunk := &embeddedVolumeRdmaReadChunk{
+				index:   chunk.Index,
+				length:  chunk.Length,
+				poolKey: poolKey,
+				mr:      mr,
+			}
+			inFlight[wrID] = readChunk
+			completed[chunk.Index] = readChunk
+			nextPost++
+			stats.VolumeServerRdmaInFlightWRs.WithLabelValues("read_remote").Set(float64(len(inFlight)))
+		}
+
+		if len(inFlight) == 0 {
+			break
+		}
+
+		var wrID C.uint64_t
+		var errBuf [embeddedVolumeRdmaErrLen]C.char
+		start := time.Now()
+		if C.swrdma_poll_completion_any(
+			conn.handle,
+			C.uint64_t(timeoutMs),
+			C.enum_ibv_wc_opcode(C.IBV_WC_RDMA_READ),
+			&wrID,
+			&errBuf[0],
+			C.size_t(len(errBuf)),
+		) != 0 {
+			stats.VolumeServerRdmaCompletionLatencySeconds.WithLabelValues("read_remote").Observe(time.Since(start).Seconds())
+			stats.VolumeServerRdmaErrors.WithLabelValues("read_remote_pipeline").Inc()
+			cleanup(false)
+			return fmt.Errorf("embedded RDMA poll read_remote pipeline: %s", cErrorString(&errBuf[0]))
+		}
+		stats.VolumeServerRdmaCompletionLatencySeconds.WithLabelValues("read_remote").Observe(time.Since(start).Seconds())
+
+		chunk := inFlight[uint64(wrID)]
+		if chunk == nil {
+			stats.VolumeServerRdmaErrors.WithLabelValues("read_remote_pipeline").Inc()
+			cleanup(false)
+			return fmt.Errorf("embedded RDMA read_remote pipeline completed unknown wr_id=%d", uint64(wrID))
+		}
+		delete(inFlight, uint64(wrID))
+		chunk.done = true
+		completedCount++
+		stats.VolumeServerRdmaInFlightWRs.WithLabelValues("read_remote").Set(float64(len(inFlight)))
+		stats.VolumeServerRdmaTransferBytes.WithLabelValues("read_remote").Add(float64(chunk.length))
+		stats.VolumeServerRdmaTransferChunks.WithLabelValues("read_remote").Inc()
+
+		for writeErr == nil && nextWrite < len(completed) {
+			ready := completed[nextWrite]
+			if ready == nil || !ready.done {
+				break
+			}
+			payload := unsafe.Slice((*byte)(ready.mr.addr), int(ready.length))
+			n, err := dst.Write(payload)
+			if err == nil && n != len(payload) {
+				err = io.ErrShortWrite
+			}
+			t.releaseReadMRLocked(conn, ready.poolKey, ready.mr, true)
+			ready.mr = nil
+			completed[nextWrite] = nil
+			nextWrite++
+			if err != nil {
+				writeErr = err
+				stats.VolumeServerRdmaErrors.WithLabelValues("read_remote_write").Inc()
+				break
+			}
+		}
+
+		if completedCount == len(chunks) && len(inFlight) == 0 {
+			break
+		}
+	}
+
+	if writeErr != nil {
+		cleanup(true)
+		return writeErr
+	}
+	cleanup(true)
+	return nil
+}
+
 func (t *embeddedVolumeRdmaTransport) RegisterReadBuffer(ctx context.Context, data []byte) (VolumeRdmaRegisteredBuffer, error) {
 	return t.RegisterReadBufferFor(ctx, 1, data)
 }
@@ -789,7 +1052,7 @@ func (t *embeddedVolumeRdmaTransport) RegisterReadStreamFor(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
-	writer := &embeddedRdmaExactBufferWriter{dst: buffer.bytes()}
+	writer := &embeddedRdmaExactBufferWriter{dst: buffer.bytes()[:int(size)]}
 	if err := writeData(writer); err != nil {
 		_ = buffer.Release(context.Background())
 		return nil, err
@@ -864,11 +1127,17 @@ func (t *embeddedVolumeRdmaTransport) ReleaseSession(ctx context.Context, sessio
 	if ok {
 		delete(t.sessions, sessionID)
 	}
-	t.mu.Unlock()
 	if ok {
-		C.swrdma_free_mr(buffer.mr)
+		conn := t.connections[buffer.connectionID]
+		if t.closed || conn == nil {
+			C.swrdma_free_mr(buffer.mr)
+			stats.VolumeServerRdmaMRPoolOps.WithLabelValues("session", "free").Inc()
+		} else {
+			t.releaseSessionMRLocked(conn, buffer.poolKey, buffer.mr, true)
+		}
 		buffer.mr = nil
 	}
+	t.mu.Unlock()
 	return nil
 }
 
@@ -895,6 +1164,11 @@ func (t *embeddedVolumeRdmaTransport) Close() error {
 				C.swrdma_free_mr(mr)
 			}
 		}
+		for _, pool := range conn.sessionMRPool {
+			for _, mr := range pool {
+				C.swrdma_free_mr(mr)
+			}
+		}
 		C.swrdma_close_conn(conn.handle)
 		conn.handle = nil
 	}
@@ -913,13 +1187,16 @@ func (t *embeddedVolumeRdmaTransport) acquireReadMRLocked(conn *embeddedVolumeRd
 		last := len(pool) - 1
 		mr := pool[last]
 		conn.readMRPool[poolKey] = pool[:last]
+		stats.VolumeServerRdmaMRPoolOps.WithLabelValues("read", "hit").Inc()
 		return mr, nil
 	}
 	var errBuf [embeddedVolumeRdmaErrLen]C.char
 	mr := C.swrdma_alloc_mr(conn.handle, C.size_t(poolKey), C.SWRDMA_MR_LOCAL, &errBuf[0], C.size_t(len(errBuf)))
 	if mr == nil {
+		stats.VolumeServerRdmaMRPoolOps.WithLabelValues("read", "miss_error").Inc()
 		return nil, fmt.Errorf("embedded RDMA allocate read MR: %s", cErrorString(&errBuf[0]))
 	}
+	stats.VolumeServerRdmaMRPoolOps.WithLabelValues("read", "miss").Inc()
 	return mr, nil
 }
 
@@ -929,6 +1206,7 @@ func (t *embeddedVolumeRdmaTransport) releaseReadMR(connectionID uint64, poolKey
 	}
 	if !reusable || poolKey == 0 {
 		C.swrdma_free_mr(mr)
+		stats.VolumeServerRdmaMRPoolOps.WithLabelValues("read", "free").Inc()
 		return
 	}
 	t.mu.Lock()
@@ -936,6 +1214,19 @@ func (t *embeddedVolumeRdmaTransport) releaseReadMR(connectionID uint64, poolKey
 	conn := t.connections[connectionID]
 	if t.closed || conn == nil {
 		C.swrdma_free_mr(mr)
+		stats.VolumeServerRdmaMRPoolOps.WithLabelValues("read", "free").Inc()
+		return
+	}
+	t.releaseReadMRLocked(conn, poolKey, mr, reusable)
+}
+
+func (t *embeddedVolumeRdmaTransport) releaseReadMRLocked(conn *embeddedVolumeRdmaConnection, poolKey uint64, mr *C.swrdma_mr, reusable bool) {
+	if mr == nil {
+		return
+	}
+	if !reusable || poolKey == 0 || conn == nil {
+		C.swrdma_free_mr(mr)
+		stats.VolumeServerRdmaMRPoolOps.WithLabelValues("read", "free").Inc()
 		return
 	}
 	if conn.readMRPool == nil {
@@ -943,9 +1234,11 @@ func (t *embeddedVolumeRdmaTransport) releaseReadMR(connectionID uint64, poolKey
 	}
 	if len(conn.readMRPool[poolKey]) >= embeddedVolumeRdmaReadMRPoolLimit {
 		C.swrdma_free_mr(mr)
+		stats.VolumeServerRdmaMRPoolOps.WithLabelValues("read", "drop").Inc()
 		return
 	}
 	conn.readMRPool[poolKey] = append(conn.readMRPool[poolKey], mr)
+	stats.VolumeServerRdmaMRPoolOps.WithLabelValues("read", "put").Inc()
 }
 
 func embeddedVolumeRdmaReadMRPoolKey(length uint32) uint64 {
@@ -976,16 +1269,17 @@ func (t *embeddedVolumeRdmaTransport) allocateSessionBuffer(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
-	var errBuf [embeddedVolumeRdmaErrLen]C.char
-	mr := C.swrdma_alloc_mr(conn.handle, C.size_t(size), kind, &errBuf[0], C.size_t(len(errBuf)))
-	if mr == nil {
-		return nil, fmt.Errorf("embedded RDMA allocate MR: %s", cErrorString(&errBuf[0]))
+	poolKey := embeddedVolumeRdmaSessionMRPoolKey(kind, size)
+	mr, err := t.acquireSessionMRLocked(conn, poolKey)
+	if err != nil {
+		return nil, err
 	}
 	buffer := &embeddedVolumeRdmaBuffer{
 		owner:        t,
 		sessionID:    sessionID,
 		connectionID: conn.id,
 		mr:           mr,
+		poolKey:      poolKey,
 		desc: VolumeRdmaDataDesc{
 			RemoteAddr: uint64(uintptr(mr.addr)),
 			RKey:       uint32(mr.rkey),
@@ -995,6 +1289,59 @@ func (t *embeddedVolumeRdmaTransport) allocateSessionBuffer(ctx context.Context,
 	}
 	t.sessions[sessionID] = buffer
 	return buffer, nil
+}
+
+func (t *embeddedVolumeRdmaTransport) acquireSessionMRLocked(conn *embeddedVolumeRdmaConnection, poolKey embeddedVolumeRdmaMRPoolKey) (*C.swrdma_mr, error) {
+	if conn == nil || conn.handle == nil {
+		return nil, fmt.Errorf("embedded RDMA connection is not open")
+	}
+	if conn.sessionMRPool == nil {
+		conn.sessionMRPool = make(map[embeddedVolumeRdmaMRPoolKey][]*C.swrdma_mr)
+	}
+	pool := conn.sessionMRPool[poolKey]
+	if len(pool) > 0 {
+		last := len(pool) - 1
+		mr := pool[last]
+		conn.sessionMRPool[poolKey] = pool[:last]
+		stats.VolumeServerRdmaMRPoolOps.WithLabelValues("session", "hit").Inc()
+		return mr, nil
+	}
+	var errBuf [embeddedVolumeRdmaErrLen]C.char
+	mr := C.swrdma_alloc_mr(conn.handle, C.size_t(poolKey.Size), C.int(poolKey.Kind), &errBuf[0], C.size_t(len(errBuf)))
+	if mr == nil {
+		stats.VolumeServerRdmaMRPoolOps.WithLabelValues("session", "miss_error").Inc()
+		return nil, fmt.Errorf("embedded RDMA allocate MR: %s", cErrorString(&errBuf[0]))
+	}
+	stats.VolumeServerRdmaMRPoolOps.WithLabelValues("session", "miss").Inc()
+	return mr, nil
+}
+
+func (t *embeddedVolumeRdmaTransport) releaseSessionMRLocked(conn *embeddedVolumeRdmaConnection, poolKey embeddedVolumeRdmaMRPoolKey, mr *C.swrdma_mr, reusable bool) {
+	if mr == nil {
+		return
+	}
+	if !reusable || poolKey.Size == 0 || conn == nil {
+		C.swrdma_free_mr(mr)
+		stats.VolumeServerRdmaMRPoolOps.WithLabelValues("session", "free").Inc()
+		return
+	}
+	if conn.sessionMRPool == nil {
+		conn.sessionMRPool = make(map[embeddedVolumeRdmaMRPoolKey][]*C.swrdma_mr)
+	}
+	if len(conn.sessionMRPool[poolKey]) >= embeddedVolumeRdmaSessionMRPoolLimit {
+		C.swrdma_free_mr(mr)
+		stats.VolumeServerRdmaMRPoolOps.WithLabelValues("session", "drop").Inc()
+		return
+	}
+	conn.sessionMRPool[poolKey] = append(conn.sessionMRPool[poolKey], mr)
+	stats.VolumeServerRdmaMRPoolOps.WithLabelValues("session", "put").Inc()
+}
+
+func embeddedVolumeRdmaSessionMRPoolKey(kind C.int, size uint64) embeddedVolumeRdmaMRPoolKey {
+	return embeddedVolumeRdmaMRPoolKey{
+		Kind: int(kind),
+		Size: embeddedVolumeRdmaReadMRPoolKey(uint32(size)),
+	}
 }
 
 func (t *embeddedVolumeRdmaTransport) ensureConnectionLocked(connectionID uint64) (*embeddedVolumeRdmaConnection, error) {
@@ -1019,10 +1366,11 @@ func (t *embeddedVolumeRdmaTransport) ensureConnectionLocked(connectionID uint64
 		return nil, fmt.Errorf("embedded RDMA open device=%s port=%d gid_index=%d: %s", t.cfg.Device, t.cfg.Port, t.cfg.GIDIndex, cErrorString(&errBuf[0]))
 	}
 	conn := &embeddedVolumeRdmaConnection{
-		id:         connectionID,
-		handle:     handle,
-		endpoint:   endpointInfoFromC(&handle.endpoint),
-		readMRPool: make(map[uint64][]*C.swrdma_mr),
+		id:            connectionID,
+		handle:        handle,
+		endpoint:      endpointInfoFromC(&handle.endpoint),
+		readMRPool:    make(map[uint64][]*C.swrdma_mr),
+		sessionMRPool: make(map[embeddedVolumeRdmaMRPoolKey][]*C.swrdma_mr),
 	}
 	conn.endpoint.ConnectionID = connectionID
 	t.connections[connectionID] = conn

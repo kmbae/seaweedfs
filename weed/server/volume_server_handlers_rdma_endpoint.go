@@ -103,6 +103,8 @@ type volumeRdmaNativeStatusResponse struct {
 	WriteCommitPath        string `json:"write_commit_path"`
 	WriteCommitBatchPath   string `json:"write_commit_batch_path"`
 	WriteAbortPath         string `json:"write_abort_path"`
+	ReadChunkSize          int    `json:"read_chunk_size"`
+	ReadPipelineDepth      int    `json:"read_pipeline_depth"`
 }
 
 func (e VolumeRdmaEndpointInfo) ReadyForConnect() bool {
@@ -174,6 +176,8 @@ func (vs *VolumeServer) volumeRdmaStatusHandler(w http.ResponseWriter, r *http.R
 		WriteCommitPath:        VolumeRdmaNativeWriteCommitPath,
 		WriteCommitBatchPath:   VolumeRdmaNativeWriteCommitBatchPath,
 		WriteAbortPath:         VolumeRdmaNativeWriteAbortPath,
+		ReadChunkSize:          volumeRdmaPipelineChunkSize,
+		ReadPipelineDepth:      volumeRdmaPipelineDepth,
 	})
 }
 

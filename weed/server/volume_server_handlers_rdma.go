@@ -10,6 +10,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/seaweedfs/seaweedfs/weed/stats"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
@@ -222,8 +223,11 @@ func (vs *VolumeServer) volumeRdmaWriteHandler(w http.ResponseWriter, r *http.Re
 			Size:   req.Size,
 			Source: "native-volume-rdma-write-stream",
 		})
+		stats.VolumeServerRdmaTransferBytes.WithLabelValues("write_stream").Add(float64(req.Size))
+		stats.VolumeServerRdmaTransferChunks.WithLabelValues("write_stream").Inc()
 		return
 	}
+	stats.VolumeServerRdmaFallbacks.WithLabelValues("write_remote_copy").Inc()
 	data, err := requester.ReadRemoteFor(r.Context(), req.ConnectionID, readDesc, timeout)
 	if err != nil {
 		writeJsonError(w, r, http.StatusServiceUnavailable, err)
