@@ -136,6 +136,80 @@ func (b *Backend) commitWriteNativeRDMA(ctx context.Context, fullPath string, of
 	return attr, nil
 }
 
+type nativeVolumeWriteBatchItem struct {
+	Index int
+	Lease nativeVolumeWriteLease
+}
+
+func (b *Backend) commitWriteNativeRDMABatch(ctx context.Context, fullPath string, entries []swvfsproto.RDMAWriteCommitEntry) ([]swvfsproto.RDMAWriteCommitResult, *swvfsproto.Attr, error) {
+	if b == nil || b.NativeWriteDescriptor == nil {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native volume rdma write descriptor backend is not configured"}
+	}
+	fullPath = cleanFullPath(fullPath)
+	leases, ok := b.snapshotNativeWriteLeases(fullPath, entries)
+	if !ok {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native volume rdma write commit batch has non-native entries"}
+	}
+
+	groups := make(map[string][]nativeVolumeWriteBatchItem)
+	for i, lease := range leases {
+		if lease.VolumeServer == "" || lease.SessionID == 0 {
+			return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoIO, Msg: "native volume rdma write commit batch has an invalid lease"}
+		}
+		groups[lease.VolumeServer] = append(groups[lease.VolumeServer], nativeVolumeWriteBatchItem{Index: i, Lease: lease})
+	}
+
+	results := make([]swvfsproto.RDMAWriteCommitResult, len(entries))
+	for i, entry := range entries {
+		results[i] = swvfsproto.RDMAWriteCommitResult{
+			Offset: entry.Offset,
+			Size:   entry.Size,
+		}
+	}
+
+	var lastAttr *swvfsproto.Attr
+	for volumeServer, group := range groups {
+		groupLeases := make([]nativeVolumeWriteLease, len(group))
+		for i, item := range group {
+			groupLeases[i] = item.Lease
+		}
+		resp, err := b.NativeWriteDescriptor.CommitNeedleWriteRDMABatch(ctx, volumeServer, groupLeases)
+		if err != nil {
+			b.NativeWriteDescriptor.Stats.Inc("volume_native_rdma_write_commit_batch_errors")
+			return nil, nil, err
+		}
+		if len(resp.Results) != len(group) {
+			b.NativeWriteDescriptor.Stats.Inc("volume_native_rdma_write_commit_batch_errors")
+			return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoIO, Msg: "native volume rdma write commit batch returned mismatched result count"}
+		}
+		for i, item := range group {
+			lease := item.Lease
+			b.popNativeWriteLeaseIfCurrent(lease)
+
+			status := resp.Results[i].Status
+			if status == 0 {
+				fileID := resp.Results[i].FileID
+				if fileID == "" {
+					fileID = lease.FileID
+				}
+				attr, err := b.appendChunkEntry(ctx, lease.Key.Path, lease.Key.Offset, lease.Key.Size, defaultRegularMode, 0, 0, fileID)
+				status = swvfsdaemon.ErrnoForError(err)
+				if err == nil && attr != nil {
+					lastAttr = attr
+					b.NativeWriteDescriptor.Stats.Inc("volume_native_rdma_write_commit_batch_entry_success")
+					b.NativeWriteDescriptor.Stats.Add("volume_native_rdma_write_commit_batch_bytes", lease.Key.Size)
+				}
+			}
+			if status != 0 {
+				b.NativeWriteDescriptor.Stats.Inc("volume_native_rdma_write_commit_batch_entry_errors")
+			}
+			results[item.Index].Status = status
+		}
+	}
+	b.NativeWriteDescriptor.Stats.Inc("volume_native_rdma_write_commit_batch_success")
+	return results, lastAttr, nil
+}
+
 func (b *Backend) trackNativeWriteLease(lease nativeVolumeWriteLease) nativeVolumeWriteLease {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -155,6 +229,36 @@ func (b *Backend) popNativeWriteLease(key nativeVolumeWriteKey) (nativeVolumeWri
 		delete(b.nativeWriteLeases, key)
 	}
 	return lease, ok
+}
+
+func (b *Backend) snapshotNativeWriteLeases(fullPath string, entries []swvfsproto.RDMAWriteCommitEntry) ([]nativeVolumeWriteLease, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if len(entries) == 0 || b.nativeWriteLeases == nil {
+		return nil, false
+	}
+	leases := make([]nativeVolumeWriteLease, len(entries))
+	for i, entry := range entries {
+		key := nativeVolumeWriteKey{Path: fullPath, Offset: entry.Offset, Size: entry.Size}
+		lease, ok := b.nativeWriteLeases[key]
+		if !ok {
+			return nil, false
+		}
+		leases[i] = lease
+	}
+	return leases, true
+}
+
+func (b *Backend) popNativeWriteLeaseIfCurrent(lease nativeVolumeWriteLease) {
+	if lease.SessionID == 0 {
+		return
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	current, ok := b.nativeWriteLeases[lease.Key]
+	if ok && current.SessionID == lease.SessionID {
+		delete(b.nativeWriteLeases, lease.Key)
+	}
 }
 
 func (c *NativeVolumeWriteDescriptorClient) PrepareNeedleWriteRDMA(ctx context.Context, lease nativeVolumeWriteLease) (*swvfsproto.RDMADataDesc, uint64, error) {
@@ -221,6 +325,50 @@ func (c *NativeVolumeWriteDescriptorClient) CommitNeedleWriteRDMA(ctx context.Co
 		Cookie:    lease.Cookie,
 		Size:      lease.Key.Size,
 	})
+}
+
+func (c *NativeVolumeWriteDescriptorClient) CommitNeedleWriteRDMABatch(ctx context.Context, volumeServer string, leases []nativeVolumeWriteLease) (swvfsdaemon.VolumeRDMAWriteCommitBatchResponse, error) {
+	var out swvfsdaemon.VolumeRDMAWriteCommitBatchResponse
+	if c == nil {
+		return out, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native volume rdma write descriptor client is not configured"}
+	}
+	if volumeServer == "" {
+		return out, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native volume rdma write commit batch requires a volume server"}
+	}
+	if len(leases) == 0 {
+		return out, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native volume rdma write commit batch requires entries"}
+	}
+	c.Stats.Inc("volume_native_rdma_write_commit_batch_requests")
+	c.Stats.Add("volume_native_rdma_write_commit_batch_entries", uint64(len(leases)))
+	var totalBytes uint64
+	req := swvfsdaemon.VolumeRDMAWriteCommitBatchRequest{
+		Entries: make([]swvfsdaemon.VolumeRDMAWriteCommitRequest, len(leases)),
+	}
+	for i, lease := range leases {
+		totalBytes += lease.Key.Size
+		req.Entries[i] = swvfsdaemon.VolumeRDMAWriteCommitRequest{
+			SessionID: lease.SessionID,
+			FileID:    lease.FileID,
+			VolumeID:  lease.VolumeID,
+			NeedleID:  lease.NeedleID,
+			Cookie:    lease.Cookie,
+			Size:      lease.Key.Size,
+		}
+	}
+	c.Stats.Add("volume_native_rdma_write_commit_batch_requested_bytes", totalBytes)
+	start := time.Now()
+	defer func() {
+		c.Stats.Observe("volume_native_rdma_write_commit_batch", time.Since(start))
+	}()
+	timeout := c.timeout()
+	attemptCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	out, err := swvfsdaemon.PostVolumeNativeWriteCommitBatch(attemptCtx, c.Client, volumeServer, req)
+	if err != nil {
+		c.Stats.Inc("volume_native_rdma_write_commit_batch_post_errors")
+		return out, err
+	}
+	return out, nil
 }
 
 func (c *NativeVolumeWriteDescriptorClient) AbortNeedleWriteRDMA(ctx context.Context, volumeServer string, sessionID uint64) error {

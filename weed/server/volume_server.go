@@ -161,6 +161,7 @@ func NewVolumeServer(adminMux, publicMux *http.ServeMux, ip string,
 	adminMux.HandleFunc(VolumeRdmaNativeWritePath, requestIDMiddleware(vs.guard.WhiteList(vs.volumeRdmaWriteHandler)))
 	adminMux.HandleFunc(VolumeRdmaNativeWriteDescPath, requestIDMiddleware(vs.guard.WhiteList(vs.volumeRdmaWriteDescHandler)))
 	adminMux.HandleFunc(VolumeRdmaNativeWriteCommitPath, requestIDMiddleware(vs.guard.WhiteList(vs.volumeRdmaWriteCommitHandler)))
+	adminMux.HandleFunc(VolumeRdmaNativeWriteCommitBatchPath, requestIDMiddleware(vs.guard.WhiteList(vs.volumeRdmaWriteCommitBatchHandler)))
 	adminMux.HandleFunc(VolumeRdmaNativeWriteAbortPath, requestIDMiddleware(vs.guard.WhiteList(vs.volumeRdmaWriteAbortHandler)))
 	adminMux.HandleFunc("/", requestIDMiddleware(vs.privateStoreHandler))
 	if publicMux != adminMux {

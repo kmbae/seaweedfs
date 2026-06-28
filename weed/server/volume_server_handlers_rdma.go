@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"syscall"
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
@@ -69,6 +70,10 @@ type VolumeRdmaWriteCommitRequest struct {
 	Size      uint64 `json:"size"`
 }
 
+type VolumeRdmaWriteCommitBatchRequest struct {
+	Entries []VolumeRdmaWriteCommitRequest `json:"entries"`
+}
+
 type VolumeRdmaWriteAbortRequest struct {
 	SessionID uint64 `json:"session_id"`
 }
@@ -89,6 +94,19 @@ type volumeRdmaWriteResponse struct {
 	FileID string `json:"file_id"`
 	Size   uint64 `json:"size"`
 	Source string `json:"source"`
+}
+
+type volumeRdmaWriteCommitResult struct {
+	SessionID uint64 `json:"session_id,omitempty"`
+	FileID    string `json:"file_id,omitempty"`
+	Size      uint64 `json:"size,omitempty"`
+	Source    string `json:"source,omitempty"`
+	Status    int32  `json:"status"`
+	Error     string `json:"error,omitempty"`
+}
+
+type volumeRdmaWriteCommitBatchResponse struct {
+	Results []volumeRdmaWriteCommitResult `json:"results"`
 }
 
 type volumeRdmaReleaseDescRequest struct {
@@ -273,23 +291,7 @@ func (vs *VolumeServer) volumeRdmaWriteCommitHandler(w http.ResponseWriter, r *h
 		writeJsonError(w, r, http.StatusBadRequest, err)
 		return
 	}
-	data, err := reader.ReadRegisteredBuffer(r.Context(), req.SessionID, req.Size)
-	if err != nil {
-		_ = reader.ReleaseSession(r.Context(), req.SessionID)
-		writeJsonError(w, r, http.StatusServiceUnavailable, err)
-		return
-	}
-	defer func() {
-		_ = reader.ReleaseSession(context.Background(), req.SessionID)
-	}()
-
-	fileID, err := vs.writeNeedleDataFromNativeRdma(r.Context(), VolumeRdmaWriteRequest{
-		FileID:   req.FileID,
-		VolumeID: req.VolumeID,
-		NeedleID: req.NeedleID,
-		Cookie:   req.Cookie,
-		Size:     req.Size,
-	}, data)
+	fileID, err := vs.commitVolumeRdmaWriteRequest(r.Context(), reader, req)
 	if err != nil {
 		writeJsonError(w, r, http.StatusInternalServerError, err)
 		return
@@ -299,6 +301,50 @@ func (vs *VolumeServer) volumeRdmaWriteCommitHandler(w http.ResponseWriter, r *h
 		Size:   req.Size,
 		Source: "native-volume-rdma-write-desc",
 	})
+}
+
+func (vs *VolumeServer) volumeRdmaWriteCommitBatchHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	reader, ok := vs.rdmaWriteTargetEndpoint()
+	if !ok {
+		http.Error(w, "native RDMA write target endpoint is not configured", http.StatusNotImplemented)
+		return
+	}
+
+	var req VolumeRdmaWriteCommitBatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	if len(req.Entries) == 0 {
+		writeJsonError(w, r, http.StatusBadRequest, fmt.Errorf("entries are required"))
+		return
+	}
+	results := make([]volumeRdmaWriteCommitResult, len(req.Entries))
+	for i, entry := range req.Entries {
+		results[i] = volumeRdmaWriteCommitResult{
+			SessionID: entry.SessionID,
+			FileID:    entry.FileID,
+			Size:      entry.Size,
+		}
+		if err := validateVolumeRdmaWriteCommitRequest(entry); err != nil {
+			results[i].Status = -int32(syscall.EINVAL)
+			results[i].Error = err.Error()
+			continue
+		}
+		fileID, err := vs.commitVolumeRdmaWriteRequest(r.Context(), reader, entry)
+		if err != nil {
+			results[i].Status = volumeRdmaWriteCommitStatus(err)
+			results[i].Error = err.Error()
+			continue
+		}
+		results[i].FileID = fileID
+		results[i].Source = "native-volume-rdma-write-desc"
+	}
+	writeJsonQuiet(w, r, http.StatusOK, volumeRdmaWriteCommitBatchResponse{Results: results})
 }
 
 func (vs *VolumeServer) volumeRdmaWriteAbortHandler(w http.ResponseWriter, r *http.Request) {
@@ -385,6 +431,13 @@ func validateVolumeRdmaWriteCommitRequest(req VolumeRdmaWriteCommitRequest) erro
 	return nil
 }
 
+func volumeRdmaWriteCommitStatus(err error) int32 {
+	if err == nil {
+		return 0
+	}
+	return -int32(syscall.EIO)
+}
+
 type volumeRdmaWriteTargetEndpoint interface {
 	RegisterWriteBufferFor(context.Context, uint64, uint64) (VolumeRdmaRegisteredBuffer, error)
 	ReadRegisteredBuffer(context.Context, uint64, uint64) ([]byte, error)
@@ -397,6 +450,24 @@ func (vs *VolumeServer) rdmaWriteTargetEndpoint() (volumeRdmaWriteTargetEndpoint
 	}
 	target, ok := vs.rdmaEndpoint.(volumeRdmaWriteTargetEndpoint)
 	return target, ok
+}
+
+func (vs *VolumeServer) commitVolumeRdmaWriteRequest(ctx context.Context, reader volumeRdmaWriteTargetEndpoint, req VolumeRdmaWriteCommitRequest) (string, error) {
+	data, err := reader.ReadRegisteredBuffer(ctx, req.SessionID, req.Size)
+	if err != nil {
+		_ = reader.ReleaseSession(ctx, req.SessionID)
+		return "", err
+	}
+	defer func() {
+		_ = reader.ReleaseSession(context.Background(), req.SessionID)
+	}()
+	return vs.writeNeedleDataFromNativeRdma(ctx, VolumeRdmaWriteRequest{
+		FileID:   req.FileID,
+		VolumeID: req.VolumeID,
+		NeedleID: req.NeedleID,
+		Cookie:   req.Cookie,
+		Size:     req.Size,
+	}, data)
 }
 
 func (vs *VolumeServer) writeNeedleDataFromNativeRdma(ctx context.Context, req VolumeRdmaWriteRequest, data []byte) (string, error) {

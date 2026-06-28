@@ -884,6 +884,13 @@ func (b *Backend) CommitWriteRDMABatch(ctx context.Context, fullPath string, ent
 		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma write descriptor backend is not configured"}
 	}
 	fullPath = cleanFullPath(fullPath)
+	if b.NativeWriteDescriptor != nil {
+		if results, attr, err := b.commitWriteNativeRDMABatch(ctx, fullPath, entries); err == nil {
+			return results, attr, nil
+		} else if !isDescriptorFallback(err) {
+			return nil, nil, err
+		}
+	}
 	results := make([]swvfsproto.RDMAWriteCommitResult, len(entries))
 	var lastAttr *swvfsproto.Attr
 	for i, entry := range entries {

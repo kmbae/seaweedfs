@@ -22,6 +22,7 @@ const (
 	VolumeRdmaNativeWritePath            = "/rdma/native/write"
 	VolumeRdmaNativeWriteDescPath        = "/rdma/native/write-desc"
 	VolumeRdmaNativeWriteCommitPath      = "/rdma/native/write-commit"
+	VolumeRdmaNativeWriteCommitBatchPath = "/rdma/native/write-commit-batch"
 	VolumeRdmaNativeWriteAbortPath       = "/rdma/native/write-abort"
 
 	VolumeRdmaABIVersion         uint32 = 1
@@ -99,6 +100,7 @@ type volumeRdmaNativeStatusResponse struct {
 	WritePath              string `json:"write_path"`
 	WriteDescPath          string `json:"write_desc_path"`
 	WriteCommitPath        string `json:"write_commit_path"`
+	WriteCommitBatchPath   string `json:"write_commit_batch_path"`
 	WriteAbortPath         string `json:"write_abort_path"`
 }
 
@@ -164,6 +166,7 @@ func (vs *VolumeServer) volumeRdmaStatusHandler(w http.ResponseWriter, r *http.R
 		WritePath:              VolumeRdmaNativeWritePath,
 		WriteDescPath:          VolumeRdmaNativeWriteDescPath,
 		WriteCommitPath:        VolumeRdmaNativeWriteCommitPath,
+		WriteCommitBatchPath:   VolumeRdmaNativeWriteCommitBatchPath,
 		WriteAbortPath:         VolumeRdmaNativeWriteAbortPath,
 	})
 }

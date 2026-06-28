@@ -478,6 +478,115 @@ func TestBackendWriteRDMAPrefersNativeVolumeDescriptor(t *testing.T) {
 	}
 }
 
+func TestBackendWriteRDMABatchUsesNativeVolumeCommitBatch(t *testing.T) {
+	var sawConnect bool
+	var prepareCount, singleCommitCount, batchCommitCount int
+	nextSession := uint64(55)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case swvfsdaemon.VolumeRDMALocalPath:
+			_ = json.NewEncoder(w).Encode(swvfsdaemon.RDMALocalEndpoint{
+				ConnectionID:  44,
+				ABIVersion:    swvfsproto.RDMAABIVersion,
+				KernelEnabled: true,
+				EndpointReady: true,
+				Port:          1,
+				QPNum:         123,
+				PSN:           456,
+				LID:           789,
+				LinkLayer:     swvfsproto.RDMALinkInfiniBand,
+			})
+		case swvfsdaemon.VolumeRDMAConnectPath:
+			sawConnect = true
+			_ = json.NewEncoder(w).Encode(map[string]bool{"connected": true})
+		case swvfsdaemon.VolumeRDMAWriteDescPath:
+			prepareCount++
+			nextSession++
+			var req swvfsdaemon.VolumeRDMAWriteDescRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode write desc: %v", err)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(swvfsdaemon.VolumeRDMAWriteDescResponse{
+				Desc: swvfsproto.RDMADataDesc{
+					RemoteAddr: 0xbeef + nextSession,
+					RKey:       77,
+					Length:     uint32(req.Size),
+				},
+				ConnectionID: 44,
+				SessionID:    nextSession,
+			})
+		case swvfsdaemon.VolumeRDMAWriteCommitPath:
+			singleCommitCount++
+			http.Error(w, "single commit should not be used", http.StatusInternalServerError)
+		case swvfsdaemon.VolumeRDMAWriteCommitBatchPath:
+			batchCommitCount++
+			var req swvfsdaemon.VolumeRDMAWriteCommitBatchRequest
+			if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+				t.Errorf("decode write commit batch: %v", err)
+				return
+			}
+			if len(req.Entries) != 2 || req.Entries[0].SessionID == 0 || req.Entries[1].Size != 8192 {
+				t.Errorf("write commit batch request = %+v", req)
+			}
+			resp := swvfsdaemon.VolumeRDMAWriteCommitBatchResponse{
+				Results: make([]swvfsdaemon.VolumeRDMAWriteCommitResult, len(req.Entries)),
+			}
+			for i, entry := range req.Entries {
+				resp.Results[i] = swvfsdaemon.VolumeRDMAWriteCommitResult{
+					SessionID: entry.SessionID,
+					FileID:    entry.FileID,
+					Size:      entry.Size,
+					Source:    "native-volume-rdma-write-desc",
+				}
+			}
+			_ = json.NewEncoder(w).Encode(resp)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	store := &fakeStore{
+		entries:      map[string]*filer_pb.Entry{},
+		assignServer: server.URL,
+		assignFileID: "3,01637037d6",
+	}
+	backend := &Backend{
+		Store: store,
+		NativeWriteDescriptor: &NativeVolumeWriteDescriptorClient{
+			Control: &fakeNativeWriteControl{},
+			Timeout: time.Second,
+		},
+	}
+	if _, _, err := backend.PrepareWriteRDMA(context.Background(), "/native-batch", 0, 4096); err != nil {
+		t.Fatalf("PrepareWriteRDMA first: %v", err)
+	}
+	if _, _, err := backend.PrepareWriteRDMA(context.Background(), "/native-batch", 4096, 8192); err != nil {
+		t.Fatalf("PrepareWriteRDMA second: %v", err)
+	}
+	results, attr, err := backend.CommitWriteRDMABatch(context.Background(), "/native-batch", []swvfsproto.RDMAWriteCommitEntry{
+		{Offset: 0, Size: 4096},
+		{Offset: 4096, Size: 8192},
+	})
+	if err != nil {
+		t.Fatalf("CommitWriteRDMABatch: %v", err)
+	}
+	if len(results) != 2 || results[0].Status != 0 || results[1].Status != 0 {
+		t.Fatalf("results = %+v", results)
+	}
+	if attr == nil || attr.Size != 12288 {
+		t.Fatalf("attr = %+v", attr)
+	}
+	if !sawConnect || prepareCount != 2 || batchCommitCount != 1 || singleCommitCount != 0 {
+		t.Fatalf("connect/prepare/batch/single = %v/%d/%d/%d", sawConnect, prepareCount, batchCommitCount, singleCommitCount)
+	}
+	entry := store.entries["/native-batch"]
+	if entry == nil || len(entry.Chunks) != 2 || entry.Chunks[1].Offset != 4096 || entry.Chunks[1].Size != 8192 {
+		t.Fatalf("saved entry = %+v", entry)
+	}
+}
+
 func TestBackendSequentialWritesCoalesceUntilFlush(t *testing.T) {
 	store := &fakeStore{entries: map[string]*filer_pb.Entry{}}
 	plane := &capturePlane{}

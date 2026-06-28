@@ -334,6 +334,45 @@ func TestFetchVolumeNativeStatus(t *testing.T) {
 	}
 }
 
+func TestPostVolumeNativeWriteCommitBatch(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != VolumeRDMAWriteCommitBatchPath {
+			t.Errorf("path = %q", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		var req VolumeRDMAWriteCommitBatchRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(req.Entries) != 2 || req.Entries[0].SessionID != 11 || req.Entries[1].Size != 8192 {
+			t.Errorf("entries = %+v", req.Entries)
+		}
+		writeJSON(w, VolumeRDMAWriteCommitBatchResponse{
+			Results: []VolumeRDMAWriteCommitResult{
+				{SessionID: 11, FileID: "3,abc", Size: 4096, Source: "native-volume-rdma-write-desc"},
+				{SessionID: 12, FileID: "3,def", Size: 8192, Source: "native-volume-rdma-write-desc"},
+			},
+		})
+	}))
+	defer server.Close()
+
+	resp, err := PostVolumeNativeWriteCommitBatch(context.Background(), server.Client(), server.URL, VolumeRDMAWriteCommitBatchRequest{
+		Entries: []VolumeRDMAWriteCommitRequest{
+			{SessionID: 11, FileID: "3,abc", VolumeID: 3, NeedleID: 1, Cookie: 2, Size: 4096},
+			{SessionID: 12, FileID: "3,def", VolumeID: 3, NeedleID: 2, Cookie: 2, Size: 8192},
+		},
+	})
+	if err != nil {
+		t.Fatalf("PostVolumeNativeWriteCommitBatch: %v", err)
+	}
+	if len(resp.Results) != 2 || resp.Results[0].FileID != "3,abc" || resp.Results[1].Size != 8192 {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+}
+
 func TestVolumeNativeRDMAReadDescriptorClientHandshakeFailureFallsBack(t *testing.T) {
 	client := &VolumeNativeRDMAReadDescriptorClient{
 		Control: &fakeRDMAControl{},

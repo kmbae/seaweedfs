@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -24,6 +25,8 @@ type fakeVolumeRdmaEndpoint struct {
 	requesterLocalID   uint64
 	requesterConnectID uint64
 	requesterReadData  []byte
+	registeredReads    int
+	releasedSessions   []uint64
 }
 
 func (e *fakeVolumeRdmaEndpoint) LocalEndpoint(ctx context.Context) (VolumeRdmaEndpointInfo, error) {
@@ -69,6 +72,20 @@ func (e *fakeVolumeRdmaEndpoint) ReadRemoteFor(ctx context.Context, connectionID
 	return append([]byte(nil), e.requesterReadData...), nil
 }
 
+func (e *fakeVolumeRdmaEndpoint) RegisterWriteBufferFor(ctx context.Context, connectionID uint64, size uint64) (VolumeRdmaRegisteredBuffer, error) {
+	return nil, errors.New("not implemented")
+}
+
+func (e *fakeVolumeRdmaEndpoint) ReadRegisteredBuffer(ctx context.Context, sessionID uint64, size uint64) ([]byte, error) {
+	e.registeredReads++
+	return nil, errors.New("not implemented")
+}
+
+func (e *fakeVolumeRdmaEndpoint) ReleaseSession(ctx context.Context, sessionID uint64) error {
+	e.releasedSessions = append(e.releasedSessions, sessionID)
+	return nil
+}
+
 func readyVolumeRdmaEndpoint(qpn uint32) VolumeRdmaEndpointInfo {
 	return VolumeRdmaEndpointInfo{
 		ABIVersion:    VolumeRdmaABIVersion,
@@ -104,7 +121,7 @@ func TestVolumeRdmaStatusHandlerReportsConfiguration(t *testing.T) {
 	if !resp.EndpointConfigured || !resp.ReadExporterConfigured {
 		t.Fatalf("unexpected status response: %+v", resp)
 	}
-	if resp.LocalPath != VolumeRdmaNativeLocalPath || resp.ConnectPath != VolumeRdmaNativeConnectPath {
+	if resp.LocalPath != VolumeRdmaNativeLocalPath || resp.ConnectPath != VolumeRdmaNativeConnectPath || resp.WriteCommitBatchPath != VolumeRdmaNativeWriteCommitBatchPath {
 		t.Fatalf("unexpected endpoint paths: %+v", resp)
 	}
 }
@@ -224,5 +241,36 @@ func TestVolumeRdmaRequesterConnectHandlerConvertsPeerEndpoint(t *testing.T) {
 	}
 	if endpoint.requesterRemote.QPN != 2233 || endpoint.requesterRemote.SL != 4 {
 		t.Fatalf("unexpected requester remote info: %+v", endpoint.requesterRemote)
+	}
+}
+
+func TestVolumeRdmaWriteCommitBatchHandlerReportsEntryValidation(t *testing.T) {
+	endpoint := &fakeVolumeRdmaEndpoint{}
+	vs := &VolumeServer{rdmaEndpoint: endpoint}
+	body, err := json.Marshal(VolumeRdmaWriteCommitBatchRequest{
+		Entries: []VolumeRdmaWriteCommitRequest{
+			{SessionID: 0, FileID: "3,abc", VolumeID: 3, NeedleID: 1, Cookie: 2, Size: 4096},
+		},
+	})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, VolumeRdmaNativeWriteCommitBatchPath, bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	vs.volumeRdmaWriteCommitBatchHandler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp volumeRdmaWriteCommitBatchResponse
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode response: %v", err)
+	}
+	if len(resp.Results) != 1 || resp.Results[0].Status == 0 || resp.Results[0].Error == "" {
+		t.Fatalf("unexpected batch response: %+v", resp)
+	}
+	if endpoint.registeredReads != 0 {
+		t.Fatalf("registered reads = %d, want 0", endpoint.registeredReads)
 	}
 }
