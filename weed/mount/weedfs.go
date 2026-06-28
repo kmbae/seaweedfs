@@ -146,6 +146,11 @@ type WFS struct {
 	hardLinkLockTable     *util.LockTable[string]
 	posixLocks            *PosixLockTable
 	rdmaClient            *RDMAMountClient
+	rdmaReadAheadLock     sync.Mutex
+	rdmaReadAheadFetch    sync.Mutex
+	rdmaReadAhead         map[string][]byte
+	rdmaReadAheadOrder    []string
+	rdmaReadAheadBytes    int64
 	peerRegistrar         *PeerRegistrar
 	peerDirectory         *PeerDirectory
 	peerGrpcServer        *PeerGrpcServer

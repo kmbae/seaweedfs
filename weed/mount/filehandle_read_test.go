@@ -157,3 +157,21 @@ func TestRDMAReadAheadCacheCopiesRange(t *testing.T) {
 		t.Fatal("expected cache miss after clear")
 	}
 }
+
+func TestRDMAReadAheadCacheIsSharedPerWFS(t *testing.T) {
+	wfs := &WFS{}
+	writer := &FileHandle{wfs: wfs}
+	reader := &FileHandle{wfs: wfs}
+	writer.storeRDMAReadAhead("1,shared", []byte("shared-data"))
+
+	buf := make([]byte, 6)
+	n, ok := reader.readRDMAReadAhead(&rdmaChunkReadPlan{
+		fileID:      "1,shared",
+		chunkOffset: 7,
+		readSize:    4,
+	}, buf)
+
+	if !ok || n != 4 || string(buf[:4]) != "data" {
+		t.Fatalf("unexpected shared cache read: ok=%v n=%d buf=%q", ok, n, buf)
+	}
+}

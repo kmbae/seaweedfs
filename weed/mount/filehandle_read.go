@@ -139,8 +139,8 @@ func (fh *FileHandle) tryRDMARead(ctx context.Context, fileSize int64, buff []by
 		return totalRead, plan.chunk.ModifiedTsNs, nil
 	}
 
-	fh.rdmaReadAheadFetch.Lock()
-	defer fh.rdmaReadAheadFetch.Unlock()
+	unlockFetch := fh.lockRDMAReadAheadFetch()
+	defer unlockFetch()
 
 	if totalRead, ok := fh.readRDMAReadAhead(plan, buff); ok {
 		glog.V(4).Infof("RDMA read-ahead cache hit after wait: fileId=%s, chunkOffset=%d, readSize=%d",
@@ -339,6 +339,9 @@ func (fh *FileHandle) readRDMAReadAhead(plan *rdmaChunkReadPlan, buff []byte) (i
 }
 
 func (fh *FileHandle) getRDMAReadAhead(fileID string) ([]byte, bool) {
+	if fh.wfs != nil {
+		return fh.wfs.getRDMAReadAhead(fileID)
+	}
 	fh.rdmaReadAheadLock.Lock()
 	defer fh.rdmaReadAheadLock.Unlock()
 	data, ok := fh.rdmaReadAhead[fileID]
@@ -346,6 +349,9 @@ func (fh *FileHandle) getRDMAReadAhead(fileID string) ([]byte, bool) {
 }
 
 func (fh *FileHandle) rdmaReadAheadHas(fileID string) bool {
+	if fh.wfs != nil {
+		return fh.wfs.rdmaReadAheadHas(fileID)
+	}
 	fh.rdmaReadAheadLock.Lock()
 	defer fh.rdmaReadAheadLock.Unlock()
 	_, ok := fh.rdmaReadAhead[fileID]
@@ -353,6 +359,10 @@ func (fh *FileHandle) rdmaReadAheadHas(fileID string) bool {
 }
 
 func (fh *FileHandle) storeRDMAReadAhead(fileID string, data []byte) {
+	if fh.wfs != nil {
+		fh.wfs.storeRDMAReadAhead(fileID, data)
+		return
+	}
 	if fileID == "" || len(data) == 0 || len(data) > rdmaReadAheadMaxChunkBytes {
 		return
 	}
@@ -380,6 +390,10 @@ func (fh *FileHandle) storeRDMAReadAhead(fileID string, data []byte) {
 }
 
 func (fh *FileHandle) dropRDMAReadAhead(fileID string) {
+	if fh.wfs != nil {
+		fh.wfs.dropRDMAReadAhead(fileID)
+		return
+	}
 	fh.rdmaReadAheadLock.Lock()
 	defer fh.rdmaReadAheadLock.Unlock()
 	if fh.rdmaReadAhead == nil {
@@ -405,6 +419,79 @@ func (fh *FileHandle) removeRDMAReadAheadOrderLocked(fileID string) {
 		if cachedFileID == fileID {
 			copy(fh.rdmaReadAheadOrder[i:], fh.rdmaReadAheadOrder[i+1:])
 			fh.rdmaReadAheadOrder = fh.rdmaReadAheadOrder[:len(fh.rdmaReadAheadOrder)-1]
+			return
+		}
+	}
+}
+
+func (fh *FileHandle) lockRDMAReadAheadFetch() func() {
+	if fh.wfs != nil {
+		fh.wfs.rdmaReadAheadFetch.Lock()
+		return fh.wfs.rdmaReadAheadFetch.Unlock
+	}
+	fh.rdmaReadAheadFetch.Lock()
+	return fh.rdmaReadAheadFetch.Unlock
+}
+
+func (wfs *WFS) getRDMAReadAhead(fileID string) ([]byte, bool) {
+	wfs.rdmaReadAheadLock.Lock()
+	defer wfs.rdmaReadAheadLock.Unlock()
+	data, ok := wfs.rdmaReadAhead[fileID]
+	return data, ok
+}
+
+func (wfs *WFS) rdmaReadAheadHas(fileID string) bool {
+	wfs.rdmaReadAheadLock.Lock()
+	defer wfs.rdmaReadAheadLock.Unlock()
+	_, ok := wfs.rdmaReadAhead[fileID]
+	return ok
+}
+
+func (wfs *WFS) storeRDMAReadAhead(fileID string, data []byte) {
+	if fileID == "" || len(data) == 0 || len(data) > rdmaReadAheadMaxChunkBytes {
+		return
+	}
+	wfs.rdmaReadAheadLock.Lock()
+	defer wfs.rdmaReadAheadLock.Unlock()
+	if wfs.rdmaReadAhead == nil {
+		wfs.rdmaReadAhead = make(map[string][]byte)
+	}
+	if old, ok := wfs.rdmaReadAhead[fileID]; ok {
+		wfs.rdmaReadAheadBytes -= int64(len(old))
+		wfs.removeRDMAReadAheadOrderLocked(fileID)
+	}
+	wfs.rdmaReadAhead[fileID] = data
+	wfs.rdmaReadAheadOrder = append(wfs.rdmaReadAheadOrder, fileID)
+	wfs.rdmaReadAheadBytes += int64(len(data))
+
+	for (wfs.rdmaReadAheadBytes > rdmaReadAheadMaxBytes || len(wfs.rdmaReadAhead) > rdmaReadAheadMaxChunks) && len(wfs.rdmaReadAheadOrder) > 0 {
+		victim := wfs.rdmaReadAheadOrder[0]
+		wfs.rdmaReadAheadOrder = wfs.rdmaReadAheadOrder[1:]
+		if old, ok := wfs.rdmaReadAhead[victim]; ok {
+			delete(wfs.rdmaReadAhead, victim)
+			wfs.rdmaReadAheadBytes -= int64(len(old))
+		}
+	}
+}
+
+func (wfs *WFS) dropRDMAReadAhead(fileID string) {
+	wfs.rdmaReadAheadLock.Lock()
+	defer wfs.rdmaReadAheadLock.Unlock()
+	if wfs.rdmaReadAhead == nil {
+		return
+	}
+	if old, ok := wfs.rdmaReadAhead[fileID]; ok {
+		delete(wfs.rdmaReadAhead, fileID)
+		wfs.rdmaReadAheadBytes -= int64(len(old))
+		wfs.removeRDMAReadAheadOrderLocked(fileID)
+	}
+}
+
+func (wfs *WFS) removeRDMAReadAheadOrderLocked(fileID string) {
+	for i, cachedFileID := range wfs.rdmaReadAheadOrder {
+		if cachedFileID == fileID {
+			copy(wfs.rdmaReadAheadOrder[i:], wfs.rdmaReadAheadOrder[i+1:])
+			wfs.rdmaReadAheadOrder = wfs.rdmaReadAheadOrder[:len(wfs.rdmaReadAheadOrder)-1]
 			return
 		}
 	}
