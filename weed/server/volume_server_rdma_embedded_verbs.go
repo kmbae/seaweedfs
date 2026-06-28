@@ -650,6 +650,7 @@ type embeddedVolumeRdmaTransport struct {
 }
 
 type embeddedVolumeRdmaConnection struct {
+	mu        sync.Mutex
 	id        uint64
 	handle    *C.swrdma_conn
 	endpoint  VolumeRdmaEndpointInfo
@@ -795,6 +796,25 @@ func (t *embeddedVolumeRdmaTransport) ReadRemoteToFor(ctx context.Context, conne
 	return t.readRemotePipelineTo(ctx, connectionID, desc, timeout, dst)
 }
 
+func (t *embeddedVolumeRdmaTransport) connectedConnection(ctx context.Context, connectionID uint64, op string) (*embeddedVolumeRdmaConnection, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if connectionID == 0 {
+		return nil, fmt.Errorf("embedded RDMA %s requires connection_id", op)
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	conn, err := t.ensureConnectionLocked(connectionID)
+	if err != nil {
+		return nil, err
+	}
+	if !conn.connected {
+		return nil, fmt.Errorf("embedded RDMA connection %d is not connected", connectionID)
+	}
+	return conn, nil
+}
+
 func (t *embeddedVolumeRdmaTransport) readRemoteMR(ctx context.Context, connectionID uint64, desc VolumeRdmaDataDesc, timeout time.Duration) (*C.swrdma_mr, uint64, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, 0, err
@@ -814,15 +834,12 @@ func (t *embeddedVolumeRdmaTransport) readRemoteMR(ctx context.Context, connecti
 	}
 	poolKey := embeddedVolumeRdmaReadMRPoolKey(desc.Length)
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	conn, err := t.ensureConnectionLocked(connectionID)
+	conn, err := t.connectedConnection(ctx, connectionID, "read_remote")
 	if err != nil {
 		return nil, 0, err
 	}
-	if !conn.connected {
-		return nil, 0, fmt.Errorf("embedded RDMA connection %d is not connected", connectionID)
-	}
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
 	var errBuf [embeddedVolumeRdmaErrLen]C.char
 	mr, err := t.acquireReadMRLocked(conn, poolKey)
 	if err != nil {
@@ -866,15 +883,12 @@ func (t *embeddedVolumeRdmaTransport) readRemotePipelineTo(ctx context.Context, 
 		timeoutMs = 1
 	}
 
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	conn, err := t.ensureConnectionLocked(connectionID)
+	conn, err := t.connectedConnection(ctx, connectionID, "read_remote pipeline")
 	if err != nil {
 		return err
 	}
-	if !conn.connected {
-		return fmt.Errorf("embedded RDMA connection %d is not connected", connectionID)
-	}
+	conn.mu.Lock()
+	defer conn.mu.Unlock()
 
 	inFlight := make(map[uint64]*embeddedVolumeRdmaReadChunk, volumeRdmaPipelineDepth)
 	completed := make([]*embeddedVolumeRdmaReadChunk, len(chunks))
@@ -1133,7 +1147,9 @@ func (t *embeddedVolumeRdmaTransport) ReleaseSession(ctx context.Context, sessio
 			C.swrdma_free_mr(buffer.mr)
 			stats.VolumeServerRdmaMRPoolOps.WithLabelValues("session", "free").Inc()
 		} else {
+			conn.mu.Lock()
 			t.releaseSessionMRLocked(conn, buffer.poolKey, buffer.mr, true)
+			conn.mu.Unlock()
 		}
 		buffer.mr = nil
 	}
@@ -1159,6 +1175,7 @@ func (t *embeddedVolumeRdmaTransport) Close() error {
 		buffer.mr = nil
 	}
 	for _, conn := range connections {
+		conn.mu.Lock()
 		for _, pool := range conn.readMRPool {
 			for _, mr := range pool {
 				C.swrdma_free_mr(mr)
@@ -1171,6 +1188,8 @@ func (t *embeddedVolumeRdmaTransport) Close() error {
 		}
 		C.swrdma_close_conn(conn.handle)
 		conn.handle = nil
+		conn.connected = false
+		conn.mu.Unlock()
 	}
 	return nil
 }
@@ -1210,13 +1229,16 @@ func (t *embeddedVolumeRdmaTransport) releaseReadMR(connectionID uint64, poolKey
 		return
 	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	conn := t.connections[connectionID]
 	if t.closed || conn == nil {
+		t.mu.Unlock()
 		C.swrdma_free_mr(mr)
 		stats.VolumeServerRdmaMRPoolOps.WithLabelValues("read", "free").Inc()
 		return
 	}
+	conn.mu.Lock()
+	t.mu.Unlock()
+	defer conn.mu.Unlock()
 	t.releaseReadMRLocked(conn, poolKey, mr, reusable)
 }
 
@@ -1270,7 +1292,9 @@ func (t *embeddedVolumeRdmaTransport) allocateSessionBuffer(ctx context.Context,
 		return nil, err
 	}
 	poolKey := embeddedVolumeRdmaSessionMRPoolKey(kind, size)
+	conn.mu.Lock()
 	mr, err := t.acquireSessionMRLocked(conn, poolKey)
+	conn.mu.Unlock()
 	if err != nil {
 		return nil, err
 	}

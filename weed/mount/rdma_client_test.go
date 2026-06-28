@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -426,8 +427,13 @@ func TestRDMAMountClient_NativeReadNeedlesToUsesDescriptorBatch(t *testing.T) {
 	var releaseBatchCalls atomic.Int64
 	mux := http.NewServeMux()
 	mux.HandleFunc(weed_server.VolumeRdmaNativeLocalPath, func(w http.ResponseWriter, r *http.Request) {
+		connectionID, err := strconv.ParseUint(r.URL.Query().Get("connection_id"), 10, 64)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		local := readyMountRdmaEndpoint(100)
-		local.ConnectionID = 11
+		local.ConnectionID = connectionID
 		_ = json.NewEncoder(w).Encode(local)
 	})
 	mux.HandleFunc(weed_server.VolumeRdmaNativeConnectPath, func(w http.ResponseWriter, r *http.Request) {
@@ -457,8 +463,8 @@ func TestRDMAMountClient_NativeReadNeedlesToUsesDescriptorBatch(t *testing.T) {
 			http.Error(w, fmt.Sprintf("entries=%d", len(req.Entries)), http.StatusBadRequest)
 			return
 		}
-		for _, entry := range req.Entries {
-			if entry.ConnectionID != 11 || entry.VolumeID != 7 {
+		for i, entry := range req.Entries {
+			if entry.ConnectionID != uint64(i+1) || entry.VolumeID != 7 {
 				http.Error(w, fmt.Sprintf("unexpected entry: %+v", entry), http.StatusBadRequest)
 				return
 			}
@@ -523,8 +529,8 @@ func TestRDMAMountClient_NativeReadNeedlesToUsesDescriptorBatch(t *testing.T) {
 	if n != 7 || out1.String() != "abc" || out2.String() != "abcd" {
 		t.Fatalf("unexpected batch read output: n=%d out1=%q out2=%q", n, out1.String(), out2.String())
 	}
-	if requester.localCalls.Load() != 1 || requester.connects.Load() != 1 || providerConnects.Load() != 1 {
-		t.Fatalf("handshake was not cached: requesterLocal=%d requesterConnect=%d providerConnect=%d",
+	if requester.localCalls.Load() != 2 || requester.connects.Load() != 2 || providerConnects.Load() != 2 {
+		t.Fatalf("parallel handshakes: requesterLocal=%d requesterConnect=%d providerConnect=%d",
 			requester.localCalls.Load(), requester.connects.Load(), providerConnects.Load())
 	}
 	if readDescBatchCalls.Load() != 1 || requester.readCalls.Load() != 2 || releaseBatchCalls.Load() != 1 {

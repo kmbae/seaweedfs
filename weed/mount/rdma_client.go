@@ -80,6 +80,7 @@ type RDMAMountClient struct {
 }
 
 type rdmaNativeConnection struct {
+	cacheKey              string
 	volumeServer          string
 	providerConnectionID  uint64
 	requesterConnectionID uint64
@@ -625,13 +626,16 @@ func (c *RDMAMountClient) readNeedlesNativeForVolumeTo(ctx context.Context, volu
 		return c.readNeedleNativeTo(ctx, volumeServer, read.FileID, read.Offset, read.Size, read.Dst)
 	}
 
-	conn, err := c.ensureNativeConnection(ctx, volumeServer)
-	if err != nil {
-		return 0, err
-	}
-
 	entries := make([]weed_server.VolumeRdmaReadRequest, len(group))
+	conns := make([]*rdmaNativeConnection, len(group))
+	parallelism := c.nativeReadBatchParallelism(len(group))
 	for i, item := range group {
+		conn, err := c.ensureNativeConnectionSlot(ctx, volumeServer, i%parallelism)
+		if err != nil {
+			return 0, err
+		}
+		conns[i] = conn
+
 		fid, err := needle.ParseFileIdFromString(item.read.FileID)
 		if err != nil {
 			return 0, fmt.Errorf("parse file id %s: %w", item.read.FileID, err)
@@ -648,8 +652,7 @@ func (c *RDMAMountClient) readNeedlesNativeForVolumeTo(ctx context.Context, volu
 	}
 
 	var resp volumeRdmaReadDescBatchResponse
-	err = c.doNativeJSON(ctx, http.MethodPost, volumeServer, weed_server.VolumeRdmaNativeReadDescBatchPath, nil, weed_server.VolumeRdmaReadDescBatchRequest{Entries: entries}, &resp)
-	if err != nil {
+	if err := c.doNativeJSON(ctx, http.MethodPost, volumeServer, weed_server.VolumeRdmaNativeReadDescBatchPath, nil, weed_server.VolumeRdmaReadDescBatchRequest{Entries: entries}, &resp); err != nil {
 		glog.V(2).Infof("native RDMA read descriptor batch failed for %s, using single descriptors: %v", volumeServer, err)
 		var total int64
 		for _, item := range group {
@@ -710,22 +713,7 @@ func (c *RDMAMountClient) readNeedlesNativeForVolumeTo(ctx context.Context, volu
 		return 0, validationErr
 	}
 
-	var total int64
-	var readErr error
-	for i, item := range group {
-		counter := &countingWriter{w: item.read.Dst}
-		if err := c.nativeRequester.ReadRemoteToFor(ctx, conn.requesterConnectionID, descs[i], c.timeout, counter); err != nil {
-			c.dropNativeConnection(volumeServer, conn)
-			readErr = fmt.Errorf("native RDMA READ failed: %w", err)
-			total += counter.n
-			break
-		}
-		total += counter.n
-		if counter.n != int64(item.read.Size) {
-			readErr = fmt.Errorf("native RDMA READ copied %d bytes, expected %d", counter.n, item.read.Size)
-			break
-		}
-	}
+	total, readErr := c.readNativeBatchDescsParallel(ctx, volumeServer, group, conns, descs, parallelism)
 
 	releaseErr := c.releaseNativeReadDescs(context.Background(), volumeServer, sessionIDs)
 	if readErr != nil {
@@ -733,6 +721,87 @@ func (c *RDMAMountClient) readNeedlesNativeForVolumeTo(ctx context.Context, volu
 	}
 	if releaseErr != nil {
 		glog.V(2).Infof("native RDMA read descriptor batch release failed for %s sessions=%v: %v", volumeServer, sessionIDs, releaseErr)
+	}
+	return total, nil
+}
+
+func (c *RDMAMountClient) nativeReadBatchParallelism(entries int) int {
+	if entries <= 1 {
+		return 1
+	}
+	parallelism := c.maxConcurrent
+	if parallelism <= 0 {
+		parallelism = 1
+	}
+	if parallelism > entries {
+		parallelism = entries
+	}
+	return parallelism
+}
+
+func (c *RDMAMountClient) readNativeBatchDescsParallel(ctx context.Context, volumeServer string, group []rdmaNeedleReadForVolume, conns []*rdmaNativeConnection, descs []weed_server.VolumeRdmaDataDesc, parallelism int) (int64, error) {
+	if parallelism <= 1 || len(group) <= 1 {
+		var total int64
+		for i, item := range group {
+			counter := &countingWriter{w: item.read.Dst}
+			if err := c.nativeRequester.ReadRemoteToFor(ctx, conns[i].requesterConnectionID, descs[i], c.timeout, counter); err != nil {
+				c.dropNativeConnection(volumeServer, conns[i])
+				return total + counter.n, fmt.Errorf("native RDMA READ failed: %w", err)
+			}
+			total += counter.n
+			if counter.n != int64(item.read.Size) {
+				return total, fmt.Errorf("native RDMA READ copied %d bytes, expected %d", counter.n, item.read.Size)
+			}
+		}
+		return total, nil
+	}
+
+	readCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	type readResult struct {
+		n   int64
+		err error
+	}
+	results := make([]readResult, len(group))
+	sem := make(chan struct{}, parallelism)
+	var wg sync.WaitGroup
+	for i, item := range group {
+		i, item := i, item
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+				defer func() { <-sem }()
+			case <-readCtx.Done():
+				results[i].err = readCtx.Err()
+				return
+			}
+
+			counter := &countingWriter{w: item.read.Dst}
+			if err := c.nativeRequester.ReadRemoteToFor(readCtx, conns[i].requesterConnectionID, descs[i], c.timeout, counter); err != nil {
+				c.dropNativeConnection(volumeServer, conns[i])
+				results[i] = readResult{n: counter.n, err: fmt.Errorf("native RDMA READ failed: %w", err)}
+				cancel()
+				return
+			}
+			if counter.n != int64(item.read.Size) {
+				results[i] = readResult{n: counter.n, err: fmt.Errorf("native RDMA READ copied %d bytes, expected %d", counter.n, item.read.Size)}
+				cancel()
+				return
+			}
+			results[i] = readResult{n: counter.n}
+		}()
+	}
+	wg.Wait()
+
+	var total int64
+	for _, result := range results {
+		total += result.n
+		if result.err != nil {
+			return total, result.err
+		}
 	}
 	return total, nil
 }
@@ -801,10 +870,15 @@ func (c *RDMAMountClient) readNeedleNativeTo(ctx context.Context, volumeServer s
 }
 
 func (c *RDMAMountClient) ensureNativeConnection(ctx context.Context, volumeServer string) (*rdmaNativeConnection, error) {
+	return c.ensureNativeConnectionSlot(ctx, volumeServer, 0)
+}
+
+func (c *RDMAMountClient) ensureNativeConnectionSlot(ctx context.Context, volumeServer string, slot int) (*rdmaNativeConnection, error) {
 	c.nativeConnMu.Lock()
 	defer c.nativeConnMu.Unlock()
 
-	if conn := c.nativeConnections[volumeServer]; conn != nil {
+	cacheKey := nativeConnectionCacheKey(volumeServer, slot)
+	if conn := c.nativeConnections[cacheKey]; conn != nil {
 		return conn, nil
 	}
 
@@ -830,28 +904,36 @@ func (c *RDMAMountClient) ensureNativeConnection(ctx context.Context, volumeServ
 	}
 
 	if err := c.connectNativeProvider(ctx, volumeServer, providerConnectionID, requesterLocal); err != nil {
-		c.dropNativeConnectionLocked(volumeServer, requesterConnectionID, providerConnectionID)
+		c.dropNativeConnectionLocked(cacheKey, requesterConnectionID, providerConnectionID)
 		return nil, fmt.Errorf("native RDMA provider connect failed: %w", err)
 	}
 	providerRemote, err := providerLocal.RemoteInfo(c.nativeServiceLevel)
 	if err != nil {
-		c.dropNativeConnectionLocked(volumeServer, requesterConnectionID, providerConnectionID)
+		c.dropNativeConnectionLocked(cacheKey, requesterConnectionID, providerConnectionID)
 		return nil, fmt.Errorf("native RDMA provider endpoint metadata failed: %w", err)
 	}
 	if err := c.nativeRequester.RequesterConnectEndpointFor(ctx, requesterConnectionID, providerRemote); err != nil {
-		c.dropNativeConnectionLocked(volumeServer, requesterConnectionID, providerConnectionID)
+		c.dropNativeConnectionLocked(cacheKey, requesterConnectionID, providerConnectionID)
 		return nil, fmt.Errorf("native RDMA requester connect failed: %w", err)
 	}
 
 	conn := &rdmaNativeConnection{
+		cacheKey:              cacheKey,
 		volumeServer:          volumeServer,
 		providerConnectionID:  providerConnectionID,
 		requesterConnectionID: requesterConnectionID,
 		connectedAt:           time.Now(),
 	}
-	c.nativeConnections[volumeServer] = conn
+	c.nativeConnections[cacheKey] = conn
 	glog.Infof("native RDMA mount connected: volumeServer=%s providerConnectionID=%d requesterConnectionID=%d", volumeServer, providerConnectionID, requesterConnectionID)
 	return conn, nil
+}
+
+func nativeConnectionCacheKey(volumeServer string, slot int) string {
+	if slot <= 0 {
+		return volumeServer
+	}
+	return fmt.Sprintf("%s#%d", volumeServer, slot)
 }
 
 func (c *RDMAMountClient) nextNativeConnectionID() uint64 {
@@ -983,16 +1065,16 @@ func (c *RDMAMountClient) dropNativeConnection(volumeServer string, conn *rdmaNa
 		delete(c.nativeConnections, volumeServer)
 		return
 	}
-	c.dropNativeConnectionLocked(volumeServer, conn.requesterConnectionID, conn.providerConnectionID)
+	c.dropNativeConnectionLocked(conn.cacheKey, conn.requesterConnectionID, conn.providerConnectionID)
 }
 
-func (c *RDMAMountClient) dropNativeConnectionLocked(volumeServer string, requesterConnectionID uint64, providerConnectionID uint64) {
-	if existing := c.nativeConnections[volumeServer]; existing != nil {
+func (c *RDMAMountClient) dropNativeConnectionLocked(cacheKey string, requesterConnectionID uint64, providerConnectionID uint64) {
+	if existing := c.nativeConnections[cacheKey]; existing != nil {
 		if requesterConnectionID == 0 || existing.requesterConnectionID == requesterConnectionID {
-			delete(c.nativeConnections, volumeServer)
+			delete(c.nativeConnections, cacheKey)
 		}
 	}
-	glog.V(2).Infof("native RDMA mount connection dropped: volumeServer=%s providerConnectionID=%d requesterConnectionID=%d", volumeServer, providerConnectionID, requesterConnectionID)
+	glog.V(2).Infof("native RDMA mount connection dropped: key=%s providerConnectionID=%d requesterConnectionID=%d", cacheKey, providerConnectionID, requesterConnectionID)
 }
 
 type countingWriter struct {
