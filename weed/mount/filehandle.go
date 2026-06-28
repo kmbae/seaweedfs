@@ -50,6 +50,7 @@ type FileHandle struct {
 	chunkCacheLock   sync.RWMutex
 
 	rdmaReadAheadLock  sync.Mutex
+	rdmaReadAheadFetch sync.Mutex
 	rdmaReadAhead      map[string][]byte
 	rdmaReadAheadOrder []string
 	rdmaReadAheadBytes int64

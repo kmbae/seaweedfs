@@ -139,6 +139,15 @@ func (fh *FileHandle) tryRDMARead(ctx context.Context, fileSize int64, buff []by
 		return totalRead, plan.chunk.ModifiedTsNs, nil
 	}
 
+	fh.rdmaReadAheadFetch.Lock()
+	defer fh.rdmaReadAheadFetch.Unlock()
+
+	if totalRead, ok := fh.readRDMAReadAhead(plan, buff); ok {
+		glog.V(4).Infof("RDMA read-ahead cache hit after wait: fileId=%s, chunkOffset=%d, readSize=%d",
+			plan.fileID, plan.chunkOffset, plan.readSize)
+		return totalRead, plan.chunk.ModifiedTsNs, nil
+	}
+
 	if err := fh.prefetchRDMAReadAhead(ctx, chunks, plan); err == nil {
 		if totalRead, ok := fh.readRDMAReadAhead(plan, buff); ok {
 			glog.V(4).Infof("RDMA read-ahead served after prefetch: fileId=%s, chunkOffset=%d, readSize=%d",
