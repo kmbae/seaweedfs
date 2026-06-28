@@ -33,6 +33,7 @@ var (
 	ioctlRDMATestMRInfo  = ior(swvfsIOCMagic, 7, unsafe.Sizeof(swvfsproto.RDMATestMR{}))
 	ioctlRDMATestMRRead  = iowr(swvfsIOCMagic, 8, unsafe.Sizeof(swvfsproto.RDMATestMR{}))
 	ioctlRDMATestMRWrite = iowr(swvfsIOCMagic, 9, unsafe.Sizeof(swvfsproto.RDMATestMR{}))
+	ioctlRDMAGetLocalFor = iowr(swvfsIOCMagic, 10, unsafe.Sizeof(swvfsproto.RDMALocalInfo{}))
 )
 
 type RDMAControl struct {
@@ -50,6 +51,18 @@ func (c *RDMAControl) GetLocal() (swvfsproto.RDMALocalInfo, error) {
 	}
 	if err := ioctl(c.file.Fd(), ioctlRDMAGetLocal, uintptr(unsafe.Pointer(&info))); err != nil {
 		return info, fmt.Errorf("SWVFS_IOC_RDMA_GET_LOCAL: %w", err)
+	}
+	return info, nil
+}
+
+func (c *RDMAControl) GetLocalFor(connectionID uint64) (swvfsproto.RDMALocalInfo, error) {
+	var info swvfsproto.RDMALocalInfo
+	if c == nil || c.file == nil {
+		return info, fmt.Errorf("nil RDMA control device")
+	}
+	info.Reserved[0] = connectionID
+	if err := ioctl(c.file.Fd(), ioctlRDMAGetLocalFor, uintptr(unsafe.Pointer(&info))); err != nil {
+		return info, fmt.Errorf("SWVFS_IOC_RDMA_GET_LOCAL_FOR: %w", err)
 	}
 	return info, nil
 }

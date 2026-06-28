@@ -33,6 +33,10 @@ type RDMALocalProvider interface {
 	GetLocal() (swvfsproto.RDMALocalInfo, error)
 }
 
+type RDMAConnectionLocalProvider interface {
+	GetLocalFor(connectionID uint64) (swvfsproto.RDMALocalInfo, error)
+}
+
 type RDMAPeerConnectorControl interface {
 	RDMALocalProvider
 	Connect(swvfsproto.RDMARemoteInfo) error
@@ -62,6 +66,7 @@ type RDMALocalEndpoint struct {
 
 func RDMALocalEndpointFromInfo(info swvfsproto.RDMALocalInfo) RDMALocalEndpoint {
 	return RDMALocalEndpoint{
+		ConnectionID:    info.Reserved[0],
 		ABIVersion:      info.ABIVersion,
 		Flags:           info.Flags,
 		Device:          info.DeviceName(),
@@ -121,6 +126,7 @@ func (e RDMALocalEndpoint) RemoteInfo(serviceLevel uint32) (swvfsproto.RDMARemot
 		GIDIndex:   e.GIDIndex,
 		SL:         serviceLevel,
 	}
+	remote.Reserved[0] = e.ConnectionID
 	if gid, ok := swvfsproto.DecodeGIDHex(e.GID); ok {
 		remote.GID = gid
 		remote.Flags |= swvfsproto.RDMARemoteFGIDValid

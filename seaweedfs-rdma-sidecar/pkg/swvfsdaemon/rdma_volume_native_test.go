@@ -200,7 +200,13 @@ func TestVolumeNativeRDMAReadDescriptorClientConnectsNativePeer(t *testing.T) {
 	if !control.connected || control.remote.QPN != remoteEndpoint.QPNum || control.remote.LID != remoteEndpoint.LID || control.remote.SL != 4 {
 		t.Fatalf("kernel control was not connected to remote endpoint: connected=%v remote=%+v", control.connected, control.remote)
 	}
-	if postedLocal.QPNum != 111 || postedLocal.LID != 0x11 {
+	if control.remote.Reserved[0] != 55 {
+		t.Fatalf("kernel connect connection id = %d, want 55", control.remote.Reserved[0])
+	}
+	if len(control.localForIDs) != 2 || control.localForIDs[0] != 55 || control.localForIDs[1] != 55 {
+		t.Fatalf("local-for ids = %v, want [55 55]", control.localForIDs)
+	}
+	if postedLocal.QPNum != 111 || postedLocal.LID != 0x11 || postedLocal.ConnectionID != 55 {
 		t.Fatalf("posted local endpoint = %+v", postedLocal)
 	}
 }
@@ -286,7 +292,13 @@ func TestVolumeNativePeerManagerRetriesEAGAINWithFreshLocal(t *testing.T) {
 	if control.connectCalls != 2 || localRequests != 2 || connectRequests != 1 {
 		t.Fatalf("calls connect/local/post = %d/%d/%d, want 2/2/1", control.connectCalls, localRequests, connectRequests)
 	}
-	if postedLocal.QPNum != 112 || postedLocal.PSN != 0x111112 {
+	if len(control.localForIDs) != 2 || control.localForIDs[0] != 55 || control.localForIDs[1] != 56 {
+		t.Fatalf("local-for ids = %v, want [55 56]", control.localForIDs)
+	}
+	if control.remote.Reserved[0] != 56 {
+		t.Fatalf("kernel retry connect connection id = %d, want 56", control.remote.Reserved[0])
+	}
+	if postedLocal.QPNum != 112 || postedLocal.PSN != 0x111112 || postedLocal.ConnectionID != 56 {
 		t.Fatalf("posted stale local endpoint after retry: %+v", postedLocal)
 	}
 }

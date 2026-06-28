@@ -337,7 +337,7 @@ func (m *VolumeNativePeerManager) Ensure(ctx context.Context, volumeServer strin
 }
 
 func (m *VolumeNativePeerManager) cachedPeerStillLocal(peer VolumeNativePeer) bool {
-	localInfo, err := m.Control.GetLocal()
+	localInfo, err := m.getLocalInfo(peer.VolumeConnectionID)
 	if err != nil {
 		return false
 	}
@@ -349,20 +349,20 @@ func (m *VolumeNativePeerManager) cachedPeerStillLocal(peer VolumeNativePeer) bo
 }
 
 func (m *VolumeNativePeerManager) connectOnce(ctx context.Context, volumeServer string) (VolumeNativePeer, error) {
-	localInfo, err := m.Control.GetLocal()
-	if err != nil {
-		return VolumeNativePeer{}, err
-	}
-	local := RDMALocalEndpointFromInfo(localInfo)
-	if !local.ReadyForConnect() {
-		return VolumeNativePeer{}, ErrnoError{Errno: ErrnoNoSys, Msg: fmt.Sprintf("local kernel RDMA endpoint is not ready: qpn=%d lid=%d flags=0x%x", local.QPNum, local.LID, local.Flags)}
-	}
 	remote, err := FetchVolumeNativeEndpoint(ctx, m.Client, volumeServer)
 	if err != nil {
 		return VolumeNativePeer{}, err
 	}
 	if !remote.ReadyForConnect() {
 		return VolumeNativePeer{}, ErrnoError{Errno: ErrnoNoSys, Msg: fmt.Sprintf("volume RDMA endpoint is not ready: qpn=%d lid=%d flags=0x%x", remote.QPNum, remote.LID, remote.Flags)}
+	}
+	localInfo, err := m.getLocalInfo(remote.ConnectionID)
+	if err != nil {
+		return VolumeNativePeer{}, err
+	}
+	local := RDMALocalEndpointFromInfo(localInfo)
+	if !local.ReadyForConnect() {
+		return VolumeNativePeer{}, ErrnoError{Errno: ErrnoNoSys, Msg: fmt.Sprintf("local kernel RDMA endpoint is not ready: qpn=%d lid=%d flags=0x%x", local.QPNum, local.LID, local.Flags)}
 	}
 
 	if m.ServiceLevel > 15 {
@@ -384,6 +384,15 @@ func (m *VolumeNativePeerManager) connectOnce(ctx context.Context, volumeServer 
 		LocalPSN:           local.PSN,
 		LocalLID:           local.LID,
 	}, nil
+}
+
+func (m *VolumeNativePeerManager) getLocalInfo(connectionID uint64) (swvfsproto.RDMALocalInfo, error) {
+	if connectionID != 0 {
+		if provider, ok := m.Control.(RDMAConnectionLocalProvider); ok {
+			return provider.GetLocalFor(connectionID)
+		}
+	}
+	return m.Control.GetLocal()
 }
 
 func volumeNativePeerHandshakeError(err error) error {
