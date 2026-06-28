@@ -298,7 +298,7 @@ func TestBackendReadFileRDMAPrefersNativeSingleChunk(t *testing.T) {
 	}
 }
 
-func TestBackendReadFileRDMAFallsBackForMultiChunk(t *testing.T) {
+func TestBackendReadFileRDMAReturnsFirstNativeChunkForMultiChunk(t *testing.T) {
 	store := &fakeStore{entries: map[string]*filer_pb.Entry{
 		"/file": {
 			Name: "file",
@@ -312,7 +312,7 @@ func TestBackendReadFileRDMAFallsBackForMultiChunk(t *testing.T) {
 			},
 		},
 	}}
-	native := &captureNativeReadDescriptor{desc: swvfsproto.RDMADataDesc{RemoteAddr: 0xbeef, RKey: 99, Length: 2048}}
+	native := &captureNativeReadDescriptor{desc: swvfsproto.RDMADataDesc{RemoteAddr: 0xbeef, RKey: 99, Length: 1024}}
 	staging := &captureReadDescriptor{desc: swvfsproto.RDMADataDesc{RemoteAddr: 0xdead, RKey: 7, Length: 2048}}
 	backend := &Backend{
 		Store:                 store,
@@ -324,13 +324,13 @@ func TestBackendReadFileRDMAFallsBackForMultiChunk(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ReadFileRDMA: %v", err)
 	}
-	if native.calls != 0 || staging.calls != 1 {
+	if native.calls != 1 || staging.calls != 0 {
 		t.Fatalf("native/staging calls = %d/%d", native.calls, staging.calls)
 	}
-	if staging.path != "/file" {
-		t.Fatalf("staging path = %q", staging.path)
+	if native.req.Offset != 0 || native.req.Size != 1024 || native.req.FileID != "3,01637037d6" {
+		t.Fatalf("unexpected native request: %+v", native.req)
 	}
-	if desc.RemoteAddr != 0xdead {
+	if desc.RemoteAddr != 0xbeef || desc.Length != 1024 {
 		t.Fatalf("desc = %+v", desc)
 	}
 }

@@ -795,8 +795,8 @@ func (b *Backend) readFileNativeRDMA(ctx context.Context, fullPath string, offse
 	if err != nil {
 		return nil, nil, err
 	}
-	if len(views) != 1 {
-		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native rdma read descriptor supports one chunk per request"}
+	if len(views) == 0 {
+		return nil, attr, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native rdma read descriptor found no visible chunk"}
 	}
 	view := views[0]
 	if view.size == 0 {
