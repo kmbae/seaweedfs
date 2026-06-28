@@ -128,7 +128,7 @@ func init() {
 	v.allowUntrustedRemoteEndpoints = cmdVolume.Flag.Bool("volume.allowUntrustedRemoteEndpoints", false, "if true, FetchAndWriteNeedle accepts arbitrary remote S3 endpoints including loopback / link-local hosts. Default rejects internal / metadata endpoints.")
 	v.rdmaEngineSocket = cmdVolume.Flag.String("volume.rdma.engineSocket", "", "<experimental> Unix socket for the native volume RDMA engine")
 	v.rdmaEngineTimeout = cmdVolume.Flag.Duration("volume.rdma.engineTimeout", 5*time.Second, "<experimental> timeout for native volume RDMA engine IPC")
-	v.rdmaReadMaxSizeMB = cmdVolume.Flag.Int("volume.rdma.readMaxSizeMB", 4, "<experimental> max native volume RDMA read descriptor size in MiB")
+	v.rdmaReadMaxSizeMB = cmdVolume.Flag.Int("volume.rdma.readMaxSizeMB", 16, "<experimental> max native volume RDMA read descriptor size in MiB")
 	v.rdmaReadLeaseTTL = cmdVolume.Flag.Duration("volume.rdma.readLeaseTTL", 30*time.Second, "<experimental> native volume RDMA read lease TTL")
 	v.rdmaReadBufferSizeMB = cmdVolume.Flag.Int("volume.rdma.readBufferSizeMB", 1, "<experimental> buffer size used while filling native volume RDMA read leases in MiB")
 	v.debug = cmdVolume.Flag.Bool("debug", false, "serves runtime profiling data via pprof on the port specified by -debug.port")
