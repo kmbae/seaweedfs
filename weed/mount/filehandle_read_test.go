@@ -80,6 +80,28 @@ func TestPlanRDMAChunkReadRejectsHoles(t *testing.T) {
 	}
 }
 
+func TestPlanRDMAChunkReadRejectsCompressedChunks(t *testing.T) {
+	chunks := []*filer_pb.FileChunk{
+		{Offset: 0, Size: 4096, FileId: "1,compressed", IsCompressed: true},
+	}
+
+	_, err := planRDMAChunkRead(chunks, 4096, 4096, 0)
+	if err == nil {
+		t.Fatal("expected compressed chunk error")
+	}
+}
+
+func TestPlanRDMAChunkReadRejectsEncryptedChunks(t *testing.T) {
+	chunks := []*filer_pb.FileChunk{
+		{Offset: 0, Size: 4096, FileId: "1,encrypted", CipherKey: []byte("key")},
+	}
+
+	_, err := planRDMAChunkRead(chunks, 4096, 4096, 0)
+	if err == nil {
+		t.Fatal("expected encrypted chunk error")
+	}
+}
+
 func TestPlanRDMAChunkReadEOF(t *testing.T) {
 	chunks := []*filer_pb.FileChunk{
 		{Offset: 0, Size: 4096, FileId: "1,aaa"},

@@ -166,6 +166,12 @@ func planRDMAChunkRead(chunks []*filer_pb.FileChunk, fileSize int64, bufferSize 
 	if fileID == "" {
 		return nil, fmt.Errorf("chunk at offset %d has no file id", targetChunk.Offset)
 	}
+	if targetChunk.IsCompressed {
+		return nil, fmt.Errorf("RDMA read does not support compressed chunk %s", fileID)
+	}
+	if len(targetChunk.CipherKey) > 0 {
+		return nil, fmt.Errorf("RDMA read does not support encrypted chunk %s", fileID)
+	}
 
 	readStop := offset + int64(bufferSize)
 	if readStop > fileSize {
