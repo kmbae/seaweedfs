@@ -22,7 +22,7 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-const defaultRDMAMinSize = 8 << 20
+const defaultRDMAMinSize = 256 << 10
 
 var (
 	devPath                string
@@ -57,20 +57,21 @@ func main() {
 		Use:   "swvfs-rdma-daemon",
 		Short: "Experimental RDMA-aware userspace daemon for seaweedvfs",
 		Long: `Experimental replacement daemon for seaweedvfs. It speaks the
-/dev/seaweedvfs ABI, serves basic metadata plus READ and WRITE requests through
-the SeaweedFS filer, and chooses the RDMA data plane when the kernel request
-carries RDMA preference hints.`,
+	/dev/seaweedvfs ABI, serves metadata plus READ/WRITE requests through the
+	SeaweedFS filer, and serves kernel-direct RDMA descriptor opcodes when the
+	seaweedvfs module is loaded with kernel_rdma_direct_reads or
+	kernel_rdma_direct_writes.`,
 		RunE: run,
 	}
 	root.Flags().StringVar(&devPath, "dev", "/dev/seaweedvfs", "seaweedvfs character device")
 	root.Flags().StringVar(&filerAddresses, "filer", "127.0.0.1:8888", "comma-separated filer HTTP addresses; use host:http.grpc for an explicit gRPC port")
 	root.Flags().StringVar(&engineSocket, "engine-socket", "/tmp/rdma-engine.sock", "RDMA engine Unix socket")
-	root.Flags().BoolVar(&enableReadRDMA, "enable-read-rdma", false, "prefer RDMA for READ requests carrying the kernel RDMA hint")
-	root.Flags().BoolVar(&enableWriteRDMA, "enable-write-rdma", false, "prefer RDMA for WRITE requests carrying the kernel RDMA hint")
+	root.Flags().BoolVar(&enableReadRDMA, "enable-read-rdma", false, "prefer RDMA for legacy READ requests carrying the kernel RDMA hint")
+	root.Flags().BoolVar(&enableWriteRDMA, "enable-write-rdma", false, "prefer RDMA for legacy WRITE requests carrying the kernel RDMA hint")
 	root.Flags().BoolVar(&enablePayloadRDMA, "enable-payload-rdma", false, "enable real payload RDMA in the SeaweedFS data plane")
 	root.Flags().BoolVar(&enableVolumeNativeRDMA, "enable-volume-native-rdma", false, "try volume-server-native RDMA read descriptors before sidecar/kernel-MR staging")
-	root.Flags().Uint64Var(&readRDMAMinSize, "rdma-read-min-size", defaultRDMAMinSize, "minimum READ size in bytes before RDMA is considered; set 0 to allow all hinted reads")
-	root.Flags().Uint64Var(&writeRDMAMinSize, "rdma-write-min-size", defaultRDMAMinSize, "minimum WRITE size in bytes before RDMA is considered; set 0 to allow all hinted writes")
+	root.Flags().Uint64Var(&readRDMAMinSize, "rdma-read-min-size", defaultRDMAMinSize, "minimum READ size in bytes before RDMA descriptors are served; set 0 to allow all direct/hinted reads")
+	root.Flags().Uint64Var(&writeRDMAMinSize, "rdma-write-min-size", defaultRDMAMinSize, "minimum WRITE size in bytes before RDMA descriptors are served; set 0 to allow all direct/hinted writes")
 	root.Flags().BoolVar(&forceRDMA, "force-rdma", false, "prefer RDMA for READ and WRITE even when the kernel request has no RDMA hint")
 	root.Flags().BoolVar(&fallbackOnError, "fallback-on-error", true, "fall back to TCP/HTTP when RDMA is unavailable")
 	root.Flags().StringVar(&rdmaControlListen, "rdma-control-listen", "", "listen address for kernel RDMA peer-control HTTP API; empty disables it")
