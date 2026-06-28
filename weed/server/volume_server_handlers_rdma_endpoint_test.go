@@ -134,7 +134,11 @@ func TestVolumeRdmaStatusHandlerReportsConfiguration(t *testing.T) {
 	if resp.Transport != VolumeRdmaTransportSocket {
 		t.Fatalf("transport = %q, want %q", resp.Transport, VolumeRdmaTransportSocket)
 	}
-	if resp.LocalPath != VolumeRdmaNativeLocalPath || resp.ConnectPath != VolumeRdmaNativeConnectPath || resp.WriteCommitBatchPath != VolumeRdmaNativeWriteCommitBatchPath {
+	if resp.LocalPath != VolumeRdmaNativeLocalPath ||
+		resp.ConnectPath != VolumeRdmaNativeConnectPath ||
+		resp.ReadDescBatchPath != VolumeRdmaNativeReadDescBatchPath ||
+		resp.ReleaseDescBatchPath != VolumeRdmaNativeReleaseDescBatchPath ||
+		resp.WriteCommitBatchPath != VolumeRdmaNativeWriteCommitBatchPath {
 		t.Fatalf("unexpected endpoint paths: %+v", resp)
 	}
 	if resp.Counters["read_desc_requests"] != 2 || resp.Counters["read_desc_successes"] != 1 || resp.Counters["read_desc_bytes"] != 8192 {

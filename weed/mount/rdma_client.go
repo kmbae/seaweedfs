@@ -92,8 +92,45 @@ type volumeRdmaReadDescResponse struct {
 	SessionID    uint64                         `json:"session_id,omitempty"`
 }
 
+type volumeRdmaReadDescBatchResult struct {
+	Index        int                            `json:"index"`
+	FileID       string                         `json:"file_id,omitempty"`
+	Size         uint64                         `json:"size,omitempty"`
+	Desc         weed_server.VolumeRdmaDataDesc `json:"desc,omitempty"`
+	ConnectionID uint64                         `json:"connection_id,omitempty"`
+	SessionID    uint64                         `json:"session_id,omitempty"`
+	Status       int32                          `json:"status"`
+	Error        string                         `json:"error,omitempty"`
+}
+
+type volumeRdmaReadDescBatchResponse struct {
+	Results []volumeRdmaReadDescBatchResult `json:"results"`
+}
+
 type volumeRdmaReleaseDescRequest struct {
 	SessionID uint64 `json:"session_id"`
+}
+
+type volumeRdmaReleaseDescBatchRequest struct {
+	SessionIDs []uint64 `json:"session_ids"`
+}
+
+type volumeRdmaReleaseDescBatchResult struct {
+	SessionID uint64 `json:"session_id"`
+	Released  bool   `json:"released"`
+	Status    int32  `json:"status"`
+	Error     string `json:"error,omitempty"`
+}
+
+type volumeRdmaReleaseDescBatchResponse struct {
+	Results []volumeRdmaReleaseDescBatchResult `json:"results"`
+}
+
+type RDMANeedleReadRequest struct {
+	FileID string
+	Offset uint64
+	Size   uint64
+	Dst    io.Writer
 }
 
 // RDMAReadRequest represents a request to read data via RDMA
@@ -348,6 +385,70 @@ func (c *RDMAMountClient) ReadNeedleTo(ctx context.Context, fileID string, offse
 	return written, isRDMA, nil
 }
 
+// ReadNeedlesTo streams multiple needles into their destination writers. Native
+// mode uses one descriptor batch per volume server to avoid one HTTP round trip
+// per FUSE-sized read.
+func (c *RDMAMountClient) ReadNeedlesTo(ctx context.Context, reads []RDMANeedleReadRequest) (int64, bool, error) {
+	if len(reads) == 0 {
+		return 0, true, nil
+	}
+	for i, read := range reads {
+		if read.Dst == nil {
+			return 0, false, fmt.Errorf("RDMA batch read entry %d requires destination writer", i)
+		}
+	}
+
+	select {
+	case c.semaphore <- struct{}{}:
+		defer func() { <-c.semaphore }()
+	case <-ctx.Done():
+		return 0, false, ctx.Err()
+	}
+
+	c.totalRequests.Add(int64(len(reads)))
+	startTime := time.Now()
+
+	var written int64
+	var isRDMA bool
+	var err error
+	switch c.mode {
+	case rdmaMountModeNative:
+		written, err = c.readNeedlesNativeTo(ctx, reads)
+		isRDMA = err == nil
+	default:
+		written, isRDMA, err = c.readNeedlesSidecarTo(ctx, reads)
+	}
+
+	duration := time.Since(startTime)
+	c.totalLatencyNs.Add(duration.Nanoseconds())
+	for range reads {
+		c.recordReadAttempt(c.normalizedMode(), 0, isRDMA, duration, err)
+	}
+	if err != nil {
+		c.failedReads.Add(int64(len(reads)))
+		return written, false, err
+	}
+	c.successfulReads.Add(int64(len(reads)))
+	c.totalBytesRead.Add(written)
+	if isRDMA && written > 0 {
+		switch c.normalizedMode() {
+		case rdmaMountModeNative:
+			c.nativeReadBytes.Add(written)
+			c.rdmaReadBytes.Add(written)
+		case rdmaMountModeSidecar:
+			c.sidecarReadBytes.Add(written)
+			c.rdmaReadBytes.Add(written)
+		}
+	} else if written > 0 {
+		c.nonRdmaReadBytes.Add(written)
+	}
+
+	glog.V(4).Infof("RDMA batch read completed: mode=%s, entries=%d, read=%d, duration=%v, rdma=%v",
+		c.mode, len(reads), written, duration, isRDMA)
+
+	return written, isRDMA, nil
+}
+
 func (c *RDMAMountClient) recordReadAttempt(mode string, written int64, isRDMA bool, duration time.Duration, err error) {
 	switch mode {
 	case rdmaMountModeNative:
@@ -451,6 +552,189 @@ func (c *RDMAMountClient) readNeedleSidecarTo(ctx context.Context, volumeServer 
 		return n, false, fmt.Errorf("failed to read RDMA response: %w", err)
 	}
 	return n, isRDMA, nil
+}
+
+func (c *RDMAMountClient) readNeedlesSidecarTo(ctx context.Context, reads []RDMANeedleReadRequest) (int64, bool, error) {
+	var total int64
+	allRDMA := true
+	for _, read := range reads {
+		if read.Size == 0 {
+			continue
+		}
+		volumeServer, err := c.lookupVolumeLocationByFileID(ctx, read.FileID)
+		if err != nil {
+			return total, false, fmt.Errorf("failed to lookup volume for file %s: %w", read.FileID, err)
+		}
+		n, isRDMA, err := c.readNeedleSidecarTo(ctx, volumeServer, read.FileID, read.Offset, read.Size, read.Dst)
+		total += n
+		if err != nil {
+			return total, false, err
+		}
+		if !isRDMA {
+			allRDMA = false
+		}
+	}
+	return total, allRDMA, nil
+}
+
+type rdmaNeedleReadForVolume struct {
+	index int
+	read  RDMANeedleReadRequest
+}
+
+func (c *RDMAMountClient) readNeedlesNativeTo(ctx context.Context, reads []RDMANeedleReadRequest) (int64, error) {
+	if c.nativeRequester == nil {
+		return 0, fmt.Errorf("native RDMA requester is not configured")
+	}
+
+	groups := make(map[string][]rdmaNeedleReadForVolume)
+	for i, read := range reads {
+		if read.Size == 0 {
+			continue
+		}
+		if read.Size > maxUint32 {
+			return 0, fmt.Errorf("native RDMA read is too large for one descriptor: %d", read.Size)
+		}
+		volumeServer, err := c.lookupVolumeLocationByFileID(ctx, read.FileID)
+		if err != nil {
+			return 0, fmt.Errorf("failed to lookup volume for file %s: %w", read.FileID, err)
+		}
+		groups[volumeServer] = append(groups[volumeServer], rdmaNeedleReadForVolume{
+			index: i,
+			read:  read,
+		})
+	}
+
+	var total int64
+	for volumeServer, group := range groups {
+		n, err := c.readNeedlesNativeForVolumeTo(ctx, volumeServer, group)
+		total += n
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
+func (c *RDMAMountClient) readNeedlesNativeForVolumeTo(ctx context.Context, volumeServer string, group []rdmaNeedleReadForVolume) (int64, error) {
+	if len(group) == 0 {
+		return 0, nil
+	}
+	if len(group) == 1 {
+		read := group[0].read
+		return c.readNeedleNativeTo(ctx, volumeServer, read.FileID, read.Offset, read.Size, read.Dst)
+	}
+
+	conn, err := c.ensureNativeConnection(ctx, volumeServer)
+	if err != nil {
+		return 0, err
+	}
+
+	entries := make([]weed_server.VolumeRdmaReadRequest, len(group))
+	for i, item := range group {
+		fid, err := needle.ParseFileIdFromString(item.read.FileID)
+		if err != nil {
+			return 0, fmt.Errorf("parse file id %s: %w", item.read.FileID, err)
+		}
+		entries[i] = weed_server.VolumeRdmaReadRequest{
+			ConnectionID: conn.providerConnectionID,
+			FileID:       item.read.FileID,
+			VolumeID:     uint32(fid.VolumeId),
+			NeedleID:     uint64(fid.Key),
+			Cookie:       uint32(fid.Cookie),
+			Offset:       item.read.Offset,
+			Size:         item.read.Size,
+		}
+	}
+
+	var resp volumeRdmaReadDescBatchResponse
+	err = c.doNativeJSON(ctx, http.MethodPost, volumeServer, weed_server.VolumeRdmaNativeReadDescBatchPath, nil, weed_server.VolumeRdmaReadDescBatchRequest{Entries: entries}, &resp)
+	if err != nil {
+		glog.V(2).Infof("native RDMA read descriptor batch failed for %s, using single descriptors: %v", volumeServer, err)
+		var total int64
+		for _, item := range group {
+			read := item.read
+			n, singleErr := c.readNeedleNativeTo(ctx, volumeServer, read.FileID, read.Offset, read.Size, read.Dst)
+			total += n
+			if singleErr != nil {
+				return total, singleErr
+			}
+		}
+		return total, nil
+	}
+	if len(resp.Results) != len(group) {
+		return 0, fmt.Errorf("native RDMA read descriptor batch returned %d results for %d entries", len(resp.Results), len(group))
+	}
+
+	descs := make([]weed_server.VolumeRdmaDataDesc, len(group))
+	sessionIDs := make([]uint64, 0, len(group))
+	var validationErr error
+	for _, result := range resp.Results {
+		if result.Index < 0 || result.Index >= len(group) {
+			validationErr = fmt.Errorf("native RDMA read descriptor batch returned invalid index %d", result.Index)
+			continue
+		}
+		if result.SessionID != 0 {
+			sessionIDs = append(sessionIDs, result.SessionID)
+		}
+		if result.Status < http.StatusOK || result.Status >= http.StatusMultipleChoices {
+			if validationErr == nil {
+				validationErr = fmt.Errorf("native RDMA read descriptor batch entry %d failed with status %d: %s", result.Index, result.Status, result.Error)
+			}
+			continue
+		}
+		read := group[result.Index].read
+		if result.SessionID == 0 {
+			if validationErr == nil {
+				validationErr = fmt.Errorf("native RDMA read descriptor batch entry %d missing session_id", result.Index)
+			}
+			continue
+		}
+		if result.Desc.RemoteAddr == 0 || result.Desc.RKey == 0 || result.Desc.Length == 0 {
+			if validationErr == nil {
+				validationErr = fmt.Errorf("native RDMA read descriptor batch entry %d is not exportable", result.Index)
+			}
+			continue
+		}
+		if uint64(result.Desc.Length) < read.Size {
+			if validationErr == nil {
+				validationErr = fmt.Errorf("native RDMA read descriptor batch entry %d length %d is smaller than requested size %d", result.Index, result.Desc.Length, read.Size)
+			}
+			continue
+		}
+		result.Desc.Length = uint32(read.Size)
+		descs[result.Index] = result.Desc
+	}
+	if validationErr != nil {
+		_ = c.releaseNativeReadDescs(context.Background(), volumeServer, sessionIDs)
+		return 0, validationErr
+	}
+
+	var total int64
+	var readErr error
+	for i, item := range group {
+		counter := &countingWriter{w: item.read.Dst}
+		if err := c.nativeRequester.ReadRemoteToFor(ctx, conn.requesterConnectionID, descs[i], c.timeout, counter); err != nil {
+			c.dropNativeConnection(volumeServer, conn)
+			readErr = fmt.Errorf("native RDMA READ failed: %w", err)
+			total += counter.n
+			break
+		}
+		total += counter.n
+		if counter.n != int64(item.read.Size) {
+			readErr = fmt.Errorf("native RDMA READ copied %d bytes, expected %d", counter.n, item.read.Size)
+			break
+		}
+	}
+
+	releaseErr := c.releaseNativeReadDescs(context.Background(), volumeServer, sessionIDs)
+	if readErr != nil {
+		return total, readErr
+	}
+	if releaseErr != nil {
+		glog.V(2).Infof("native RDMA read descriptor batch release failed for %s sessions=%v: %v", volumeServer, sessionIDs, releaseErr)
+	}
+	return total, nil
 }
 
 func (c *RDMAMountClient) readNeedleNativeTo(ctx context.Context, volumeServer string, fileID string, offset, size uint64, dst io.Writer) (int64, error) {
@@ -613,6 +897,42 @@ func (c *RDMAMountClient) releaseNativeReadDesc(ctx context.Context, volumeServe
 	defer cancel()
 	var resp map[string]bool
 	return c.doNativeJSON(releaseCtx, http.MethodPost, volumeServer, weed_server.VolumeRdmaNativeReleaseDescPath, nil, volumeRdmaReleaseDescRequest{SessionID: sessionID}, &resp)
+}
+
+func (c *RDMAMountClient) releaseNativeReadDescs(ctx context.Context, volumeServer string, sessionIDs []uint64) error {
+	filtered := sessionIDs[:0]
+	for _, sessionID := range sessionIDs {
+		if sessionID != 0 {
+			filtered = append(filtered, sessionID)
+		}
+	}
+	if len(filtered) == 0 {
+		return nil
+	}
+	if len(filtered) == 1 {
+		return c.releaseNativeReadDesc(ctx, volumeServer, filtered[0])
+	}
+
+	releaseCtx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
+
+	var resp volumeRdmaReleaseDescBatchResponse
+	err := c.doNativeJSON(releaseCtx, http.MethodPost, volumeServer, weed_server.VolumeRdmaNativeReleaseDescBatchPath, nil, volumeRdmaReleaseDescBatchRequest{SessionIDs: filtered}, &resp)
+	if err != nil {
+		for _, sessionID := range filtered {
+			_ = c.releaseNativeReadDesc(context.Background(), volumeServer, sessionID)
+		}
+		return err
+	}
+	if len(resp.Results) != len(filtered) {
+		return fmt.Errorf("native RDMA release descriptor batch returned %d results for %d sessions", len(resp.Results), len(filtered))
+	}
+	for _, result := range resp.Results {
+		if result.Status < http.StatusOK || result.Status >= http.StatusMultipleChoices || !result.Released {
+			return fmt.Errorf("native RDMA release descriptor batch session %d failed with status %d: %s", result.SessionID, result.Status, result.Error)
+		}
+	}
+	return nil
 }
 
 func (c *RDMAMountClient) doNativeJSON(ctx context.Context, method string, volumeServer string, endpointPath string, query url.Values, body interface{}, out interface{}) error {

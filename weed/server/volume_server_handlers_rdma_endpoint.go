@@ -17,7 +17,9 @@ const (
 	VolumeRdmaNativeLocalPath            = "/rdma/native/local"
 	VolumeRdmaNativeConnectPath          = "/rdma/native/connect"
 	VolumeRdmaNativeReadDescPath         = "/rdma/native/read-desc"
+	VolumeRdmaNativeReadDescBatchPath    = "/rdma/native/read-desc-batch"
 	VolumeRdmaNativeReleaseDescPath      = "/rdma/native/release-desc"
+	VolumeRdmaNativeReleaseDescBatchPath = "/rdma/native/release-desc-batch"
 	VolumeRdmaNativeRequesterLocalPath   = "/rdma/native/requester-local"
 	VolumeRdmaNativeRequesterConnectPath = "/rdma/native/requester-connect"
 	VolumeRdmaNativeWritePath            = "/rdma/native/write"
@@ -97,7 +99,9 @@ type volumeRdmaNativeStatusResponse struct {
 	LocalPath              string           `json:"local_path"`
 	ConnectPath            string           `json:"connect_path"`
 	ReadDescPath           string           `json:"read_desc_path"`
+	ReadDescBatchPath      string           `json:"read_desc_batch_path"`
 	ReleaseDescPath        string           `json:"release_desc_path"`
+	ReleaseDescBatchPath   string           `json:"release_desc_batch_path"`
 	RequesterLocalPath     string           `json:"requester_local_path"`
 	RequesterConnectPath   string           `json:"requester_connect_path"`
 	WritePath              string           `json:"write_path"`
@@ -173,7 +177,9 @@ func (vs *VolumeServer) volumeRdmaStatusHandler(w http.ResponseWriter, r *http.R
 		LocalPath:              VolumeRdmaNativeLocalPath,
 		ConnectPath:            VolumeRdmaNativeConnectPath,
 		ReadDescPath:           VolumeRdmaNativeReadDescPath,
+		ReadDescBatchPath:      VolumeRdmaNativeReadDescBatchPath,
 		ReleaseDescPath:        VolumeRdmaNativeReleaseDescPath,
+		ReleaseDescBatchPath:   VolumeRdmaNativeReleaseDescBatchPath,
 		RequesterLocalPath:     VolumeRdmaNativeRequesterLocalPath,
 		RequesterConnectPath:   VolumeRdmaNativeRequesterConnectPath,
 		WritePath:              VolumeRdmaNativeWritePath,

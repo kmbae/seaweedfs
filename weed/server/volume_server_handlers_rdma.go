@@ -86,6 +86,25 @@ type volumeRdmaReadDescResponse struct {
 	SessionID    uint64             `json:"session_id,omitempty"`
 }
 
+type VolumeRdmaReadDescBatchRequest struct {
+	Entries []VolumeRdmaReadRequest `json:"entries"`
+}
+
+type volumeRdmaReadDescBatchResult struct {
+	Index        int                `json:"index"`
+	FileID       string             `json:"file_id,omitempty"`
+	Size         uint64             `json:"size,omitempty"`
+	Desc         VolumeRdmaDataDesc `json:"desc,omitempty"`
+	ConnectionID uint64             `json:"connection_id,omitempty"`
+	SessionID    uint64             `json:"session_id,omitempty"`
+	Status       int32              `json:"status"`
+	Error        string             `json:"error,omitempty"`
+}
+
+type volumeRdmaReadDescBatchResponse struct {
+	Results []volumeRdmaReadDescBatchResult `json:"results"`
+}
+
 type volumeRdmaWriteDescResponse struct {
 	Desc         VolumeRdmaDataDesc `json:"desc"`
 	ConnectionID uint64             `json:"connection_id,omitempty"`
@@ -113,6 +132,21 @@ type volumeRdmaWriteCommitBatchResponse struct {
 
 type volumeRdmaReleaseDescRequest struct {
 	SessionID uint64 `json:"session_id"`
+}
+
+type volumeRdmaReleaseDescBatchRequest struct {
+	SessionIDs []uint64 `json:"session_ids"`
+}
+
+type volumeRdmaReleaseDescBatchResult struct {
+	SessionID uint64 `json:"session_id"`
+	Released  bool   `json:"released"`
+	Status    int32  `json:"status"`
+	Error     string `json:"error,omitempty"`
+}
+
+type volumeRdmaReleaseDescBatchResponse struct {
+	Results []volumeRdmaReleaseDescBatchResult `json:"results"`
 }
 
 func (vs *VolumeServer) volumeRdmaReadDescHandler(w http.ResponseWriter, r *http.Request) {
@@ -166,6 +200,74 @@ func (vs *VolumeServer) volumeRdmaReadDescHandler(w http.ResponseWriter, r *http
 	})
 }
 
+func (vs *VolumeServer) volumeRdmaReadDescBatchHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if vs == nil || vs.rdmaReadExporter == nil {
+		http.Error(w, "native RDMA read exporter is not configured", http.StatusNotImplemented)
+		return
+	}
+
+	var req VolumeRdmaReadDescBatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	if len(req.Entries) == 0 {
+		writeJsonError(w, r, http.StatusBadRequest, fmt.Errorf("entries are required"))
+		return
+	}
+
+	resp := volumeRdmaReadDescBatchResponse{
+		Results: make([]volumeRdmaReadDescBatchResult, 0, len(req.Entries)),
+	}
+	for i, entry := range req.Entries {
+		start := time.Now()
+		success := false
+		bytesExported := uint64(0)
+		vs.rdmaStats.readDescRequests.Add(1)
+
+		result := volumeRdmaReadDescBatchResult{
+			Index:  i,
+			FileID: entry.FileID,
+			Size:   entry.Size,
+			Status: http.StatusOK,
+		}
+		if entry.VolumeID == 0 || entry.NeedleID == 0 || entry.Size == 0 {
+			result.Status = http.StatusBadRequest
+			result.Error = "volume_id, needle_id, and size are required"
+		} else {
+			lease, err := vs.rdmaReadExporter.PrepareRead(r.Context(), entry)
+			if err != nil {
+				result.Status = int32(volumeRdmaReadHTTPStatus(err))
+				result.Error = err.Error()
+			} else if lease == nil || lease.Desc.RemoteAddr == 0 || lease.Desc.Length == 0 {
+				result.Status = http.StatusNotImplemented
+				result.Error = "native RDMA read exporter returned no exportable descriptor"
+			} else {
+				success = true
+				bytesExported = entry.Size
+				result.Desc = lease.Desc
+				result.ConnectionID = lease.ConnectionID
+				result.SessionID = lease.SessionID
+			}
+		}
+
+		recordLatency(&vs.rdmaStats.readDescLatencyNs, start)
+		if success {
+			vs.rdmaStats.readDescSuccesses.Add(1)
+			vs.rdmaStats.readDescBytes.Add(int64(bytesExported))
+		} else {
+			vs.rdmaStats.readDescFailures.Add(1)
+		}
+		resp.Results = append(resp.Results, result)
+	}
+
+	writeJsonQuiet(w, r, http.StatusOK, resp)
+}
+
 func (vs *VolumeServer) volumeRdmaReleaseDescHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -202,6 +304,61 @@ func (vs *VolumeServer) volumeRdmaReleaseDescHandler(w http.ResponseWriter, r *h
 	}
 	success = true
 	writeJsonQuiet(w, r, http.StatusOK, map[string]bool{"released": true})
+}
+
+func (vs *VolumeServer) volumeRdmaReleaseDescBatchHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if vs == nil || vs.rdmaReadExporter == nil {
+		http.Error(w, "native RDMA read exporter is not configured", http.StatusNotImplemented)
+		return
+	}
+
+	var req volumeRdmaReleaseDescBatchRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	if len(req.SessionIDs) == 0 {
+		writeJsonError(w, r, http.StatusBadRequest, fmt.Errorf("session_ids are required"))
+		return
+	}
+
+	resp := volumeRdmaReleaseDescBatchResponse{
+		Results: make([]volumeRdmaReleaseDescBatchResult, 0, len(req.SessionIDs)),
+	}
+	for _, sessionID := range req.SessionIDs {
+		start := time.Now()
+		success := false
+		vs.rdmaStats.releaseDescRequests.Add(1)
+
+		result := volumeRdmaReleaseDescBatchResult{
+			SessionID: sessionID,
+			Status:    http.StatusOK,
+		}
+		if sessionID == 0 {
+			result.Status = http.StatusBadRequest
+			result.Error = "session_id is required"
+		} else if err := vs.rdmaReadExporter.ReleaseRead(r.Context(), sessionID); err != nil {
+			result.Status = int32(volumeRdmaReadHTTPStatus(err))
+			result.Error = err.Error()
+		} else {
+			success = true
+			result.Released = true
+		}
+
+		recordLatency(&vs.rdmaStats.releaseDescLatencyNs, start)
+		if success {
+			vs.rdmaStats.releaseDescSuccesses.Add(1)
+		} else {
+			vs.rdmaStats.releaseDescFailures.Add(1)
+		}
+		resp.Results = append(resp.Results, result)
+	}
+
+	writeJsonQuiet(w, r, http.StatusOK, resp)
 }
 
 func (vs *VolumeServer) volumeRdmaWriteHandler(w http.ResponseWriter, r *http.Request) {

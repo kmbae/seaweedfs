@@ -413,6 +413,130 @@ func TestRDMAMountClient_NativeReadNeedleTo(t *testing.T) {
 	}
 }
 
+func TestRDMAMountClient_NativeReadNeedlesToUsesDescriptorBatch(t *testing.T) {
+	fileID1 := storage_needle.NewFileId(7, 0x1234, 0x98765432).String()
+	fileID2 := storage_needle.NewFileId(7, 0x1235, 0x98765432).String()
+	requester := &fakeNativeRdmaRequester{
+		local:    readyMountRdmaEndpoint(200),
+		readData: []byte("abcdefghijklmnopqrstuvwxyz"),
+	}
+
+	var providerConnects atomic.Int64
+	var readDescBatchCalls atomic.Int64
+	var releaseBatchCalls atomic.Int64
+	mux := http.NewServeMux()
+	mux.HandleFunc(weed_server.VolumeRdmaNativeLocalPath, func(w http.ResponseWriter, r *http.Request) {
+		local := readyMountRdmaEndpoint(100)
+		local.ConnectionID = 11
+		_ = json.NewEncoder(w).Encode(local)
+	})
+	mux.HandleFunc(weed_server.VolumeRdmaNativeConnectPath, func(w http.ResponseWriter, r *http.Request) {
+		var peer weed_server.VolumeRdmaEndpointInfo
+		if err := json.NewDecoder(r.Body).Decode(&peer); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if !peer.ReadyForConnect() {
+			http.Error(w, "peer not ready", http.StatusBadRequest)
+			return
+		}
+		providerConnects.Add(1)
+		_ = json.NewEncoder(w).Encode(map[string]bool{"connected": true})
+	})
+	mux.HandleFunc(weed_server.VolumeRdmaNativeReadDescBatchPath, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "bad method", http.StatusMethodNotAllowed)
+			return
+		}
+		var req weed_server.VolumeRdmaReadDescBatchRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(req.Entries) != 2 {
+			http.Error(w, fmt.Sprintf("entries=%d", len(req.Entries)), http.StatusBadRequest)
+			return
+		}
+		for _, entry := range req.Entries {
+			if entry.ConnectionID != 11 || entry.VolumeID != 7 {
+				http.Error(w, fmt.Sprintf("unexpected entry: %+v", entry), http.StatusBadRequest)
+				return
+			}
+		}
+		readDescBatchCalls.Add(1)
+		_ = json.NewEncoder(w).Encode(volumeRdmaReadDescBatchResponse{
+			Results: []volumeRdmaReadDescBatchResult{
+				{
+					Index:     0,
+					Desc:      weed_server.VolumeRdmaDataDesc{RemoteAddr: 0x100000, RKey: 99, Length: uint32(req.Entries[0].Size)},
+					SessionID: 900,
+					Status:    http.StatusOK,
+				},
+				{
+					Index:     1,
+					Desc:      weed_server.VolumeRdmaDataDesc{RemoteAddr: 0x200000, RKey: 100, Length: uint32(req.Entries[1].Size)},
+					SessionID: 901,
+					Status:    http.StatusOK,
+				},
+			},
+		})
+	})
+	mux.HandleFunc(weed_server.VolumeRdmaNativeReleaseDescBatchPath, func(w http.ResponseWriter, r *http.Request) {
+		var req volumeRdmaReleaseDescBatchRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if len(req.SessionIDs) != 2 || req.SessionIDs[0] != 900 || req.SessionIDs[1] != 901 {
+			http.Error(w, fmt.Sprintf("unexpected sessions: %+v", req.SessionIDs), http.StatusBadRequest)
+			return
+		}
+		releaseBatchCalls.Add(1)
+		_ = json.NewEncoder(w).Encode(volumeRdmaReleaseDescBatchResponse{
+			Results: []volumeRdmaReleaseDescBatchResult{
+				{SessionID: 900, Released: true, Status: http.StatusOK},
+				{SessionID: 901, Released: true, Status: http.StatusOK},
+			},
+		})
+	})
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	client := newRDMAMountClientBase(rdmaMountModeNative, "", func(ctx context.Context, fid string) ([]string, error) {
+		return []string{server.URL + "/" + fid}, nil
+	}, 4, 1000)
+	client.httpClient = server.Client()
+	client.nativeRequester = requester
+
+	var out1, out2 bytes.Buffer
+	n, isRDMA, err := client.ReadNeedlesTo(context.Background(), []RDMANeedleReadRequest{
+		{FileID: fileID1, Size: 3, Dst: &out1},
+		{FileID: fileID2, Size: 4, Dst: &out2},
+	})
+	if err != nil {
+		t.Fatalf("ReadNeedlesTo: %v", err)
+	}
+	if !isRDMA {
+		t.Fatal("expected RDMA batch read")
+	}
+	if n != 7 || out1.String() != "abc" || out2.String() != "abcd" {
+		t.Fatalf("unexpected batch read output: n=%d out1=%q out2=%q", n, out1.String(), out2.String())
+	}
+	if requester.localCalls.Load() != 1 || requester.connects.Load() != 1 || providerConnects.Load() != 1 {
+		t.Fatalf("handshake was not cached: requesterLocal=%d requesterConnect=%d providerConnect=%d",
+			requester.localCalls.Load(), requester.connects.Load(), providerConnects.Load())
+	}
+	if readDescBatchCalls.Load() != 1 || requester.readCalls.Load() != 2 || releaseBatchCalls.Load() != 1 {
+		t.Fatalf("batch counts: readDescBatch=%d requesterRead=%d releaseBatch=%d",
+			readDescBatchCalls.Load(), requester.readCalls.Load(), releaseBatchCalls.Load())
+	}
+	stats := client.GetStats()
+	if stats["native_read_requests"].(int64) != 2 || stats["native_read_successes"].(int64) != 2 || stats["native_read_bytes"].(int64) != 7 {
+		t.Fatalf("unexpected native read stats: %+v", stats)
+	}
+}
+
 func TestRDMAMountClient_WriteNeedle(t *testing.T) {
 	t.Run("successful_write", func(t *testing.T) {
 		var receivedData []byte

@@ -10,6 +10,13 @@ import (
 	"github.com/seaweedfs/seaweedfs/weed/pb/filer_pb"
 )
 
+const (
+	rdmaReadAheadChunkCount    = 4
+	rdmaReadAheadMaxChunks     = 16
+	rdmaReadAheadMaxBytes      = 64 << 20
+	rdmaReadAheadMaxChunkBytes = 16 << 20
+)
+
 func (fh *FileHandle) lockForRead(startOffset int64, size int) {
 	fh.dirtyPages.LockForRead(startOffset, startOffset+int64(size))
 }
@@ -126,6 +133,22 @@ func (fh *FileHandle) tryRDMARead(ctx context.Context, fileSize int64, buff []by
 	glog.V(4).Infof("RDMA read attempt: chunk=%s (fileId=%s), chunkOffset=%d, readSize=%d",
 		plan.fileID, plan.fileID, plan.chunkOffset, plan.readSize)
 
+	if totalRead, ok := fh.readRDMAReadAhead(plan, buff); ok {
+		glog.V(4).Infof("RDMA read-ahead cache hit: fileId=%s, chunkOffset=%d, readSize=%d",
+			plan.fileID, plan.chunkOffset, plan.readSize)
+		return totalRead, plan.chunk.ModifiedTsNs, nil
+	}
+
+	if err := fh.prefetchRDMAReadAhead(ctx, chunks, plan); err == nil {
+		if totalRead, ok := fh.readRDMAReadAhead(plan, buff); ok {
+			glog.V(4).Infof("RDMA read-ahead served after prefetch: fileId=%s, chunkOffset=%d, readSize=%d",
+				plan.fileID, plan.chunkOffset, plan.readSize)
+			return totalRead, plan.chunk.ModifiedTsNs, nil
+		}
+	} else {
+		glog.V(4).Infof("RDMA read-ahead prefetch skipped for fileId=%s: %v", plan.fileID, err)
+	}
+
 	writer := &fixedBufferWriter{buf: buff[:plan.readSize]}
 	totalRead, isRDMA, err := fh.wfs.rdmaClient.ReadNeedleTo(ctx, plan.fileID, uint64(plan.chunkOffset), uint64(plan.readSize), writer)
 	if err != nil {
@@ -137,6 +160,51 @@ func (fh *FileHandle) tryRDMARead(ctx context.Context, fileSize int64, buff []by
 	}
 
 	return totalRead, plan.chunk.ModifiedTsNs, nil
+}
+
+func (fh *FileHandle) prefetchRDMAReadAhead(ctx context.Context, chunks []*filer_pb.FileChunk, current *rdmaChunkReadPlan) error {
+	plans := selectRDMAReadAheadPlans(chunks, current, fh.rdmaReadAheadHas)
+	if len(plans) == 0 {
+		return fmt.Errorf("no eligible RDMA read-ahead chunks")
+	}
+
+	reads := make([]RDMANeedleReadRequest, 0, len(plans))
+	buffers := make([][]byte, 0, len(plans))
+	var expected int64
+	for _, plan := range plans {
+		if plan.readSize <= 0 || plan.readSize > int64(maxInt) {
+			continue
+		}
+		data := make([]byte, int(plan.readSize))
+		reads = append(reads, RDMANeedleReadRequest{
+			FileID: plan.fileID,
+			Offset: 0,
+			Size:   uint64(plan.readSize),
+			Dst:    &fixedBufferWriter{buf: data},
+		})
+		buffers = append(buffers, data)
+		expected += plan.readSize
+	}
+	if len(reads) == 0 {
+		return fmt.Errorf("no RDMA read-ahead reads were built")
+	}
+
+	totalRead, isRDMA, err := fh.wfs.rdmaClient.ReadNeedlesTo(ctx, reads)
+	if err != nil {
+		return err
+	}
+	if !isRDMA {
+		return fmt.Errorf("RDMA read-ahead did not use RDMA")
+	}
+	if totalRead != expected {
+		return fmt.Errorf("RDMA read-ahead copied %d bytes, expected %d", totalRead, expected)
+	}
+
+	for i, read := range reads {
+		fh.storeRDMAReadAhead(read.FileID, buffers[i])
+	}
+	glog.V(4).Infof("RDMA read-ahead prefetched %d chunks (%d bytes)", len(reads), totalRead)
+	return nil
 }
 
 type rdmaChunkReadPlan struct {
@@ -190,6 +258,147 @@ func planRDMAChunkRead(chunks []*filer_pb.FileChunk, fileSize int64, bufferSize 
 		chunkOffset: chunkOffset,
 		readSize:    readSize,
 	}, nil
+}
+
+func selectRDMAReadAheadPlans(chunks []*filer_pb.FileChunk, current *rdmaChunkReadPlan, cached func(string) bool) []rdmaChunkReadPlan {
+	if current == nil || current.chunk == nil {
+		return nil
+	}
+	plans := make([]rdmaChunkReadPlan, 0, rdmaReadAheadChunkCount)
+	for _, chunk := range chunks {
+		if chunk == nil || chunk.Offset < current.chunk.Offset {
+			continue
+		}
+		plan, err := planRDMAWholeChunkRead(chunk)
+		if err != nil {
+			continue
+		}
+		if cached != nil && cached(plan.fileID) {
+			continue
+		}
+		plans = append(plans, *plan)
+		if len(plans) >= rdmaReadAheadChunkCount {
+			break
+		}
+	}
+	return plans
+}
+
+func planRDMAWholeChunkRead(chunk *filer_pb.FileChunk) (*rdmaChunkReadPlan, error) {
+	if chunk == nil {
+		return nil, fmt.Errorf("nil chunk")
+	}
+	fileID := chunk.GetFileIdString()
+	if fileID == "" {
+		return nil, fmt.Errorf("chunk at offset %d has no file id", chunk.Offset)
+	}
+	if chunk.IsCompressed {
+		return nil, fmt.Errorf("RDMA read does not support compressed chunk %s", fileID)
+	}
+	if len(chunk.CipherKey) > 0 {
+		return nil, fmt.Errorf("RDMA read does not support encrypted chunk %s", fileID)
+	}
+	if chunk.Size == 0 {
+		return nil, fmt.Errorf("empty chunk %s", fileID)
+	}
+	if chunk.Size > maxUint32 || chunk.Size > uint64(maxInt) || chunk.Size > rdmaReadAheadMaxChunkBytes {
+		return nil, fmt.Errorf("chunk %s is too large for RDMA read-ahead: %d", fileID, chunk.Size)
+	}
+	return &rdmaChunkReadPlan{
+		chunk:       chunk,
+		fileID:      fileID,
+		chunkOffset: 0,
+		readSize:    int64(chunk.Size),
+	}, nil
+}
+
+func (fh *FileHandle) readRDMAReadAhead(plan *rdmaChunkReadPlan, buff []byte) (int64, bool) {
+	if plan == nil || plan.chunkOffset < 0 || plan.readSize <= 0 {
+		return 0, false
+	}
+	data, ok := fh.getRDMAReadAhead(plan.fileID)
+	if !ok {
+		return 0, false
+	}
+	stop := plan.chunkOffset + plan.readSize
+	if stop > int64(len(data)) {
+		fh.dropRDMAReadAhead(plan.fileID)
+		return 0, false
+	}
+	copied := copy(buff[:plan.readSize], data[plan.chunkOffset:stop])
+	return int64(copied), copied == int(plan.readSize)
+}
+
+func (fh *FileHandle) getRDMAReadAhead(fileID string) ([]byte, bool) {
+	fh.rdmaReadAheadLock.Lock()
+	defer fh.rdmaReadAheadLock.Unlock()
+	data, ok := fh.rdmaReadAhead[fileID]
+	return data, ok
+}
+
+func (fh *FileHandle) rdmaReadAheadHas(fileID string) bool {
+	fh.rdmaReadAheadLock.Lock()
+	defer fh.rdmaReadAheadLock.Unlock()
+	_, ok := fh.rdmaReadAhead[fileID]
+	return ok
+}
+
+func (fh *FileHandle) storeRDMAReadAhead(fileID string, data []byte) {
+	if fileID == "" || len(data) == 0 || len(data) > rdmaReadAheadMaxChunkBytes {
+		return
+	}
+	fh.rdmaReadAheadLock.Lock()
+	defer fh.rdmaReadAheadLock.Unlock()
+	if fh.rdmaReadAhead == nil {
+		fh.rdmaReadAhead = make(map[string][]byte)
+	}
+	if old, ok := fh.rdmaReadAhead[fileID]; ok {
+		fh.rdmaReadAheadBytes -= int64(len(old))
+		fh.removeRDMAReadAheadOrderLocked(fileID)
+	}
+	fh.rdmaReadAhead[fileID] = data
+	fh.rdmaReadAheadOrder = append(fh.rdmaReadAheadOrder, fileID)
+	fh.rdmaReadAheadBytes += int64(len(data))
+
+	for (fh.rdmaReadAheadBytes > rdmaReadAheadMaxBytes || len(fh.rdmaReadAhead) > rdmaReadAheadMaxChunks) && len(fh.rdmaReadAheadOrder) > 0 {
+		victim := fh.rdmaReadAheadOrder[0]
+		fh.rdmaReadAheadOrder = fh.rdmaReadAheadOrder[1:]
+		if old, ok := fh.rdmaReadAhead[victim]; ok {
+			delete(fh.rdmaReadAhead, victim)
+			fh.rdmaReadAheadBytes -= int64(len(old))
+		}
+	}
+}
+
+func (fh *FileHandle) dropRDMAReadAhead(fileID string) {
+	fh.rdmaReadAheadLock.Lock()
+	defer fh.rdmaReadAheadLock.Unlock()
+	if fh.rdmaReadAhead == nil {
+		return
+	}
+	if old, ok := fh.rdmaReadAhead[fileID]; ok {
+		delete(fh.rdmaReadAhead, fileID)
+		fh.rdmaReadAheadBytes -= int64(len(old))
+		fh.removeRDMAReadAheadOrderLocked(fileID)
+	}
+}
+
+func (fh *FileHandle) clearRDMAReadAhead() {
+	fh.rdmaReadAheadLock.Lock()
+	defer fh.rdmaReadAheadLock.Unlock()
+	fh.rdmaReadAhead = nil
+	fh.rdmaReadAheadOrder = nil
+	fh.rdmaReadAheadBytes = 0
+}
+
+func (fh *FileHandle) removeRDMAReadAheadOrderLocked(fileID string) {
+	for i, cachedFileID := range fh.rdmaReadAheadOrder {
+		if cachedFileID == fileID {
+			copy(fh.rdmaReadAheadOrder[i:], fh.rdmaReadAheadOrder[i+1:])
+			fh.rdmaReadAheadOrder = fh.rdmaReadAheadOrder[:len(fh.rdmaReadAheadOrder)-1]
+			return
+		}
+	}
 }
 
 type fixedBufferWriter struct {

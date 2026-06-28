@@ -49,6 +49,11 @@ type FileHandle struct {
 	chunkCacheValid  bool
 	chunkCacheLock   sync.RWMutex
 
+	rdmaReadAheadLock  sync.Mutex
+	rdmaReadAhead      map[string][]byte
+	rdmaReadAheadOrder []string
+	rdmaReadAheadBytes int64
+
 	// for debugging
 	mirrorFile *os.File
 }
@@ -155,6 +160,7 @@ func (fh *FileHandle) ReleaseHandle() {
 	defer fh.wfs.fhLockTable.ReleaseLock(fh.fh, fhActiveLock)
 
 	fh.dirtyPages.Destroy()
+	fh.clearRDMAReadAhead()
 	if IsDebugFileReadWrite {
 		fh.mirrorFile.Close()
 	}
@@ -203,4 +209,5 @@ func (fh *FileHandle) invalidateChunkCache() {
 	fh.chunkCacheValid = false
 	fh.chunkOffsetCache = nil
 	fh.chunkCacheLock.Unlock()
+	fh.clearRDMAReadAhead()
 }
