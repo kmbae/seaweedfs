@@ -187,6 +187,9 @@ func TestVolumeNativeRDMAReadDescriptorClientConnectsNativePeer(t *testing.T) {
 		if desc.RemoteAddr != 0xbeef || desc.RKey != 77 || desc.Length != 512 {
 			t.Fatalf("unexpected desc[%d]: %+v", i, desc)
 		}
+		if desc.Reserved[1] != 55 {
+			t.Fatalf("desc[%d] connection id = %d, want 55", i, desc.Reserved[1])
+		}
 	}
 	if localRequests != 1 {
 		t.Fatalf("local requests = %d, want 1", localRequests)
