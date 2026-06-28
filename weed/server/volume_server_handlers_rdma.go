@@ -201,7 +201,30 @@ func (vs *VolumeServer) volumeRdmaWriteHandler(w http.ResponseWriter, r *http.Re
 	if req.TimeoutMs != 0 {
 		timeout = time.Duration(req.TimeoutMs) * time.Millisecond
 	}
-	data, err := requester.ReadRemoteFor(r.Context(), req.ConnectionID, req.Desc, timeout)
+	readDesc := req.Desc
+	readDesc.Length = uint32(req.Size)
+	if streamer, ok := requester.(volumeRdmaRemoteReadStreamer); ok {
+		var readErr error
+		fileID, err := vs.writeNeedleDataFromNativeRdmaStream(r.Context(), req, func(w io.Writer) error {
+			readErr = streamer.ReadRemoteToFor(r.Context(), req.ConnectionID, readDesc, timeout, w)
+			return readErr
+		})
+		if err != nil {
+			if readErr != nil {
+				writeJsonError(w, r, http.StatusServiceUnavailable, readErr)
+			} else {
+				writeJsonError(w, r, http.StatusInternalServerError, err)
+			}
+			return
+		}
+		writeJsonQuiet(w, r, http.StatusOK, volumeRdmaWriteResponse{
+			FileID: fileID,
+			Size:   req.Size,
+			Source: "native-volume-rdma-write-stream",
+		})
+		return
+	}
+	data, err := requester.ReadRemoteFor(r.Context(), req.ConnectionID, readDesc, timeout)
 	if err != nil {
 		writeJsonError(w, r, http.StatusServiceUnavailable, err)
 		return
@@ -447,6 +470,10 @@ type volumeRdmaWriteTargetEndpoint interface {
 
 type volumeRdmaWriteStreamTargetEndpoint interface {
 	ReadRegisteredBufferTo(context.Context, uint64, uint64, io.Writer) error
+}
+
+type volumeRdmaRemoteReadStreamer interface {
+	ReadRemoteToFor(context.Context, uint64, VolumeRdmaDataDesc, time.Duration, io.Writer) error
 }
 
 func (vs *VolumeServer) rdmaWriteTargetEndpoint() (volumeRdmaWriteTargetEndpoint, bool) {

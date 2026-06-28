@@ -464,23 +464,22 @@ static int swrdma_poll_completion(swrdma_conn *conn, uint64_t wr_id, uint64_t ti
 	}
 }
 
-static swrdma_mr *swrdma_read_remote(swrdma_conn *conn, uint64_t remote_addr, uint32_t rkey, size_t length, uint64_t timeout_ms, char *err, size_t err_len) {
+static int swrdma_read_remote_into(swrdma_conn *conn, swrdma_mr *local, uint64_t remote_addr, uint32_t rkey, size_t length, uint64_t timeout_ms, char *err, size_t err_len) {
 	if (conn == NULL || conn->qp == NULL) {
 		swrdma_set_error(err, err_len, "RDMA connection is not open");
-		return NULL;
+		return -1;
 	}
 	if (!conn->connected || conn->qp_state != IBV_QPS_RTS) {
 		swrdma_set_error(err, err_len, "RDMA READ requires connected RTS QP");
-		return NULL;
+		return -1;
 	}
 	if (remote_addr == 0 || length == 0) {
 		swrdma_set_error(err, err_len, "RDMA READ requires non-empty remote descriptor");
-		return NULL;
+		return -1;
 	}
-
-	swrdma_mr *local = swrdma_alloc_mr(conn, length, SWRDMA_MR_LOCAL, err, err_len);
-	if (local == NULL) {
-		return NULL;
+	if (local == NULL || local->mr == NULL || local->addr == NULL || local->length < length) {
+		swrdma_set_error(err, err_len, "RDMA READ local MR is too small");
+		return -1;
 	}
 
 	struct ibv_sge sge;
@@ -502,10 +501,20 @@ static swrdma_mr *swrdma_read_remote(swrdma_conn *conn, uint64_t remote_addr, ui
 
 	if (ibv_post_send(conn->qp, &wr, &bad_wr) != 0) {
 		swrdma_set_error(err, err_len, "ibv_post_send RDMA_READ failed: %s", strerror(errno));
-		swrdma_free_mr(local);
-		return NULL;
+		return -1;
 	}
 	if (swrdma_poll_completion(conn, wr.wr_id, timeout_ms, IBV_WC_RDMA_READ, err, err_len) != 0) {
+		return -1;
+	}
+	return 0;
+}
+
+static swrdma_mr *swrdma_read_remote(swrdma_conn *conn, uint64_t remote_addr, uint32_t rkey, size_t length, uint64_t timeout_ms, char *err, size_t err_len) {
+	swrdma_mr *local = swrdma_alloc_mr(conn, length, SWRDMA_MR_LOCAL, err, err_len);
+	if (local == NULL) {
+		return NULL;
+	}
+	if (swrdma_read_remote_into(conn, local, remote_addr, rkey, length, timeout_ms, err, err_len) != 0) {
 		swrdma_free_mr(local);
 		return NULL;
 	}
@@ -540,6 +549,10 @@ import (
 const (
 	embeddedVolumeRdmaDefaultPSN = 0xabcdef
 	embeddedVolumeRdmaErrLen     = 512
+
+	embeddedVolumeRdmaReadMRPoolLimit = 4
+	embeddedVolumeRdmaReadMRMinSize   = 64 << 10
+	embeddedVolumeRdmaReadMRAlign     = 1 << 20
 )
 
 type embeddedVolumeRdmaTransport struct {
@@ -559,6 +572,8 @@ type embeddedVolumeRdmaConnection struct {
 	endpoint  VolumeRdmaEndpointInfo
 	remote    VolumeRdmaRemoteInfo
 	connected bool
+
+	readMRPool map[uint64][]*C.swrdma_mr
 }
 
 type embeddedVolumeRdmaBuffer struct {
@@ -663,51 +678,82 @@ func (t *embeddedVolumeRdmaTransport) RequesterConnectEndpointFor(ctx context.Co
 }
 
 func (t *embeddedVolumeRdmaTransport) ReadRemoteFor(ctx context.Context, connectionID uint64, desc VolumeRdmaDataDesc, timeout time.Duration) ([]byte, error) {
-	if err := ctx.Err(); err != nil {
+	mr, poolKey, err := t.readRemoteMR(ctx, connectionID, desc, timeout)
+	if err != nil {
 		return nil, err
 	}
+	defer t.releaseReadMR(connectionID, poolKey, mr, true)
+	data := C.GoBytes(mr.addr, C.int(desc.Length))
+	if uint32(len(data)) < desc.Length {
+		return nil, fmt.Errorf("embedded RDMA read_remote returned %d bytes for %d byte descriptor", len(data), desc.Length)
+	}
+	return data[:int(desc.Length)], nil
+}
+
+func (t *embeddedVolumeRdmaTransport) ReadRemoteToFor(ctx context.Context, connectionID uint64, desc VolumeRdmaDataDesc, timeout time.Duration, dst io.Writer) error {
+	if dst == nil {
+		return fmt.Errorf("embedded RDMA read_remote_to requires destination writer")
+	}
+	mr, poolKey, err := t.readRemoteMR(ctx, connectionID, desc, timeout)
+	if err != nil {
+		return err
+	}
+	defer t.releaseReadMR(connectionID, poolKey, mr, true)
+	payload := unsafe.Slice((*byte)(mr.addr), int(desc.Length))
+	n, err := dst.Write(payload)
+	if err == nil && n != len(payload) {
+		err = io.ErrShortWrite
+	}
+	return err
+}
+
+func (t *embeddedVolumeRdmaTransport) readRemoteMR(ctx context.Context, connectionID uint64, desc VolumeRdmaDataDesc, timeout time.Duration) (*C.swrdma_mr, uint64, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, 0, err
+	}
 	if connectionID == 0 {
-		return nil, fmt.Errorf("embedded RDMA read_remote requires connection_id")
+		return nil, 0, fmt.Errorf("embedded RDMA read_remote requires connection_id")
 	}
 	if desc.RemoteAddr == 0 || desc.Length == 0 {
-		return nil, fmt.Errorf("embedded RDMA read_remote requires non-empty descriptor")
+		return nil, 0, fmt.Errorf("embedded RDMA read_remote requires non-empty descriptor")
 	}
 	if desc.Length > volumeRdmaEngineMaxFrameSize {
-		return nil, fmt.Errorf("embedded RDMA read_remote frame too large: %d bytes", desc.Length)
+		return nil, 0, fmt.Errorf("embedded RDMA read_remote frame too large: %d bytes", desc.Length)
 	}
 	timeoutMs := uint64(timeout.Milliseconds())
 	if timeoutMs == 0 && timeout > 0 {
 		timeoutMs = 1
 	}
+	poolKey := embeddedVolumeRdmaReadMRPoolKey(desc.Length)
 
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	conn, err := t.ensureConnectionLocked(connectionID)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if !conn.connected {
-		return nil, fmt.Errorf("embedded RDMA connection %d is not connected", connectionID)
+		return nil, 0, fmt.Errorf("embedded RDMA connection %d is not connected", connectionID)
 	}
 	var errBuf [embeddedVolumeRdmaErrLen]C.char
-	mr := C.swrdma_read_remote(
+	mr, err := t.acquireReadMRLocked(conn, poolKey)
+	if err != nil {
+		return nil, 0, err
+	}
+	if C.swrdma_read_remote_into(
 		conn.handle,
+		mr,
 		C.uint64_t(desc.RemoteAddr),
 		C.uint32_t(desc.RKey),
 		C.size_t(desc.Length),
 		C.uint64_t(timeoutMs),
 		&errBuf[0],
 		C.size_t(len(errBuf)),
-	)
-	if mr == nil {
-		return nil, fmt.Errorf("embedded RDMA read_remote: %s", cErrorString(&errBuf[0]))
+	) != 0 {
+		C.swrdma_free_mr(mr)
+		return nil, 0, fmt.Errorf("embedded RDMA read_remote: %s", cErrorString(&errBuf[0]))
 	}
-	defer C.swrdma_free_mr(mr)
-	data := C.GoBytes(mr.addr, C.int(mr.length))
-	if uint32(len(data)) < desc.Length {
-		return nil, fmt.Errorf("embedded RDMA read_remote returned %d bytes for %d byte descriptor", len(data), desc.Length)
-	}
-	return data[:int(desc.Length)], nil
+	return mr, poolKey, nil
 }
 
 func (t *embeddedVolumeRdmaTransport) RegisterReadBuffer(ctx context.Context, data []byte) (VolumeRdmaRegisteredBuffer, error) {
@@ -844,10 +890,73 @@ func (t *embeddedVolumeRdmaTransport) Close() error {
 		buffer.mr = nil
 	}
 	for _, conn := range connections {
+		for _, pool := range conn.readMRPool {
+			for _, mr := range pool {
+				C.swrdma_free_mr(mr)
+			}
+		}
 		C.swrdma_close_conn(conn.handle)
 		conn.handle = nil
 	}
 	return nil
+}
+
+func (t *embeddedVolumeRdmaTransport) acquireReadMRLocked(conn *embeddedVolumeRdmaConnection, poolKey uint64) (*C.swrdma_mr, error) {
+	if conn == nil || conn.handle == nil {
+		return nil, fmt.Errorf("embedded RDMA connection is not open")
+	}
+	if conn.readMRPool == nil {
+		conn.readMRPool = make(map[uint64][]*C.swrdma_mr)
+	}
+	pool := conn.readMRPool[poolKey]
+	if len(pool) > 0 {
+		last := len(pool) - 1
+		mr := pool[last]
+		conn.readMRPool[poolKey] = pool[:last]
+		return mr, nil
+	}
+	var errBuf [embeddedVolumeRdmaErrLen]C.char
+	mr := C.swrdma_alloc_mr(conn.handle, C.size_t(poolKey), C.SWRDMA_MR_LOCAL, &errBuf[0], C.size_t(len(errBuf)))
+	if mr == nil {
+		return nil, fmt.Errorf("embedded RDMA allocate read MR: %s", cErrorString(&errBuf[0]))
+	}
+	return mr, nil
+}
+
+func (t *embeddedVolumeRdmaTransport) releaseReadMR(connectionID uint64, poolKey uint64, mr *C.swrdma_mr, reusable bool) {
+	if mr == nil {
+		return
+	}
+	if !reusable || poolKey == 0 {
+		C.swrdma_free_mr(mr)
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	conn := t.connections[connectionID]
+	if t.closed || conn == nil {
+		C.swrdma_free_mr(mr)
+		return
+	}
+	if conn.readMRPool == nil {
+		conn.readMRPool = make(map[uint64][]*C.swrdma_mr)
+	}
+	if len(conn.readMRPool[poolKey]) >= embeddedVolumeRdmaReadMRPoolLimit {
+		C.swrdma_free_mr(mr)
+		return
+	}
+	conn.readMRPool[poolKey] = append(conn.readMRPool[poolKey], mr)
+}
+
+func embeddedVolumeRdmaReadMRPoolKey(length uint32) uint64 {
+	size := uint64(length)
+	if size < embeddedVolumeRdmaReadMRMinSize {
+		size = embeddedVolumeRdmaReadMRMinSize
+	}
+	if size <= embeddedVolumeRdmaReadMRAlign {
+		return size
+	}
+	return ((size + embeddedVolumeRdmaReadMRAlign - 1) / embeddedVolumeRdmaReadMRAlign) * embeddedVolumeRdmaReadMRAlign
 }
 
 func (t *embeddedVolumeRdmaTransport) allocateSessionBuffer(ctx context.Context, connectionID uint64, size uint64, kind C.int) (*embeddedVolumeRdmaBuffer, error) {
@@ -910,9 +1019,10 @@ func (t *embeddedVolumeRdmaTransport) ensureConnectionLocked(connectionID uint64
 		return nil, fmt.Errorf("embedded RDMA open device=%s port=%d gid_index=%d: %s", t.cfg.Device, t.cfg.Port, t.cfg.GIDIndex, cErrorString(&errBuf[0]))
 	}
 	conn := &embeddedVolumeRdmaConnection{
-		id:       connectionID,
-		handle:   handle,
-		endpoint: endpointInfoFromC(&handle.endpoint),
+		id:         connectionID,
+		handle:     handle,
+		endpoint:   endpointInfoFromC(&handle.endpoint),
+		readMRPool: make(map[uint64][]*C.swrdma_mr),
 	}
 	conn.endpoint.ConnectionID = connectionID
 	t.connections[connectionID] = conn
