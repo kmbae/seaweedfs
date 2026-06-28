@@ -1,0 +1,45 @@
+FROM golang:1.25-alpine AS builder
+
+RUN apk add --no-cache \
+      build-base \
+      ca-certificates \
+      git \
+      linux-headers \
+      rdma-core-dev
+
+WORKDIR /go/src/github.com/seaweedfs/seaweedfs
+COPY . .
+
+ARG TAGS=seaweedfs_rdmaverbs,5BytesOffset
+RUN cd weed \
+    && export LDFLAGS="-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$(git rev-parse --short HEAD)" \
+    && CGO_ENABLED=1 GOOS=linux go install -tags "$TAGS" -ldflags "-s -w ${LDFLAGS}"
+
+FROM alpine:3.24
+LABEL author="Chris Lu"
+
+RUN apk add --no-cache \
+      ca-certificates \
+      curl \
+      fuse3 \
+      procps \
+      rdma-core \
+      su-exec
+
+COPY --from=builder /go/bin/weed /usr/bin/weed
+RUN touch /usr/bin/weed-volume && chmod 0755 /usr/bin/weed /usr/bin/weed-volume
+
+RUN mkdir -p /etc/seaweedfs
+COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/filer.toml /etc/seaweedfs/filer.toml
+COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/entrypoint.sh /entrypoint.sh
+
+EXPOSE 18080 8080 18888 8888 19333 9333 8333 7333
+
+RUN mkdir -p /data/filerldb2 \
+    && chmod 755 /entrypoint.sh
+
+VOLUME /data
+WORKDIR /data
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["mini", "-dir=/data"]
