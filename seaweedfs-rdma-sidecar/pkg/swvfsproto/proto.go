@@ -36,6 +36,7 @@ const (
 	OpRDMAReleaseRead      uint32 = 25
 	OpRDMAReadPrepare      uint32 = 26
 	OpWriteRDMACommitBatch uint32 = 27
+	OpRDMAReadPrepareBatch uint32 = 28
 )
 
 const (

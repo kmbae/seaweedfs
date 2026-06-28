@@ -159,6 +159,7 @@ func (p *capturePlane) WriteNeedle(ctx context.Context, req swvfsdaemon.NeedleWr
 type captureNativeReadDescriptor struct {
 	calls int
 	req   swvfsdaemon.NeedleReadDescriptorRequest
+	reqs  []swvfsdaemon.NeedleReadDescriptorRequest
 	desc  swvfsproto.RDMADataDesc
 	err   error
 }
@@ -166,6 +167,7 @@ type captureNativeReadDescriptor struct {
 func (c *captureNativeReadDescriptor) ReadNeedleRDMA(ctx context.Context, req swvfsdaemon.NeedleReadDescriptorRequest) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
 	c.calls++
 	c.req = req
+	c.reqs = append(c.reqs, req)
 	if c.err != nil {
 		return nil, nil, c.err
 	}
@@ -332,6 +334,49 @@ func TestBackendReadFileRDMAReturnsFirstNativeChunkForMultiChunk(t *testing.T) {
 	}
 	if desc.RemoteAddr != 0xbeef || desc.Length != 1024 {
 		t.Fatalf("desc = %+v", desc)
+	}
+}
+
+func TestBackendReadFileRDMABatchReturnsNativeChunks(t *testing.T) {
+	store := &fakeStore{entries: map[string]*filer_pb.Entry{
+		"/file": {
+			Name: "file",
+			Attributes: &filer_pb.FuseAttributes{
+				FileMode: 0644,
+				FileSize: 2048,
+			},
+			Chunks: []*filer_pb.FileChunk{
+				{FileId: "3,01637037d6", Offset: 0, Size: 1024, ModifiedTsNs: 1},
+				{FileId: "4,01637037d7", Offset: 1024, Size: 1024, ModifiedTsNs: 2},
+			},
+		},
+	}}
+	native := &captureNativeReadDescriptor{desc: swvfsproto.RDMADataDesc{RemoteAddr: 0xbeef, RKey: 99, Length: 1024}}
+	staging := &captureReadDescriptor{desc: swvfsproto.RDMADataDesc{RemoteAddr: 0xdead, RKey: 7, Length: 2048}}
+	backend := &Backend{
+		Store:                 store,
+		NativeReadDescriptor:  native,
+		ReadDescriptorBackend: staging,
+	}
+
+	descs, attr, err := backend.ReadFileRDMABatch(context.Background(), "/file", 0, 2048, 4)
+	if err != nil {
+		t.Fatalf("ReadFileRDMABatch: %v", err)
+	}
+	if attr == nil || attr.Size != 2048 {
+		t.Fatalf("attr = %+v", attr)
+	}
+	if len(descs) != 2 {
+		t.Fatalf("desc count = %d, descs=%+v", len(descs), descs)
+	}
+	if descs[0].Reserved[2] != 0 || descs[1].Reserved[2] != 1024 {
+		t.Fatalf("descriptor file offsets = %d/%d", descs[0].Reserved[2], descs[1].Reserved[2])
+	}
+	if len(native.reqs) != 2 || native.reqs[0].FileID != "3,01637037d6" || native.reqs[1].FileID != "4,01637037d7" {
+		t.Fatalf("unexpected native requests: %+v", native.reqs)
+	}
+	if staging.calls != 0 {
+		t.Fatalf("staging backend was called: %d", staging.calls)
 	}
 }
 

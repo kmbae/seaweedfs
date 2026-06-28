@@ -79,6 +79,27 @@ func TestRDMADataDescEncodeDecode(t *testing.T) {
 	}
 }
 
+func TestRDMADataDescArrayEncodeDecode(t *testing.T) {
+	descs := []RDMADataDesc{
+		{RemoteAddr: 0x1000, RKey: 1, Length: 4096, Reserved: [4]uint64{11, 21, 0, 0}},
+		{RemoteAddr: 0x2000, RKey: 2, Length: 8192, Reserved: [4]uint64{12, 22, 4096, 0}},
+	}
+	encoded := EncodeRDMADataDescs(descs)
+	if len(encoded) != len(descs)*RDMADataDescSize {
+		t.Fatalf("encoded length = %d", len(encoded))
+	}
+	got, err := DecodeRDMADataDescs(encoded)
+	if err != nil {
+		t.Fatalf("DecodeRDMADataDescs: %v", err)
+	}
+	if len(got) != len(descs) || got[0] != descs[0] || got[1] != descs[1] {
+		t.Fatalf("decoded descs mismatch: %+v", got)
+	}
+	if _, err := DecodeRDMADataDescs(encoded[:len(encoded)-1]); err == nil {
+		t.Fatal("short descriptor array decoded successfully")
+	}
+}
+
 func TestRDMAWriteCommitEntryEncodeDecode(t *testing.T) {
 	entries := []RDMAWriteCommitEntry{
 		{Offset: 4, Size: 8},

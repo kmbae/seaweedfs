@@ -38,9 +38,11 @@ type fakeXAttrBackend struct {
 type fakeRDMAFileBackend struct {
 	fakeFileBackend
 	readDesc         *swvfsproto.RDMADataDesc
+	readBatchDescs   []swvfsproto.RDMADataDesc
 	readDescPath     string
 	readDescOffset   uint64
 	readDescSize     uint64
+	readBatchMax     uint32
 	writeDesc        *swvfsproto.RDMADataDesc
 	preparePath      string
 	prepareOffset    uint64
@@ -81,6 +83,28 @@ func (f *fakeRDMAFileBackend) ReadFileRDMA(ctx context.Context, path string, off
 		return nil, nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma read desc unavailable"}
 	}
 	return f.readDesc, &swvfsproto.Attr{Ino: 9, Size: size, Mode: 0100644, Nlink: 1}, nil
+}
+
+func (f *fakeRDMAFileBackend) ReadFileRDMABatch(ctx context.Context, path string, offset, size uint64, maxDescs uint32) ([]swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
+	f.readDescPath = path
+	f.readDescOffset = offset
+	f.readDescSize = size
+	f.readBatchMax = maxDescs
+	if f.readDescErr != nil {
+		return nil, nil, f.readDescErr
+	}
+	if f.readDescFallback {
+		return nil, nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma read desc unavailable"}
+	}
+	if f.readBatchDescs != nil {
+		return append([]swvfsproto.RDMADataDesc(nil), f.readBatchDescs...), &swvfsproto.Attr{Ino: 9, Size: size, Mode: 0100644, Nlink: 1}, nil
+	}
+	if f.readDesc == nil {
+		return nil, nil, nil
+	}
+	desc := *f.readDesc
+	desc.Reserved[2] = offset
+	return []swvfsproto.RDMADataDesc{desc}, &swvfsproto.Attr{Ino: 9, Size: size, Mode: 0100644, Nlink: 1}, nil
 }
 
 func (f *fakeRDMAFileBackend) PrepareWriteRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
@@ -259,6 +283,38 @@ func TestHandlerRDMAReadPrepareReturnsDescriptorOnly(t *testing.T) {
 	}
 	if backend.readDescPath != "/direct-rdma-file" || backend.readDescOffset != 256 || backend.readDescSize != 8192 {
 		t.Fatalf("read desc backend mismatch: path=%q off=%d size=%d", backend.readDescPath, backend.readDescOffset, backend.readDescSize)
+	}
+}
+
+func TestHandlerRDMAReadPrepareBatchReturnsDescriptors(t *testing.T) {
+	backend := &fakeRDMAFileBackend{
+		readBatchDescs: []swvfsproto.RDMADataDesc{
+			{RemoteAddr: 0x3000, RKey: 17, Length: 4096, Reserved: [4]uint64{1, 11, 256, 0}},
+			{RemoteAddr: 0x5000, RKey: 19, Length: 8192, Reserved: [4]uint64{2, 12, 4352, 0}},
+		},
+	}
+	h := &Handler{Backend: backend}
+	req := &swvfsproto.Request{
+		Header: swvfsproto.RequestHeader{Tag: 17, Op: swvfsproto.OpRDMAReadPrepareBatch, Offset: 256, Size: 12288, Mode: 8},
+		Path1:  "/direct-rdma-file",
+	}
+
+	reply, err := h.Handle(context.Background(), req)
+	if err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if reply.EOF&swvfsproto.ReplyFRDMAReadDesc == 0 {
+		t.Fatalf("RDMA read desc flag not set: eof=0x%x", reply.EOF)
+	}
+	descs, err := swvfsproto.DecodeRDMADataDescs(reply.Data)
+	if err != nil {
+		t.Fatalf("DecodeRDMADataDescs: %v", err)
+	}
+	if len(descs) != 2 || descs[0].Reserved[2] != 256 || descs[1].Reserved[2] != 4352 {
+		t.Fatalf("descriptors mismatch: %+v", descs)
+	}
+	if backend.readDescPath != "/direct-rdma-file" || backend.readDescOffset != 256 || backend.readDescSize != 12288 || backend.readBatchMax != 8 {
+		t.Fatalf("backend batch range mismatch: path=%q off=%d size=%d max=%d", backend.readDescPath, backend.readDescOffset, backend.readDescSize, backend.readBatchMax)
 	}
 }
 

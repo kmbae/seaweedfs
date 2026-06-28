@@ -168,6 +168,14 @@ func EncodeRDMADataDesc(desc RDMADataDesc) []byte {
 	return out
 }
 
+func EncodeRDMADataDescs(descs []RDMADataDesc) []byte {
+	out := make([]byte, len(descs)*RDMADataDescSize)
+	for i, desc := range descs {
+		copy(out[i*RDMADataDescSize:], EncodeRDMADataDesc(desc))
+	}
+	return out
+}
+
 func DecodeRDMADataDesc(buf []byte) (RDMADataDesc, error) {
 	if len(buf) < RDMADataDescSize {
 		return RDMADataDesc{}, fmt.Errorf("%w: rdma desc got %d need %d", ErrShortReply, len(buf), RDMADataDescSize)
@@ -181,6 +189,21 @@ func DecodeRDMADataDesc(buf []byte) (RDMADataDesc, error) {
 		desc.Reserved[i] = binary.LittleEndian.Uint64(buf[off : off+8])
 	}
 	return desc, nil
+}
+
+func DecodeRDMADataDescs(buf []byte) ([]RDMADataDesc, error) {
+	if len(buf)%RDMADataDescSize != 0 {
+		return nil, fmt.Errorf("%w: rdma desc array got %d bytes", ErrBadLength, len(buf))
+	}
+	descs := make([]RDMADataDesc, len(buf)/RDMADataDescSize)
+	for i := range descs {
+		desc, err := DecodeRDMADataDesc(buf[i*RDMADataDescSize:])
+		if err != nil {
+			return nil, err
+		}
+		descs[i] = desc
+	}
+	return descs, nil
 }
 
 func EncodeRDMAWriteCommitEntries(entries []RDMAWriteCommitEntry) []byte {

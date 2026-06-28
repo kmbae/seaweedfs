@@ -746,6 +746,64 @@ func (b *Backend) ReadFileRDMA(ctx context.Context, fullPath string, offset, siz
 	return b.ReadDescriptorBackend.ReadFileRDMA(ctx, cleanFullPath(fullPath), offset, size)
 }
 
+func (b *Backend) ReadFileRDMABatch(ctx context.Context, fullPath string, offset, size uint64, maxDescs uint32) ([]swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
+	if b == nil {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma read descriptor backend is not configured"}
+	}
+	if maxDescs == 0 {
+		maxDescs = 1
+	}
+	if maxDescs > 16 {
+		maxDescs = 16
+	}
+	if b.NativeReadDescriptor != nil {
+		if descs, attr, err := b.readFileNativeRDMABatch(ctx, fullPath, offset, size, maxDescs); err == nil && len(descs) > 0 {
+			return descs, attr, nil
+		} else if err != nil && !isDescriptorFallback(err) {
+			return nil, nil, err
+		}
+	}
+	if batch, ok := b.ReadDescriptorBackend.(swvfsdaemon.RDMAReadDescriptorBatchBackend); ok {
+		return batch.ReadFileRDMABatch(ctx, cleanFullPath(fullPath), offset, size, maxDescs)
+	}
+	if b.ReadDescriptorBackend == nil {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma read descriptor backend is not configured"}
+	}
+
+	descs := make([]swvfsproto.RDMADataDesc, 0, maxDescs)
+	var attr *swvfsproto.Attr
+	cur := offset
+	remaining := size
+	for remaining > 0 && uint32(len(descs)) < maxDescs {
+		seg := minUint64(remaining, swvfsproto.RDMAIOMax)
+		desc, nextAttr, err := b.ReadDescriptorBackend.ReadFileRDMA(ctx, cleanFullPath(fullPath), cur, seg)
+		if err != nil {
+			return nil, nil, err
+		}
+		if desc == nil || desc.Length == 0 {
+			break
+		}
+		if uint64(desc.Length) > seg {
+			return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoIO, Msg: "rdma read descriptor exceeds requested segment"}
+		}
+		desc.Reserved[2] = cur
+		descs = append(descs, *desc)
+		if nextAttr != nil {
+			attr = nextAttr
+		}
+		advanced := uint64(desc.Length)
+		if advanced > remaining {
+			advanced = remaining
+		}
+		cur += advanced
+		remaining -= advanced
+	}
+	if len(descs) == 0 {
+		return nil, attr, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma read descriptor batch returned no descriptors"}
+	}
+	return descs, attr, nil
+}
+
 func (b *Backend) ReleaseReadDescriptor(ctx context.Context, leaseID uint64, status int32, bytes uint64) error {
 	if b == nil {
 		return swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma read descriptor backend is not configured"}
@@ -830,6 +888,93 @@ func (b *Backend) readFileNativeRDMA(ctx context.Context, fullPath string, offse
 		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native rdma read descriptor returned no descriptor"}
 	}
 	return desc, attr, nil
+}
+
+func (b *Backend) readFileNativeRDMABatch(ctx context.Context, fullPath string, offset, size uint64, maxDescs uint32) ([]swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
+	if b == nil || b.Store == nil || b.NativeReadDescriptor == nil {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native rdma read descriptor backend is not configured"}
+	}
+	fullPath = cleanFullPath(fullPath)
+	pending := b.pendingSnapshot(fullPath)
+	if pending != nil {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native rdma read descriptor does not support pending writes"}
+	}
+	entry, err := b.Store.LookupEntry(ctx, fullPath)
+	if err != nil {
+		return nil, nil, mapLookupErr(err)
+	}
+	if entry.IsDirectory {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoInval, Msg: "cannot read a directory"}
+	}
+	if len(entry.Content) > 0 {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native rdma read descriptor does not support inline filer content"}
+	}
+	attr := AttrFromEntry(fullPath, entry)
+	if offset >= attr.Size || size == 0 {
+		return nil, attr, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native rdma read descriptor requires a non-empty file range"}
+	}
+	if maxDescs == 0 {
+		maxDescs = 1
+	}
+	readSize := minUint64(size, attr.Size-offset)
+	views, err := visibleChunkViews(entry.GetChunks(), int64(offset), int64(readSize))
+	if err != nil {
+		return nil, nil, err
+	}
+	if len(views) == 0 {
+		return nil, attr, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native rdma read descriptor found no visible chunk"}
+	}
+
+	descs := make([]swvfsproto.RDMADataDesc, 0, maxDescs)
+	for _, view := range views {
+		if uint32(len(descs)) >= maxDescs {
+			break
+		}
+		if view.size == 0 {
+			continue
+		}
+		if len(view.cipherKey) > 0 || view.isGzipped {
+			return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native rdma read descriptor does not support encrypted or compressed chunks"}
+		}
+		volumeID, needleID, cookie, err := ParseFileID(view.fileID)
+		if err != nil {
+			return nil, nil, err
+		}
+		volumeServer, err := b.volumeServerForFileID(ctx, view.fileID)
+		if err != nil {
+			return nil, nil, err
+		}
+		var viewDone uint64
+		for viewDone < uint64(view.size) && uint32(len(descs)) < maxDescs {
+			seg := minUint64(uint64(view.size)-viewDone, swvfsproto.RDMAIOMax)
+			desc, _, err := b.NativeReadDescriptor.ReadNeedleRDMA(ctx, swvfsdaemon.NeedleReadDescriptorRequest{
+				FileID:       view.fileID,
+				VolumeID:     volumeID,
+				NeedleID:     needleID,
+				Cookie:       cookie,
+				VolumeServer: volumeServer,
+				RDMAServer:   volumeServer,
+				Offset:       uint64(view.offsetInChunk) + viewDone,
+				Size:         seg,
+			})
+			if err != nil {
+				return nil, nil, err
+			}
+			if desc == nil || desc.Length == 0 {
+				return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native rdma read descriptor returned no descriptor"}
+			}
+			if uint64(desc.Length) > seg {
+				return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoIO, Msg: "native rdma read descriptor exceeds requested segment"}
+			}
+			desc.Reserved[2] = uint64(view.start) + viewDone
+			descs = append(descs, *desc)
+			viewDone += uint64(desc.Length)
+		}
+	}
+	if len(descs) == 0 {
+		return nil, attr, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native rdma read descriptor batch returned no descriptors"}
+	}
+	return descs, attr, nil
 }
 
 func isDescriptorFallback(err error) bool {

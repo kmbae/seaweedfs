@@ -23,6 +23,8 @@ const (
 	ErrnoNotEmpty int32 = -39
 )
 
+const maxRDMAReadBatchDescs = 16
+
 type ErrnoError struct {
 	Errno int32
 	Msg   string
@@ -42,6 +44,10 @@ type FileBackend interface {
 
 type RDMAReadDescriptorBackend interface {
 	ReadFileRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.RDMADataDesc, *swvfsproto.Attr, error)
+}
+
+type RDMAReadDescriptorBatchBackend interface {
+	ReadFileRDMABatch(ctx context.Context, path string, offset, size uint64, maxDescs uint32) ([]swvfsproto.RDMADataDesc, *swvfsproto.Attr, error)
 }
 
 type RDMAReadDescriptorReleaseBackend interface {
@@ -269,6 +275,63 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 			Tag:  req.Header.Tag,
 			EOF:  swvfsproto.ReplyFRDMAReadDesc,
 			Data: swvfsproto.EncodeRDMADataDesc(*desc),
+		}
+		if attr != nil {
+			reply.Attr = *attr
+		}
+		return reply, nil
+	case swvfsproto.OpRDMAReadPrepareBatch:
+		h.Stats.Inc("handler_read_rdma_prepare_batch_requests")
+		h.Stats.Add("handler_read_rdma_prepare_batch_bytes", req.Header.Size)
+		if !h.shouldUseRDMAReadDescriptor(req.Header.Size) {
+			h.Stats.Inc("handler_read_rdma_prepare_batch_policy_too_small")
+			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma read prepare batch below minimum size"}
+		}
+		maxDescs := req.Header.Mode
+		if maxDescs == 0 {
+			maxDescs = 1
+		}
+		if maxDescs > maxRDMAReadBatchDescs {
+			maxDescs = maxRDMAReadBatchDescs
+		}
+		prepareStart := time.Now()
+		var descs []swvfsproto.RDMADataDesc
+		var attr *swvfsproto.Attr
+		var err error
+		if batchBackend, ok := h.Backend.(RDMAReadDescriptorBatchBackend); ok {
+			descs, attr, err = batchBackend.ReadFileRDMABatch(ctx, req.Path1, req.Header.Offset, req.Header.Size, maxDescs)
+		} else if singleBackend, ok := h.Backend.(RDMAReadDescriptorBackend); ok {
+			var desc *swvfsproto.RDMADataDesc
+			desc, attr, err = singleBackend.ReadFileRDMA(ctx, req.Path1, req.Header.Offset, req.Header.Size)
+			if desc != nil {
+				desc.Reserved[2] = req.Header.Offset
+				descs = []swvfsproto.RDMADataDesc{*desc}
+			}
+		} else {
+			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma read prepare batch is not implemented"}
+		}
+		h.Stats.Observe("handler_read_rdma_prepare_batch", time.Since(prepareStart))
+		if err != nil {
+			h.Stats.Inc("handler_read_rdma_prepare_batch_errors")
+			return nil, err
+		}
+		if len(descs) == 0 {
+			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma read prepare batch returned no descriptors"}
+		}
+		if len(descs) > int(maxDescs) {
+			return nil, ErrnoError{Errno: ErrnoIO, Msg: "rdma read prepare batch returned too many descriptors"}
+		}
+		var descBytes uint64
+		for _, desc := range descs {
+			descBytes += uint64(desc.Length)
+		}
+		h.Stats.Inc("handler_read_rdma_prepare_batch_replies")
+		h.Stats.Add("handler_read_rdma_prepare_batch_descs", uint64(len(descs)))
+		h.Stats.Add("handler_read_rdma_prepare_batch_desc_bytes", descBytes)
+		reply := &swvfsproto.Reply{
+			Tag:  req.Header.Tag,
+			EOF:  swvfsproto.ReplyFRDMAReadDesc,
+			Data: swvfsproto.EncodeRDMADataDescs(descs),
 		}
 		if attr != nil {
 			reply.Attr = *attr
