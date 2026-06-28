@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"sort"
 
 	"github.com/seaweedfs/seaweedfs/weed/filer"
 	"github.com/seaweedfs/seaweedfs/weed/glog"
@@ -114,47 +113,21 @@ func (fh *FileHandle) readFromChunksWithContext(ctx context.Context, buff []byte
 
 // tryRDMARead attempts to read file data using RDMA acceleration
 func (fh *FileHandle) tryRDMARead(ctx context.Context, fileSize int64, buff []byte, offset int64, entry *LockedEntry) (int64, int64, error) {
-	// For now, we'll try to read the chunks directly using RDMA
-	// This is a simplified approach - in a full implementation, we'd need to
-	// handle chunk boundaries, multiple chunks, etc.
-
 	chunks := entry.GetEntry().Chunks
 	if len(chunks) == 0 {
 		return 0, 0, fmt.Errorf("no chunks available for RDMA read")
 	}
 
-	// Find the chunk that contains our offset using binary search
-	var targetChunk *filer_pb.FileChunk
-	var chunkOffset int64
-
-	// Get cached cumulative offsets for efficient binary search
-	cumulativeOffsets := fh.getCumulativeOffsets(chunks)
-
-	// Use binary search to find the chunk containing the offset
-	chunkIndex := sort.Search(len(chunks), func(i int) bool {
-		return offset < cumulativeOffsets[i+1]
-	})
-
-	// Verify the chunk actually contains our offset
-	if chunkIndex < len(chunks) && offset >= cumulativeOffsets[chunkIndex] {
-		targetChunk = chunks[chunkIndex]
-		chunkOffset = offset - cumulativeOffsets[chunkIndex]
+	plan, err := planRDMAChunkRead(chunks, fileSize, len(buff), offset)
+	if err != nil {
+		return 0, 0, err
 	}
-
-	if targetChunk == nil {
-		return 0, 0, fmt.Errorf("no chunk found for offset %d", offset)
-	}
-
-	// Calculate how much to read from this chunk
-	remainingInChunk := int64(targetChunk.Size) - chunkOffset
-	readSize := min(int64(len(buff)), remainingInChunk)
 
 	glog.V(4).Infof("RDMA read attempt: chunk=%s (fileId=%s), chunkOffset=%d, readSize=%d",
-		targetChunk.FileId, targetChunk.FileId, chunkOffset, readSize)
+		plan.fileID, plan.fileID, plan.chunkOffset, plan.readSize)
 
-	// Try RDMA read using file ID directly (more efficient)
-	writer := &fixedBufferWriter{buf: buff[:readSize]}
-	totalRead, isRDMA, err := fh.wfs.rdmaClient.ReadNeedleTo(ctx, targetChunk.FileId, uint64(chunkOffset), uint64(readSize), writer)
+	writer := &fixedBufferWriter{buf: buff[:plan.readSize]}
+	totalRead, isRDMA, err := fh.wfs.rdmaClient.ReadNeedleTo(ctx, plan.fileID, uint64(plan.chunkOffset), uint64(plan.readSize), writer)
 	if err != nil {
 		return 0, 0, fmt.Errorf("RDMA read failed: %w", err)
 	}
@@ -163,7 +136,54 @@ func (fh *FileHandle) tryRDMARead(ctx context.Context, fileSize int64, buff []by
 		return 0, 0, fmt.Errorf("RDMA not available for chunk")
 	}
 
-	return totalRead, targetChunk.ModifiedTsNs, nil
+	return totalRead, plan.chunk.ModifiedTsNs, nil
+}
+
+type rdmaChunkReadPlan struct {
+	chunk       *filer_pb.FileChunk
+	fileID      string
+	chunkOffset int64
+	readSize    int64
+}
+
+func planRDMAChunkRead(chunks []*filer_pb.FileChunk, fileSize int64, bufferSize int, offset int64) (*rdmaChunkReadPlan, error) {
+	if bufferSize <= 0 {
+		return nil, fmt.Errorf("empty read buffer")
+	}
+	if offset < 0 {
+		return nil, fmt.Errorf("negative read offset %d", offset)
+	}
+	if offset >= fileSize {
+		return nil, io.EOF
+	}
+
+	targetChunk, chunkOffset := findChunkContaining(chunks, offset)
+	if targetChunk == nil {
+		return nil, fmt.Errorf("no chunk found for offset %d", offset)
+	}
+
+	fileID := targetChunk.GetFileIdString()
+	if fileID == "" {
+		return nil, fmt.Errorf("chunk at offset %d has no file id", targetChunk.Offset)
+	}
+
+	readStop := offset + int64(bufferSize)
+	if readStop > fileSize {
+		readStop = fileSize
+	}
+
+	remainingInChunk := targetChunk.Offset + int64(targetChunk.Size) - offset
+	readSize := min(readStop-offset, remainingInChunk)
+	if readSize <= 0 {
+		return nil, io.EOF
+	}
+
+	return &rdmaChunkReadPlan{
+		chunk:       targetChunk,
+		fileID:      fileID,
+		chunkOffset: chunkOffset,
+		readSize:    readSize,
+	}, nil
 }
 
 type fixedBufferWriter struct {
