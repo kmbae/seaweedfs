@@ -137,7 +137,27 @@ pub trait VolumeRdmaProvider: std::fmt::Debug + Send + Sync {
         connection_id: u64,
         size: usize,
     ) -> Result<VolumeRdmaRegisteredRead>;
+    async fn validate_registered_read(&self, session_id: u64, size: usize) -> Result<()> {
+        let data = self.read_registered(session_id, size).await?;
+        if data.len() < size {
+            return Err(anyhow!(
+                "registered buffer shorter than requested read: data={} size={}",
+                data.len(),
+                size
+            ));
+        }
+        Ok(())
+    }
     async fn read_registered(&self, session_id: u64, size: usize) -> Result<Vec<u8>>;
+    async fn write_registered_frame(
+        &self,
+        session_id: u64,
+        size: usize,
+        stream: &mut UnixStream,
+    ) -> Result<()> {
+        let data = self.read_registered(session_id, size).await?;
+        write_frame(stream, &data[..size]).await
+    }
     async fn release_read(&self, session_id: u64) -> Result<()>;
 }
 
@@ -276,6 +296,12 @@ impl VolumeNativeEngine {
                 .context("read volume RDMA engine data sideband")?;
         }
         debug!("volume RDMA engine request: {:?}", request);
+        if request.op == "read_registered" {
+            return self
+                .handle_read_registered_stream(request, &mut stream)
+                .await;
+        }
+
         let mut response = if request.op == "register_read_stream" {
             self.process_stream_request(request, &mut stream).await
         } else {
@@ -293,6 +319,41 @@ impl VolumeNativeEngine {
             write_frame(&mut stream, &data)
                 .await
                 .context("write volume RDMA engine response data sideband")?;
+        }
+        Ok(())
+    }
+
+    async fn handle_read_registered_stream(
+        &self,
+        request: EngineRequest,
+        stream: &mut UnixStream,
+    ) -> Result<()> {
+        let response = if request.session_id == 0 {
+            EngineResponse::error("read_registered requires session_id")
+        } else if request.size == 0 {
+            EngineResponse::error("read_registered requires size")
+        } else if request.size > MAX_FRAME_SIZE as u64 {
+            EngineResponse::error(format!("read_registered size too large: {}", request.size))
+        } else {
+            match self
+                .provider
+                .validate_registered_read(request.session_id, request.size as usize)
+                .await
+            {
+                Ok(()) => EngineResponse::ok_data_sideband(),
+                Err(err) => EngineResponse::error(format!("read_registered failed: {err:#}")),
+            }
+        };
+
+        let ok = response.ok;
+        let payload =
+            serde_json::to_vec(&response).context("encode volume RDMA engine response")?;
+        write_frame(stream, &payload).await?;
+        if ok {
+            self.provider
+                .write_registered_frame(request.session_id, request.size as usize, stream)
+                .await
+                .context("write registered RDMA response frame")?;
         }
         Ok(())
     }
@@ -500,6 +561,19 @@ impl EngineResponse {
             session_id: 0,
             data_sideband: true,
             data,
+        }
+    }
+
+    fn ok_data_sideband() -> Self {
+        Self {
+            ok: true,
+            error: None,
+            endpoint: None,
+            desc: None,
+            connection_id: 0,
+            session_id: 0,
+            data_sideband: true,
+            data: Vec::new(),
         }
     }
 
@@ -756,6 +830,50 @@ impl VolumeRdmaProvider for MockVolumeRdmaProvider {
         Ok(lease.data[..size].to_vec())
     }
 
+    async fn validate_registered_read(&self, session_id: u64, size: usize) -> Result<()> {
+        let state = self.state.lock().await;
+        let lease = state
+            .leases
+            .get(&session_id)
+            .ok_or_else(|| anyhow!("unknown registered session_id {session_id}"))?;
+        if size > lease.data.len() {
+            return Err(anyhow!(
+                "registered buffer shorter than requested read: capacity={} size={}",
+                lease.data.len(),
+                size
+            ));
+        }
+        Ok(())
+    }
+
+    async fn write_registered_frame(
+        &self,
+        session_id: u64,
+        size: usize,
+        stream: &mut UnixStream,
+    ) -> Result<()> {
+        let lease = {
+            let mut state = self.state.lock().await;
+            state
+                .leases
+                .remove(&session_id)
+                .ok_or_else(|| anyhow!("unknown registered session_id {session_id}"))?
+        };
+
+        let write_result = if size > lease.data.len() {
+            Err(anyhow!(
+                "registered buffer shorter than requested read: capacity={} size={}",
+                lease.data.len(),
+                size
+            ))
+        } else {
+            write_frame(stream, &lease.data[..size]).await
+        };
+
+        self.state.lock().await.leases.insert(session_id, lease);
+        write_result
+    }
+
     async fn release_read(&self, session_id: u64) -> Result<()> {
         self.state.lock().await.leases.remove(&session_id);
         Ok(())
@@ -894,20 +1012,32 @@ pub async fn read_frame(stream: &mut UnixStream) -> Result<Vec<u8>> {
     Ok(payload)
 }
 
-pub async fn write_frame(stream: &mut UnixStream, payload: &[u8]) -> Result<()> {
+pub async fn write_frame_header(stream: &mut UnixStream, size: usize) -> Result<()> {
+    if size > MAX_FRAME_SIZE {
+        return Err(anyhow!("frame too large: {size}"));
+    }
+    stream
+        .write_all(&(size as u32).to_le_bytes())
+        .await
+        .context("write frame header")?;
+    Ok(())
+}
+
+pub async fn write_frame_payload(stream: &mut UnixStream, payload: &[u8]) -> Result<()> {
     if payload.len() > MAX_FRAME_SIZE {
         return Err(anyhow!("frame too large: {}", payload.len()));
     }
-    stream
-        .write_all(&(payload.len() as u32).to_le_bytes())
-        .await
-        .context("write frame header")?;
     stream
         .write_all(payload)
         .await
         .context("write frame payload")?;
     stream.flush().await.context("flush frame")?;
     Ok(())
+}
+
+pub async fn write_frame(stream: &mut UnixStream, payload: &[u8]) -> Result<()> {
+    write_frame_header(stream, payload.len()).await?;
+    write_frame_payload(stream, payload).await
 }
 
 fn deserialize_go_json_bytes<'de, D>(deserializer: D) -> std::result::Result<Vec<u8>, D::Error>
@@ -1347,6 +1477,67 @@ mod tests {
             provider.lease_data(session_id).await.unwrap(),
             b"streamed-data"
         );
+        server_task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_stream_emits_read_registered_without_vec_payload() {
+        let (engine, provider, _) = mock_engine();
+        let local = engine.process_request(request("local")).await;
+        assert!(local.ok);
+        let connection_id = local.connection_id;
+        let connect = engine
+            .process_request(EngineRequest {
+                connection_id,
+                remote: Some(VolumeRdmaRemoteInfo {
+                    abi_version: ABI_VERSION,
+                    flags: 0,
+                    qpn: 10,
+                    lid: 1,
+                    psn: 2,
+                    port: 1,
+                    gid_index: 0,
+                    sl: 0,
+                    gid: [0; 16],
+                    reserved: [0; 8],
+                }),
+                ..request("connect")
+            })
+            .await;
+        assert!(connect.ok);
+        let registered = engine
+            .process_request(EngineRequest {
+                connection_id,
+                size: 16,
+                ..request("register_write")
+            })
+            .await;
+        assert!(registered.ok);
+        let session_id = registered.session_id;
+        assert_eq!(provider.lease_count().await, 1);
+
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let engine = Arc::new(engine);
+        let server_task = tokio::spawn(async move { engine.handle_stream(server).await });
+        let request = serde_json::json!({
+            "op": "read_registered",
+            "session_id": session_id,
+            "size": 16,
+        });
+        write_frame(
+            &mut client,
+            serde_json::to_string(&request).unwrap().as_bytes(),
+        )
+        .await
+        .unwrap();
+        let response_payload = read_frame(&mut client).await.unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&response_payload).unwrap();
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["data_sideband"], true);
+        assert!(response.get("data").is_none());
+        let data_sideband = read_frame(&mut client).await.unwrap();
+        assert_eq!(data_sideband, vec![0u8; 16]);
+        assert_eq!(provider.lease_count().await, 1);
         server_task.await.unwrap().unwrap();
     }
 

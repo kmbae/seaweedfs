@@ -1,7 +1,7 @@
 use crate::volume_native::{
-    read_frame_header, read_frame_payload_into, VolumeRdmaDataDesc, VolumeRdmaEndpointInfo,
-    VolumeRdmaProvider, VolumeRdmaRegisteredRead, VolumeRdmaRemoteInfo, VolumeRdmaRequester,
-    ABI_VERSION, LINK_ETHERNET, LINK_INFINIBAND,
+    read_frame_header, read_frame_payload_into, write_frame, VolumeRdmaDataDesc,
+    VolumeRdmaEndpointInfo, VolumeRdmaProvider, VolumeRdmaRegisteredRead, VolumeRdmaRemoteInfo,
+    VolumeRdmaRequester, ABI_VERSION, LINK_ETHERNET, LINK_INFINIBAND,
 };
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -236,6 +236,74 @@ impl RealVerbsVolumeRdmaProvider {
         Err(anyhow!("unknown registered RDMA session_id {session_id}"))
     }
 
+    pub fn validate_registered_session(&self, session_id: u64, size: usize) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("verbs provider mutex poisoned"))?;
+        for connection in state.connections.values() {
+            if let Some(lease) = connection.leases.get(&session_id) {
+                lease.validate_len(size)?;
+                return Ok(());
+            }
+        }
+        Err(anyhow!("unknown registered RDMA session_id {session_id}"))
+    }
+
+    pub async fn write_registered_session_frame(
+        &self,
+        session_id: u64,
+        size: usize,
+        stream: &mut UnixStream,
+    ) -> Result<()> {
+        let (connection_id, lease) = self.take_registered_lease(session_id)?;
+        let write_result = match lease.data_slice(size) {
+            Ok(data) => write_frame(stream, data).await,
+            Err(err) => Err(err),
+        };
+        let restore_result = self.restore_registered_lease(connection_id, session_id, lease);
+        match (write_result, restore_result) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(err), Ok(())) => Err(err),
+            (Ok(()), Err(err)) => Err(err),
+            (Err(write_err), Err(restore_err)) => Err(anyhow!(
+                "{write_err:#}; additionally failed to restore registered RDMA lease: {restore_err:#}"
+            )),
+        }
+    }
+
+    fn take_registered_lease(&self, session_id: u64) -> Result<(u64, VerbsReadLease)> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("verbs provider mutex poisoned"))?;
+        for (connection_id, connection) in state.connections.iter_mut() {
+            if let Some(lease) = connection.leases.remove(&session_id) {
+                return Ok((*connection_id, lease));
+            }
+        }
+        Err(anyhow!("unknown registered RDMA session_id {session_id}"))
+    }
+
+    fn restore_registered_lease(
+        &self,
+        connection_id: u64,
+        session_id: u64,
+        lease: VerbsReadLease,
+    ) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("verbs provider mutex poisoned"))?;
+        let connection = state.get_connection_mut(connection_id)?;
+        if connection.leases.insert(session_id, lease).is_some() {
+            return Err(anyhow!(
+                "registered RDMA session_id {session_id} was recreated while streaming"
+            ));
+        }
+        Ok(())
+    }
+
     fn acquire_stream_read_buffer(
         &self,
         connection_id: u64,
@@ -359,6 +427,20 @@ impl VolumeRdmaProvider for RealVerbsVolumeRdmaProvider {
 
     async fn read_registered(&self, session_id: u64, size: usize) -> Result<Vec<u8>> {
         self.read_registered_session(session_id, size)
+    }
+
+    async fn validate_registered_read(&self, session_id: u64, size: usize) -> Result<()> {
+        self.validate_registered_session(session_id, size)
+    }
+
+    async fn write_registered_frame(
+        &self,
+        session_id: u64,
+        size: usize,
+        stream: &mut UnixStream,
+    ) -> Result<()> {
+        self.write_registered_session_frame(session_id, size, stream)
+            .await
     }
 
     async fn release_read(&self, session_id: u64) -> Result<()> {
@@ -1420,6 +1502,17 @@ impl VerbsReadBuffer {
         Ok(self.data[..length].to_vec())
     }
 
+    fn data_slice(&self, length: usize) -> Result<&[u8]> {
+        if length > self.data.len() {
+            return Err(anyhow!(
+                "registered RDMA buffer shorter than requested read: capacity={} length={}",
+                self.data.len(),
+                length
+            ));
+        }
+        Ok(&self.data[..length])
+    }
+
     fn deregister(&mut self, reason: &str) -> Result<()> {
         if self.mr.is_null() {
             return Ok(());
@@ -1569,6 +1662,18 @@ impl VerbsReadLease {
             .as_ref()
             .ok_or_else(|| anyhow!("verbs lease already released"))?
             .read_vec(length)
+    }
+
+    fn validate_len(&self, length: usize) -> Result<()> {
+        let _ = self.data_slice(length)?;
+        Ok(())
+    }
+
+    fn data_slice(&self, length: usize) -> Result<&[u8]> {
+        self.buffer
+            .as_ref()
+            .ok_or_else(|| anyhow!("verbs lease already released"))?
+            .data_slice(length)
     }
 
     fn release(mut self) -> Result<VerbsReadBuffer> {
@@ -2310,15 +2415,15 @@ fn validate_register_write_ready(
     if size > u32::MAX as usize {
         return Err(anyhow!("register_write size too large"));
     }
-	if !connected_remote || !endpoint.qp_connected || endpoint.qp_state != IBV_QPS_RTS as u32 {
-		return Err(anyhow!(
+    if !connected_remote || !endpoint.qp_connected || endpoint.qp_state != IBV_QPS_RTS as u32 {
+        return Err(anyhow!(
 			"register_write requires connected RTS QP: qpn={} qp_connected={} qp_state={} remote_connected={}",
 			endpoint.qp_num,
 			endpoint.qp_connected,
 			endpoint.qp_state,
 			connected_remote
 		));
-	}
+    }
     Ok(())
 }
 
