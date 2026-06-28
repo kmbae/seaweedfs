@@ -456,7 +456,7 @@ func TestBackendWriteRDMAPrefersNativeVolumeDescriptor(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PrepareWriteRDMA: %v", err)
 	}
-	if desc.RemoteAddr != 0xbeef || desc.RKey != 77 || desc.Length != 4096 || desc.Reserved[0] != 55 {
+	if desc.RemoteAddr != 0xbeef || desc.RKey != 77 || desc.Length != 4096 || desc.Reserved[0] != 55 || desc.Reserved[1] != 44 {
 		t.Fatalf("desc = %+v", desc)
 	}
 	attr, err := backend.CommitWriteRDMA(context.Background(), "/native", 0, 4096)

@@ -194,6 +194,9 @@ func (c *NativeVolumeWriteDescriptorClient) PrepareNeedleWriteRDMA(ctx context.C
 		c.Stats.Inc("volume_native_rdma_write_desc_post_errors")
 		return nil, 0, err
 	}
+	if desc != nil && peer.VolumeConnectionID != 0 {
+		desc.Reserved[1] = peer.VolumeConnectionID
+	}
 	return desc, sessionID, nil
 }
 
