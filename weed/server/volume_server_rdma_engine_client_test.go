@@ -1,6 +1,7 @@
 package weed_server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -12,7 +13,7 @@ import (
 
 func TestVolumeRdmaEngineClientEndpointAndRegistrar(t *testing.T) {
 	socketPath := filepath.Join(t.TempDir(), "volume-rdma-engine.sock")
-	requests := make(chan volumeRdmaEngineRequest, 8)
+	requests := make(chan volumeRdmaEngineRequest, 16)
 	listener, err := net.Listen("unix", socketPath)
 	if err != nil {
 		t.Fatalf("listen unix: %v", err)
@@ -122,6 +123,12 @@ func TestVolumeRdmaEngineClientEndpointAndRegistrar(t *testing.T) {
 						Length:     uint32(len(req.Data)),
 					}
 					resp.SessionID = 100
+				case volumeRdmaEngineOpReadRegistered:
+					if req.SessionID != 101 || req.Size != uint64(len("registered-data")) {
+						t.Errorf("unexpected read_registered request: %+v", req)
+					}
+					resp.DataSideband = true
+					responseSideband = []byte("registered-data")
 				case volumeRdmaEngineOpRelease:
 				default:
 					resp.OK = false
@@ -208,6 +215,13 @@ func TestVolumeRdmaEngineClientEndpointAndRegistrar(t *testing.T) {
 	if streamDesc.RemoteAddr != 0xcafe || streamDesc.RKey != 88 || streamDesc.Length != uint32(len("stream-data")) {
 		t.Fatalf("unexpected stream descriptor: %+v", streamDesc)
 	}
+	var registered bytes.Buffer
+	if err := client.ReadRegisteredBufferTo(context.Background(), 101, uint64(len("registered-data")), &registered); err != nil {
+		t.Fatalf("ReadRegisteredBufferTo: %v", err)
+	}
+	if registered.String() != "registered-data" {
+		t.Fatalf("registered data = %q", registered.String())
+	}
 	if err := buffer.Release(context.Background()); err != nil {
 		t.Fatalf("Release: %v", err)
 	}
@@ -220,6 +234,7 @@ func TestVolumeRdmaEngineClientEndpointAndRegistrar(t *testing.T) {
 		volumeRdmaEngineOpReadRemote,
 		volumeRdmaEngineOpRegisterRead,
 		volumeRdmaEngineOpRegisterReadStream,
+		volumeRdmaEngineOpReadRegistered,
 		volumeRdmaEngineOpRelease,
 	}
 	for _, want := range ops {

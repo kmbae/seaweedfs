@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"syscall"
+	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
@@ -379,6 +381,51 @@ func (v *Volume) WriteNeedleBlob(needleId NeedleId, needleBlob []byte, size Size
 	// add to needle map
 	if err = v.nm.Put(needleId, ToOffset(int64(offset)), size); err != nil {
 		glog.V(4).Infof("failed to put in needle map %d: %v", needleId, err)
+	}
+
+	return err
+}
+
+func (v *Volume) WriteNeedleDataStream(needleId NeedleId, cookie Cookie, dataSize uint64, writeData func(io.Writer) error) error {
+	v.dataFileAccessLock.Lock()
+	defer v.dataFileAccessLock.Unlock()
+
+	if MaxPossibleVolumeSize < v.nm.ContentSize()+dataSize {
+		return fmt.Errorf("volume size limit %d exceeded! current size is %d", MaxPossibleVolumeSize, v.nm.ContentSize())
+	}
+
+	nv, ok := v.nm.Get(needleId)
+	if ok && !nv.Size.IsDeleted() {
+		existingNeedle, _, _, existingNeedleReadErr := needle.ReadNeedleHeader(v.DataBackend, v.Version(), nv.Offset.ToActualOffset())
+		if existingNeedleReadErr != nil {
+			return fmt.Errorf("reading existing needle: %w", existingNeedleReadErr)
+		}
+		if existingNeedle.Cookie != cookie {
+			return fmt.Errorf("mismatching cookie %x", cookie)
+		}
+	}
+
+	appendAtNs := needle.GetAppendAtNs(v.lastAppendAtNs)
+	offset, size, err := needle.WriteNeedleDataStream(
+		v.DataBackend,
+		needleId,
+		cookie,
+		dataSize,
+		uint64(time.Now().Unix()),
+		appendAtNs,
+		v.Version(),
+		writeData,
+	)
+	v.checkReadWriteError(err)
+	if err != nil {
+		return err
+	}
+	v.lastAppendAtNs = appendAtNs
+
+	if !ok || uint64(nv.Offset.ToActualOffset()) < offset {
+		if err = v.nm.Put(needleId, ToOffset(int64(offset)), size); err != nil {
+			glog.V(4).Infof("failed to put in needle map %d: %v", needleId, err)
+		}
 	}
 
 	return err

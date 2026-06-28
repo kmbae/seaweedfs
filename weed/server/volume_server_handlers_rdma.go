@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"syscall"
 	"time"
@@ -444,6 +445,10 @@ type volumeRdmaWriteTargetEndpoint interface {
 	ReleaseSession(context.Context, uint64) error
 }
 
+type volumeRdmaWriteStreamTargetEndpoint interface {
+	ReadRegisteredBufferTo(context.Context, uint64, uint64, io.Writer) error
+}
+
 func (vs *VolumeServer) rdmaWriteTargetEndpoint() (volumeRdmaWriteTargetEndpoint, bool) {
 	if vs == nil || vs.rdmaEndpoint == nil {
 		return nil, false
@@ -453,6 +458,21 @@ func (vs *VolumeServer) rdmaWriteTargetEndpoint() (volumeRdmaWriteTargetEndpoint
 }
 
 func (vs *VolumeServer) commitVolumeRdmaWriteRequest(ctx context.Context, reader volumeRdmaWriteTargetEndpoint, req VolumeRdmaWriteCommitRequest) (string, error) {
+	if streamer, ok := reader.(volumeRdmaWriteStreamTargetEndpoint); ok {
+		defer func() {
+			_ = reader.ReleaseSession(context.Background(), req.SessionID)
+		}()
+		return vs.writeNeedleDataFromNativeRdmaStream(ctx, VolumeRdmaWriteRequest{
+			FileID:   req.FileID,
+			VolumeID: req.VolumeID,
+			NeedleID: req.NeedleID,
+			Cookie:   req.Cookie,
+			Size:     req.Size,
+		}, func(w io.Writer) error {
+			return streamer.ReadRegisteredBufferTo(ctx, req.SessionID, req.Size, w)
+		})
+	}
+
 	data, err := reader.ReadRegisteredBuffer(ctx, req.SessionID, req.Size)
 	if err != nil {
 		_ = reader.ReleaseSession(ctx, req.SessionID)
@@ -468,6 +488,38 @@ func (vs *VolumeServer) commitVolumeRdmaWriteRequest(ctx context.Context, reader
 		Cookie:   req.Cookie,
 		Size:     req.Size,
 	}, data)
+}
+
+func (vs *VolumeServer) writeNeedleDataFromNativeRdmaStream(ctx context.Context, req VolumeRdmaWriteRequest, writeData func(io.Writer) error) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", err
+	}
+	if vs == nil || vs.store == nil {
+		return "", fmt.Errorf("volume store is not configured")
+	}
+	if writeData == nil {
+		return "", fmt.Errorf("native RDMA write stream is not configured")
+	}
+	if err := vs.CheckMaintenanceMode(); err != nil {
+		return "", err
+	}
+	v := vs.store.GetVolume(needle.VolumeId(req.VolumeID))
+	if v == nil {
+		return "", fmt.Errorf("not found volume id %d", req.VolumeID)
+	}
+
+	if err := v.WriteNeedleDataStream(types.NeedleId(req.NeedleID), types.Cookie(req.Cookie), req.Size, func(w io.Writer) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		return writeData(w)
+	}); err != nil {
+		return "", fmt.Errorf("write streamed needle %d size %d: %w", req.NeedleID, req.Size, err)
+	}
+	if req.FileID != "" {
+		return req.FileID, nil
+	}
+	return needle.NewFileId(needle.VolumeId(req.VolumeID), req.NeedleID, req.Cookie).String(), nil
 }
 
 func (vs *VolumeServer) writeNeedleDataFromNativeRdma(ctx context.Context, req VolumeRdmaWriteRequest, data []byte) (string, error) {

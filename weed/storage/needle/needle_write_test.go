@@ -2,6 +2,7 @@ package needle
 
 import (
 	"bytes"
+	"io"
 	"os"
 	"testing"
 	"time"
@@ -93,6 +94,44 @@ func TestEncodeNeedleBlobRoundTrip(t *testing.T) {
 	}
 	if !bytes.Equal(decoded.Data, data) {
 		t.Fatalf("decoded data = %q, want %q", decoded.Data, data)
+	}
+}
+
+func TestWriteNeedleDataStreamRoundTrip(t *testing.T) {
+	payload := []byte("rdma registered buffer payload")
+	for _, version := range []Version{Version1, Version2, Version3} {
+		t.Run(versionString(version), func(t *testing.T) {
+			buf := &bytes.Buffer{}
+			writer := &mockBackendWriter{buf: buf}
+
+			_, size, err := WriteNeedleDataStream(writer, 123, 456, uint64(len(payload)), 0x12345, 0x987654, version, func(w io.Writer) error {
+				if _, err := w.Write(payload[:5]); err != nil {
+					return err
+				}
+				_, err := w.Write(payload[5:])
+				return err
+			})
+			if err != nil {
+				t.Fatalf("WriteNeedleDataStream: %v", err)
+			}
+
+			decoded := new(Needle)
+			if err := decoded.ReadBytes(buf.Bytes(), 0, size, version); err != nil {
+				t.Fatalf("ReadBytes: %v", err)
+			}
+			if decoded.Id != 123 || decoded.Cookie != 456 {
+				t.Fatalf("decoded id/cookie = %d/%d", decoded.Id, decoded.Cookie)
+			}
+			if !bytes.Equal(decoded.Data, payload) {
+				t.Fatalf("decoded data = %q, want %q", decoded.Data, payload)
+			}
+			if version != Version1 && decoded.LastModified != 0x12345 {
+				t.Fatalf("decoded last modified = %#x", decoded.LastModified)
+			}
+			if version == Version3 && decoded.AppendAtNs != 0x987654 {
+				t.Fatalf("decoded append timestamp = %#x", decoded.AppendAtNs)
+			}
+		})
 	}
 }
 

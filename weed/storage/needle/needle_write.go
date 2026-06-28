@@ -3,6 +3,8 @@ package needle
 import (
 	"bytes"
 	"fmt"
+	"io"
+	"math"
 
 	"github.com/seaweedfs/seaweedfs/weed/glog"
 	"github.com/seaweedfs/seaweedfs/weed/storage/backend"
@@ -93,4 +95,128 @@ func WriteNeedleBlob(w backend.BackendStorageFile, dataSlice []byte, size Size, 
 
 	return
 
+}
+
+func WriteNeedleDataStream(w backend.BackendStorageFile, needleId NeedleId, cookie Cookie, dataSize uint64, lastModified uint64, appendAtNs uint64, version Version, writeData func(io.Writer) error) (offset uint64, size Size, err error) {
+	if dataSize == 0 {
+		return 0, 0, fmt.Errorf("empty needle data stream")
+	}
+	if dataSize > math.MaxUint32 {
+		return 0, 0, fmt.Errorf("needle data stream too large: %d", dataSize)
+	}
+	if dataSize > uint64(math.MaxInt32) {
+		return 0, 0, fmt.Errorf("needle data stream exceeds index size limit: %d", dataSize)
+	}
+	if writeData == nil {
+		return 0, 0, fmt.Errorf("nil needle data stream writer")
+	}
+	if !IsSupportedVersion(version) {
+		return 0, 0, fmt.Errorf("unsupported version: %d", version)
+	}
+
+	end, _, e := w.GetStat()
+	if e != nil {
+		return 0, 0, fmt.Errorf("Cannot Read Current Volume Position: %w", e)
+	}
+	defer func() {
+		if err != nil {
+			if te := w.Truncate(end); te != nil {
+				glog.V(0).Infof("Failed to truncate %s back to %d with error: %v", w.Name(), end, te)
+			}
+		}
+	}()
+
+	offset = uint64(end)
+	var needleSize Size
+	if version == Version1 {
+		needleSize = Size(dataSize)
+	} else {
+		needleSize = Size(DataSizeSize + dataSize + 1 + LastModifiedBytesLength)
+	}
+
+	header := make([]byte, NeedleHeaderSize+TimestampSize)
+	CookieToBytes(header[0:CookieSize], cookie)
+	NeedleIdToBytes(header[CookieSize:CookieSize+NeedleIdSize], needleId)
+	SizeToBytes(header[CookieSize+NeedleIdSize:CookieSize+NeedleIdSize+SizeSize], needleSize)
+
+	pos := int64(offset)
+	if _, err = w.WriteAt(header[:NeedleHeaderSize], pos); err != nil {
+		return 0, 0, fmt.Errorf("write needle stream header: %w", err)
+	}
+	pos += NeedleHeaderSize
+
+	if version != Version1 {
+		util.Uint32toBytes(header[:DataSizeSize], uint32(dataSize))
+		if _, err = w.WriteAt(header[:DataSizeSize], pos); err != nil {
+			return 0, 0, fmt.Errorf("write needle stream data size: %w", err)
+		}
+		pos += DataSizeSize
+	}
+
+	payload := &needleStreamPayloadWriter{
+		file:      w,
+		offset:    pos,
+		remaining: dataSize,
+	}
+	if err = writeData(payload); err != nil {
+		return 0, 0, fmt.Errorf("write needle stream payload: %w", err)
+	}
+	if payload.remaining != 0 {
+		return 0, 0, fmt.Errorf("short needle stream payload: wrote %d of %d bytes", payload.written, dataSize)
+	}
+	pos += int64(dataSize)
+
+	if version != Version1 {
+		util.Uint8toBytes(header[:1], FlagHasLastModifiedDate)
+		if _, err = w.WriteAt(header[:1], pos); err != nil {
+			return 0, 0, fmt.Errorf("write needle stream flags: %w", err)
+		}
+		pos++
+		util.Uint64toBytes(header[:8], lastModified)
+		if _, err = w.WriteAt(header[8-LastModifiedBytesLength:8], pos); err != nil {
+			return 0, 0, fmt.Errorf("write needle stream last modified: %w", err)
+		}
+		pos += LastModifiedBytesLength
+	}
+
+	padding := PaddingLength(needleSize, version)
+	util.Uint32toBytes(header[:NeedleChecksumSize], uint32(payload.crc))
+	tailLength := NeedleChecksumSize + int(padding)
+	if version == Version3 {
+		util.Uint64toBytes(header[NeedleChecksumSize:NeedleChecksumSize+TimestampSize], appendAtNs)
+		tailLength += TimestampSize
+	}
+	if _, err = w.WriteAt(header[:tailLength], pos); err != nil {
+		return 0, 0, fmt.Errorf("write needle stream tail: %w", err)
+	}
+
+	return offset, needleSize, nil
+}
+
+type needleStreamPayloadWriter struct {
+	file      backend.BackendStorageFile
+	offset    int64
+	remaining uint64
+	written   uint64
+	crc       CRC
+}
+
+func (w *needleStreamPayloadWriter) Write(payload []byte) (int, error) {
+	if uint64(len(payload)) > w.remaining {
+		return 0, fmt.Errorf("needle stream payload exceeds declared size: write=%d remaining=%d", len(payload), w.remaining)
+	}
+	n, err := w.file.WriteAt(payload, w.offset)
+	if n > 0 {
+		w.crc = w.crc.Update(payload[:n])
+		w.offset += int64(n)
+		w.written += uint64(n)
+		w.remaining -= uint64(n)
+	}
+	if err != nil {
+		return n, err
+	}
+	if n != len(payload) {
+		return n, io.ErrShortWrite
+	}
+	return n, nil
 }

@@ -293,6 +293,33 @@ func (c *VolumeRdmaEngineClient) ReadRegisteredBuffer(ctx context.Context, sessi
 	return resp.Data[:size], nil
 }
 
+func (c *VolumeRdmaEngineClient) ReadRegisteredBufferTo(ctx context.Context, sessionID uint64, size uint64, dst io.Writer) error {
+	if sessionID == 0 {
+		return fmt.Errorf("native RDMA read_registered requires session_id")
+	}
+	if size == 0 {
+		return fmt.Errorf("native RDMA read_registered requires size")
+	}
+	if size > volumeRdmaEngineMaxFrameSize {
+		return fmt.Errorf("native RDMA read_registered frame too large: %d bytes", size)
+	}
+	if dst == nil {
+		return fmt.Errorf("native RDMA read_registered requires destination writer")
+	}
+	written, err := c.roundTripSidebandToWriter(ctx, volumeRdmaEngineRequest{
+		Op:        volumeRdmaEngineOpReadRegistered,
+		SessionID: sessionID,
+		Size:      size,
+	}, dst)
+	if err != nil {
+		return err
+	}
+	if written != size {
+		return fmt.Errorf("%w: read_registered streamed %d bytes for %d byte descriptor", ErrVolumeRdmaEngineUnavailable, written, size)
+	}
+	return nil
+}
+
 func (c *VolumeRdmaEngineClient) ReleaseSession(ctx context.Context, sessionID uint64) error {
 	if sessionID == 0 {
 		return nil
@@ -428,6 +455,67 @@ func (c *VolumeRdmaEngineClient) roundTripWrite(ctx context.Context, req volumeR
 	return &resp, nil
 }
 
+func (c *VolumeRdmaEngineClient) roundTripSidebandToWriter(ctx context.Context, req volumeRdmaEngineRequest, dst io.Writer) (uint64, error) {
+	if c == nil || strings.TrimSpace(c.SocketPath) == "" {
+		return 0, ErrVolumeRdmaReadNotConfigured
+	}
+	timeout := c.Timeout
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, timeout)
+		defer cancel()
+	}
+
+	payload, err := json.Marshal(req)
+	if err != nil {
+		return 0, err
+	}
+	if len(payload) > volumeRdmaEngineMaxFrameSize {
+		return 0, fmt.Errorf("native RDMA engine request too large: %d bytes", len(payload))
+	}
+
+	var dialer net.Dialer
+	conn, err := dialer.DialContext(ctx, "unix", c.SocketPath)
+	if err != nil {
+		return 0, fmt.Errorf("%w: dial %s: %v", ErrVolumeRdmaEngineUnavailable, c.SocketPath, err)
+	}
+	defer conn.Close()
+	if deadline, ok := ctx.Deadline(); ok {
+		_ = conn.SetDeadline(deadline)
+	}
+	if err := writeVolumeRdmaEngineFrame(conn, payload); err != nil {
+		return 0, fmt.Errorf("%w: write request: %v", ErrVolumeRdmaEngineUnavailable, err)
+	}
+	responsePayload, err := readVolumeRdmaEngineFrame(conn)
+	if err != nil {
+		return 0, fmt.Errorf("%w: read response: %v", ErrVolumeRdmaEngineUnavailable, err)
+	}
+	var resp volumeRdmaEngineResponse
+	if err := json.Unmarshal(responsePayload, &resp); err != nil {
+		return 0, fmt.Errorf("%w: decode response: %v", ErrVolumeRdmaEngineUnavailable, err)
+	}
+	if !resp.OK {
+		if resp.Error == "" {
+			resp.Error = "native RDMA engine returned failure"
+		}
+		return 0, fmt.Errorf("%w: %s", ErrVolumeRdmaEngineUnavailable, resp.Error)
+	}
+	if !resp.DataSideband {
+		return 0, fmt.Errorf("%w: response did not include a data sideband frame", ErrVolumeRdmaEngineUnavailable)
+	}
+	if len(resp.Data) != 0 {
+		return 0, fmt.Errorf("%w: response must not include JSON data with data_sideband", ErrVolumeRdmaEngineUnavailable)
+	}
+	written, err := readVolumeRdmaEngineFrameTo(conn, dst)
+	if err != nil {
+		return written, fmt.Errorf("%w: read response sideband: %v", ErrVolumeRdmaEngineUnavailable, err)
+	}
+	return written, nil
+}
+
 type volumeRdmaEngineExactFrameWriter struct {
 	w         io.Writer
 	remaining uint64
@@ -490,4 +578,17 @@ func readVolumeRdmaEngineFrame(r io.Reader) ([]byte, error) {
 		return nil, err
 	}
 	return buf.Bytes(), nil
+}
+
+func readVolumeRdmaEngineFrameTo(r io.Reader, w io.Writer) (uint64, error) {
+	var header [4]byte
+	if _, err := io.ReadFull(r, header[:]); err != nil {
+		return 0, err
+	}
+	size := binary.LittleEndian.Uint32(header[:])
+	if size > volumeRdmaEngineMaxFrameSize {
+		return 0, fmt.Errorf("frame too large: %d", size)
+	}
+	n, err := io.CopyN(w, r, int64(size))
+	return uint64(n), err
 }
