@@ -193,6 +193,11 @@ func (vs *VolumeServer) LoadNewVolumes() {
 
 func (vs *VolumeServer) Shutdown() {
 	glog.V(0).Infoln("Shutting down volume server...")
+	if closer, ok := vs.rdmaEndpoint.(interface{ Close() error }); ok {
+		if err := closer.Close(); err != nil {
+			glog.Warningf("close native RDMA transport: %v", err)
+		}
+	}
 	vs.store.Close()
 	glog.V(0).Infoln("Shut down successfully!")
 }
