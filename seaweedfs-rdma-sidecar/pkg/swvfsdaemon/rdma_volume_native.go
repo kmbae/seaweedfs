@@ -16,12 +16,15 @@ import (
 )
 
 const (
-	VolumeRDMAStatusPath      = "/rdma/native/status"
-	VolumeRDMALocalPath       = "/rdma/native/local"
-	VolumeRDMAConnectPath     = "/rdma/native/connect"
-	VolumeRDMAReadDescPath    = "/rdma/native/read-desc"
-	VolumeRDMAReleaseDescPath = "/rdma/native/release-desc"
-	nativeReadLeaseBit        = uint64(1) << 63
+	VolumeRDMAStatusPath           = "/rdma/native/status"
+	VolumeRDMALocalPath            = "/rdma/native/local"
+	VolumeRDMAConnectPath          = "/rdma/native/connect"
+	VolumeRDMAReadDescPath         = "/rdma/native/read-desc"
+	VolumeRDMAReleaseDescPath      = "/rdma/native/release-desc"
+	VolumeRDMARequesterLocalPath   = "/rdma/native/requester-local"
+	VolumeRDMARequesterConnectPath = "/rdma/native/requester-connect"
+	VolumeRDMAWritePath            = "/rdma/native/write"
+	nativeReadLeaseBit             = uint64(1) << 63
 )
 
 type NeedleReadDescriptorRequest struct {
@@ -60,6 +63,23 @@ type VolumeRDMAReleaseDescRequest struct {
 	SessionID uint64 `json:"session_id"`
 }
 
+type VolumeRDMAWriteRequest struct {
+	ConnectionID uint64                  `json:"connection_id,omitempty"`
+	FileID       string                  `json:"file_id"`
+	VolumeID     uint32                  `json:"volume_id"`
+	NeedleID     uint64                  `json:"needle_id"`
+	Cookie       uint32                  `json:"cookie"`
+	Size         uint64                  `json:"size"`
+	Desc         swvfsproto.RDMADataDesc `json:"desc"`
+	TimeoutMs    uint64                  `json:"timeout_ms,omitempty"`
+}
+
+type VolumeRDMAWriteResponse struct {
+	FileID string `json:"file_id"`
+	Size   uint64 `json:"size"`
+	Source string `json:"source"`
+}
+
 type VolumeRDMAStatusResponse struct {
 	ReadExporterConfigured bool   `json:"read_exporter_configured"`
 	EndpointConfigured     bool   `json:"endpoint_configured"`
@@ -69,6 +89,9 @@ type VolumeRDMAStatusResponse struct {
 	ConnectPath            string `json:"connect_path"`
 	ReadDescPath           string `json:"read_desc_path"`
 	ReleaseDescPath        string `json:"release_desc_path"`
+	RequesterLocalPath     string `json:"requester_local_path"`
+	RequesterConnectPath   string `json:"requester_connect_path"`
+	WritePath              string `json:"write_path"`
 }
 
 type VolumeNativeRDMAReadDescriptorClient struct {
@@ -306,12 +329,81 @@ func FetchVolumeNativeEndpoint(ctx context.Context, client *http.Client, rawURL 
 	return endpoint, nil
 }
 
+func FetchVolumeNativeRequesterEndpoint(ctx context.Context, client *http.Client, rawURL string, connectionID uint64) (RDMALocalEndpoint, error) {
+	var endpoint RDMALocalEndpoint
+	reqURL, err := normalizeVolumeNativeURL(rawURL, VolumeRDMARequesterLocalPath)
+	if err != nil {
+		return endpoint, err
+	}
+	if connectionID != 0 {
+		u, err := url.Parse(reqURL)
+		if err != nil {
+			return endpoint, err
+		}
+		q := u.Query()
+		q.Set("connection_id", fmt.Sprintf("%d", connectionID))
+		u.RawQuery = q.Encode()
+		reqURL = u.String()
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, reqURL, nil)
+	if err != nil {
+		return endpoint, err
+	}
+	resp, err := httpClient(client).Do(req)
+	if err != nil {
+		return endpoint, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return endpoint, volumeNativeHTTPError(reqURL, resp.StatusCode, resp.Status)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&endpoint); err != nil {
+		return endpoint, err
+	}
+	return endpoint, nil
+}
+
 func PostVolumeNativeConnect(ctx context.Context, client *http.Client, rawURL string, local RDMALocalEndpoint, serviceLevel uint32) error {
 	return PostVolumeNativeConnectFor(ctx, client, rawURL, 0, local, serviceLevel)
 }
 
 func PostVolumeNativeConnectFor(ctx context.Context, client *http.Client, rawURL string, connectionID uint64, local RDMALocalEndpoint, serviceLevel uint32) error {
 	reqURL, err := normalizeVolumeNativeURL(rawURL, VolumeRDMAConnectPath)
+	if err != nil {
+		return err
+	}
+	u, err := url.Parse(reqURL)
+	if err != nil {
+		return err
+	}
+	q := u.Query()
+	q.Set("sl", fmt.Sprintf("%d", serviceLevel))
+	if connectionID != 0 {
+		q.Set("connection_id", fmt.Sprintf("%d", connectionID))
+	}
+	u.RawQuery = q.Encode()
+	body, err := json.Marshal(local)
+	if err != nil {
+		return err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient(client).Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return volumeNativeHTTPError(u.String(), resp.StatusCode, resp.Status)
+	}
+	return nil
+}
+
+func PostVolumeNativeRequesterConnectFor(ctx context.Context, client *http.Client, rawURL string, connectionID uint64, local RDMALocalEndpoint, serviceLevel uint32) error {
+	reqURL, err := normalizeVolumeNativeURL(rawURL, VolumeRDMARequesterConnectPath)
 	if err != nil {
 		return err
 	}
@@ -372,6 +464,35 @@ func PostVolumeNativeReadDesc(ctx context.Context, client *http.Client, rawURL s
 		return nil, nil, 0, err
 	}
 	return &out.Desc, out.Attr, out.SessionID, nil
+}
+
+func PostVolumeNativeWrite(ctx context.Context, client *http.Client, rawURL string, reqBody VolumeRDMAWriteRequest) (VolumeRDMAWriteResponse, error) {
+	var out VolumeRDMAWriteResponse
+	reqURL, err := normalizeVolumeNativeURL(rawURL, VolumeRDMAWritePath)
+	if err != nil {
+		return out, err
+	}
+	body, err := json.Marshal(reqBody)
+	if err != nil {
+		return out, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, reqURL, bytes.NewReader(body))
+	if err != nil {
+		return out, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient(client).Do(req)
+	if err != nil {
+		return out, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return out, volumeNativeHTTPError(reqURL, resp.StatusCode, resp.Status)
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return out, err
+	}
+	return out, nil
 }
 
 func PostVolumeNativeReleaseDesc(ctx context.Context, client *http.Client, rawURL string, sessionID uint64) error {

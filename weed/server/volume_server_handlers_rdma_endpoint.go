@@ -8,14 +8,18 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 )
 
 const (
-	VolumeRdmaNativeStatusPath      = "/rdma/native/status"
-	VolumeRdmaNativeLocalPath       = "/rdma/native/local"
-	VolumeRdmaNativeConnectPath     = "/rdma/native/connect"
-	VolumeRdmaNativeReadDescPath    = "/rdma/native/read-desc"
-	VolumeRdmaNativeReleaseDescPath = "/rdma/native/release-desc"
+	VolumeRdmaNativeStatusPath           = "/rdma/native/status"
+	VolumeRdmaNativeLocalPath            = "/rdma/native/local"
+	VolumeRdmaNativeConnectPath          = "/rdma/native/connect"
+	VolumeRdmaNativeReadDescPath         = "/rdma/native/read-desc"
+	VolumeRdmaNativeReleaseDescPath      = "/rdma/native/release-desc"
+	VolumeRdmaNativeRequesterLocalPath   = "/rdma/native/requester-local"
+	VolumeRdmaNativeRequesterConnectPath = "/rdma/native/requester-connect"
+	VolumeRdmaNativeWritePath            = "/rdma/native/write"
 
 	VolumeRdmaABIVersion         uint32 = 1
 	VolumeRdmaLinkUnknown        uint32 = 0
@@ -33,6 +37,14 @@ type VolumeRdmaEndpoint interface {
 type VolumeRdmaConnectionEndpoint interface {
 	LocalEndpointFor(context.Context, uint64) (VolumeRdmaEndpointInfo, uint64, error)
 	ConnectEndpointFor(context.Context, uint64, VolumeRdmaRemoteInfo) error
+}
+
+type VolumeRdmaRequesterEndpoint interface {
+	RequesterLocalEndpoint(context.Context) (VolumeRdmaEndpointInfo, error)
+	RequesterLocalEndpointFor(context.Context, uint64) (VolumeRdmaEndpointInfo, uint64, error)
+	RequesterConnectEndpoint(context.Context, VolumeRdmaRemoteInfo) error
+	RequesterConnectEndpointFor(context.Context, uint64, VolumeRdmaRemoteInfo) error
+	ReadRemoteFor(context.Context, uint64, VolumeRdmaDataDesc, time.Duration) ([]byte, error)
 }
 
 type VolumeRdmaEndpointInfo struct {
@@ -79,6 +91,9 @@ type volumeRdmaNativeStatusResponse struct {
 	ConnectPath            string `json:"connect_path"`
 	ReadDescPath           string `json:"read_desc_path"`
 	ReleaseDescPath        string `json:"release_desc_path"`
+	RequesterLocalPath     string `json:"requester_local_path"`
+	RequesterConnectPath   string `json:"requester_connect_path"`
+	WritePath              string `json:"write_path"`
 }
 
 func (e VolumeRdmaEndpointInfo) ReadyForConnect() bool {
@@ -138,6 +153,9 @@ func (vs *VolumeServer) volumeRdmaStatusHandler(w http.ResponseWriter, r *http.R
 		ConnectPath:            VolumeRdmaNativeConnectPath,
 		ReadDescPath:           VolumeRdmaNativeReadDescPath,
 		ReleaseDescPath:        VolumeRdmaNativeReleaseDescPath,
+		RequesterLocalPath:     VolumeRdmaNativeRequesterLocalPath,
+		RequesterConnectPath:   VolumeRdmaNativeRequesterConnectPath,
+		WritePath:              VolumeRdmaNativeWritePath,
 	})
 }
 
@@ -214,6 +232,81 @@ func (vs *VolumeServer) volumeRdmaConnectHandler(w http.ResponseWriter, r *http.
 		return
 	}
 	writeJsonQuiet(w, r, http.StatusOK, map[string]bool{"connected": true})
+}
+
+func (vs *VolumeServer) volumeRdmaRequesterLocalHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	requester, ok := vs.rdmaRequesterEndpoint()
+	if !ok {
+		http.Error(w, "native RDMA requester endpoint is not configured", http.StatusNotImplemented)
+		return
+	}
+	connectionID, err := parseVolumeRdmaConnectionID(r)
+	if err != nil {
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	local, connectionID, err := requester.RequesterLocalEndpointFor(r.Context(), connectionID)
+	if connectionID != 0 {
+		local.ConnectionID = connectionID
+	}
+	if err != nil {
+		writeJsonError(w, r, http.StatusServiceUnavailable, err)
+		return
+	}
+	if !local.ReadyForConnect() {
+		writeJsonError(w, r, http.StatusServiceUnavailable, fmt.Errorf("native RDMA requester endpoint is not ready"))
+		return
+	}
+	writeJsonQuiet(w, r, http.StatusOK, local)
+}
+
+func (vs *VolumeServer) volumeRdmaRequesterConnectHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	requester, ok := vs.rdmaRequesterEndpoint()
+	if !ok {
+		http.Error(w, "native RDMA requester endpoint is not configured", http.StatusNotImplemented)
+		return
+	}
+	var peer VolumeRdmaEndpointInfo
+	if err := json.NewDecoder(r.Body).Decode(&peer); err != nil {
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	serviceLevel, err := parseVolumeRdmaServiceLevel(r)
+	if err != nil {
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	remote, err := peer.RemoteInfo(serviceLevel)
+	if err != nil {
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	connectionID, err := parseVolumeRdmaConnectionID(r)
+	if err != nil {
+		writeJsonError(w, r, http.StatusBadRequest, err)
+		return
+	}
+	if err := requester.RequesterConnectEndpointFor(r.Context(), connectionID, remote); err != nil {
+		writeJsonError(w, r, http.StatusServiceUnavailable, err)
+		return
+	}
+	writeJsonQuiet(w, r, http.StatusOK, map[string]bool{"connected": true})
+}
+
+func (vs *VolumeServer) rdmaRequesterEndpoint() (VolumeRdmaRequesterEndpoint, bool) {
+	if vs == nil || vs.rdmaEndpoint == nil {
+		return nil, false
+	}
+	requester, ok := vs.rdmaEndpoint.(VolumeRdmaRequesterEndpoint)
+	return requester, ok
 }
 
 func parseVolumeRdmaConnectionID(r *http.Request) (uint64, error) {

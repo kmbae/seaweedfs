@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 type fakeVolumeRdmaEndpoint struct {
@@ -16,6 +17,13 @@ type fakeVolumeRdmaEndpoint struct {
 	connectErr  error
 	localErr    error
 	localCalled bool
+
+	requesterLocal     VolumeRdmaEndpointInfo
+	requesterRemote    VolumeRdmaRemoteInfo
+	requesterConnected bool
+	requesterLocalID   uint64
+	requesterConnectID uint64
+	requesterReadData  []byte
 }
 
 func (e *fakeVolumeRdmaEndpoint) LocalEndpoint(ctx context.Context) (VolumeRdmaEndpointInfo, error) {
@@ -30,6 +38,35 @@ func (e *fakeVolumeRdmaEndpoint) ConnectEndpoint(ctx context.Context, remote Vol
 	e.remote = remote
 	e.connected = true
 	return e.connectErr
+}
+
+func (e *fakeVolumeRdmaEndpoint) RequesterLocalEndpoint(ctx context.Context) (VolumeRdmaEndpointInfo, error) {
+	local, _, err := e.RequesterLocalEndpointFor(ctx, 0)
+	return local, err
+}
+
+func (e *fakeVolumeRdmaEndpoint) RequesterLocalEndpointFor(ctx context.Context, connectionID uint64) (VolumeRdmaEndpointInfo, uint64, error) {
+	if e.requesterLocalID == 0 {
+		e.requesterLocalID = 77
+	}
+	local := e.requesterLocal
+	local.ConnectionID = e.requesterLocalID
+	return local, e.requesterLocalID, nil
+}
+
+func (e *fakeVolumeRdmaEndpoint) RequesterConnectEndpoint(ctx context.Context, remote VolumeRdmaRemoteInfo) error {
+	return e.RequesterConnectEndpointFor(ctx, 0, remote)
+}
+
+func (e *fakeVolumeRdmaEndpoint) RequesterConnectEndpointFor(ctx context.Context, connectionID uint64, remote VolumeRdmaRemoteInfo) error {
+	e.requesterConnectID = connectionID
+	e.requesterRemote = remote
+	e.requesterConnected = true
+	return nil
+}
+
+func (e *fakeVolumeRdmaEndpoint) ReadRemoteFor(ctx context.Context, connectionID uint64, desc VolumeRdmaDataDesc, timeout time.Duration) ([]byte, error) {
+	return append([]byte(nil), e.requesterReadData...), nil
 }
 
 func readyVolumeRdmaEndpoint(qpn uint32) VolumeRdmaEndpointInfo {
@@ -144,5 +181,48 @@ func TestVolumeRdmaConnectHandlerRejectsUnreadyPeer(t *testing.T) {
 	}
 	if endpoint.connected {
 		t.Fatalf("endpoint should not be connected")
+	}
+}
+
+func TestVolumeRdmaRequesterLocalHandlerReturnsEndpoint(t *testing.T) {
+	endpoint := &fakeVolumeRdmaEndpoint{requesterLocal: readyVolumeRdmaEndpoint(199)}
+	vs := &VolumeServer{rdmaEndpoint: endpoint}
+	req := httptest.NewRequest(http.MethodGet, VolumeRdmaNativeRequesterLocalPath, nil)
+	rec := httptest.NewRecorder()
+
+	vs.volumeRdmaRequesterLocalHandler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	var resp VolumeRdmaEndpointInfo
+	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
+		t.Fatalf("decode requester local: %v", err)
+	}
+	if resp.ConnectionID != 77 || resp.QPNum != 199 || !resp.ReadyForConnect() {
+		t.Fatalf("unexpected requester endpoint: %+v", resp)
+	}
+}
+
+func TestVolumeRdmaRequesterConnectHandlerConvertsPeerEndpoint(t *testing.T) {
+	endpoint := &fakeVolumeRdmaEndpoint{}
+	vs := &VolumeServer{rdmaEndpoint: endpoint}
+	body, err := json.Marshal(readyVolumeRdmaEndpoint(2233))
+	if err != nil {
+		t.Fatalf("marshal endpoint: %v", err)
+	}
+	req := httptest.NewRequest(http.MethodPost, VolumeRdmaNativeRequesterConnectPath+"?connection_id=77&sl=4", bytes.NewReader(body))
+	rec := httptest.NewRecorder()
+
+	vs.volumeRdmaRequesterConnectHandler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d body=%s", rec.Code, rec.Body.String())
+	}
+	if !endpoint.requesterConnected || endpoint.requesterConnectID != 77 {
+		t.Fatalf("requester was not connected: endpoint=%+v", endpoint)
+	}
+	if endpoint.requesterRemote.QPN != 2233 || endpoint.requesterRemote.SL != 4 {
+		t.Fatalf("unexpected requester remote info: %+v", endpoint.requesterRemote)
 	}
 }

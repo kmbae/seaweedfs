@@ -28,6 +28,7 @@ type request struct {
 	Desc         *rdmaDataDesc   `json:"desc,omitempty"`
 	SessionID    uint64          `json:"session_id,omitempty"`
 	TimeoutMs    uint64          `json:"timeout_ms,omitempty"`
+	DataSideband bool            `json:"data_sideband,omitempty"`
 	Data         json.RawMessage `json:"data,omitempty"`
 }
 
@@ -74,6 +75,27 @@ func (c *Client) RequesterLocal(ctx context.Context) (swvfsdaemon.RDMALocalEndpo
 	return endpoint, err
 }
 
+func (c *Client) ProviderLocal(ctx context.Context) (swvfsdaemon.RDMALocalEndpoint, error) {
+	endpoint, _, err := c.ProviderLocalFor(ctx, 0)
+	return endpoint, err
+}
+
+func (c *Client) ProviderLocalFor(ctx context.Context, connectionID uint64) (swvfsdaemon.RDMALocalEndpoint, uint64, error) {
+	var endpoint swvfsdaemon.RDMALocalEndpoint
+	resp, err := c.roundTrip(ctx, request{Op: "local", ConnectionID: connectionID})
+	if err != nil {
+		return endpoint, 0, err
+	}
+	if resp.Endpoint == nil {
+		return endpoint, 0, fmt.Errorf("native engine local response missing endpoint")
+	}
+	endpoint = *resp.Endpoint
+	if resp.ConnectionID != 0 {
+		endpoint.ConnectionID = resp.ConnectionID
+	}
+	return endpoint, endpoint.ConnectionID, nil
+}
+
 func (c *Client) RequesterLocalFor(ctx context.Context, connectionID uint64) (swvfsdaemon.RDMALocalEndpoint, uint64, error) {
 	var endpoint swvfsdaemon.RDMALocalEndpoint
 	resp, err := c.roundTrip(ctx, request{Op: "requester_local", ConnectionID: connectionID})
@@ -94,11 +116,61 @@ func (c *Client) RequesterConnect(ctx context.Context, remote swvfsproto.RDMARem
 	return c.RequesterConnectFor(ctx, 0, remote)
 }
 
+func (c *Client) ProviderConnect(ctx context.Context, remote swvfsproto.RDMARemoteInfo) error {
+	return c.ProviderConnectFor(ctx, 0, remote)
+}
+
+func (c *Client) ProviderConnectFor(ctx context.Context, connectionID uint64, remote swvfsproto.RDMARemoteInfo) error {
+	_, err := c.roundTrip(ctx, request{
+		Op:           "connect",
+		ConnectionID: connectionID,
+		Remote:       toRemoteInfo(remote),
+	})
+	return err
+}
+
 func (c *Client) RequesterConnectFor(ctx context.Context, connectionID uint64, remote swvfsproto.RDMARemoteInfo) error {
 	_, err := c.roundTrip(ctx, request{
 		Op:           "requester_connect",
 		ConnectionID: connectionID,
 		Remote:       toRemoteInfo(remote),
+	})
+	return err
+}
+
+func (c *Client) RegisterReadBuffer(ctx context.Context, data []byte) (swvfsproto.RDMADataDesc, uint64, error) {
+	return c.RegisterReadBufferFor(ctx, 0, data)
+}
+
+func (c *Client) RegisterReadBufferFor(ctx context.Context, connectionID uint64, data []byte) (swvfsproto.RDMADataDesc, uint64, error) {
+	var desc swvfsproto.RDMADataDesc
+	if len(data) == 0 {
+		return desc, 0, fmt.Errorf("native engine register_read requires data")
+	}
+	resp, err := c.roundTripWithSideband(ctx, request{
+		Op:           "register_read",
+		ConnectionID: connectionID,
+		DataSideband: true,
+	}, data)
+	if err != nil {
+		return desc, 0, err
+	}
+	if resp.Desc == nil {
+		return desc, 0, fmt.Errorf("native engine register_read response missing descriptor")
+	}
+	if resp.SessionID == 0 {
+		return desc, 0, fmt.Errorf("native engine register_read response missing session_id")
+	}
+	return fromDataDesc(*resp.Desc), resp.SessionID, nil
+}
+
+func (c *Client) ReleaseRead(ctx context.Context, sessionID uint64) error {
+	if sessionID == 0 {
+		return nil
+	}
+	_, err := c.roundTrip(ctx, request{
+		Op:        "release",
+		SessionID: sessionID,
 	})
 	return err
 }
@@ -128,6 +200,10 @@ func (c *Client) ReadRemoteFor(ctx context.Context, connectionID uint64, desc sw
 }
 
 func (c *Client) roundTrip(ctx context.Context, req request) (*response, error) {
+	return c.roundTripWithSideband(ctx, req, nil)
+}
+
+func (c *Client) roundTripWithSideband(ctx context.Context, req request, sideband []byte) (*response, error) {
 	if c == nil || strings.TrimSpace(c.SocketPath) == "" {
 		return nil, fmt.Errorf("native engine socket is not configured")
 	}
@@ -160,6 +236,11 @@ func (c *Client) roundTrip(ctx context.Context, req request) (*response, error) 
 	}
 	if err := writeFrame(conn, payload); err != nil {
 		return nil, err
+	}
+	if sideband != nil {
+		if err := writeFrame(conn, sideband); err != nil {
+			return nil, err
+		}
 	}
 	frame, err := readFrame(conn)
 	if err != nil {
@@ -232,6 +313,15 @@ func toRemoteInfo(in swvfsproto.RDMARemoteInfo) *remoteInfo {
 
 func toDataDesc(in swvfsproto.RDMADataDesc) *rdmaDataDesc {
 	return &rdmaDataDesc{
+		RemoteAddr: in.RemoteAddr,
+		RKey:       in.RKey,
+		Length:     in.Length,
+		Reserved:   in.Reserved,
+	}
+}
+
+func fromDataDesc(in rdmaDataDesc) swvfsproto.RDMADataDesc {
+	return swvfsproto.RDMADataDesc{
 		RemoteAddr: in.RemoteAddr,
 		RKey:       in.RKey,
 		Length:     in.Length,

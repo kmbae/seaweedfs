@@ -229,15 +229,135 @@ func TestReadNeedleUsesNativeVolumeRDMA(t *testing.T) {
 	}
 }
 
+func TestWriteNeedleUsesNativeVolumeRDMA(t *testing.T) {
+	native := &fakeNativeVolumeEngine{
+		local: swvfsdaemon.RDMALocalEndpoint{
+			ABIVersion:    swvfsproto.RDMAABIVersion,
+			Device:        "mlx5_0",
+			Port:          1,
+			QPNum:         31,
+			PSN:           0x313131,
+			LID:           0x31,
+			LinkLayer:     swvfsproto.RDMALinkInfiniBand,
+			KernelEnabled: true,
+			EndpointReady: true,
+		},
+		registerDesc: swvfsproto.RDMADataDesc{
+			RemoteAddr: 0xcafe,
+			RKey:       17,
+			Length:     7,
+		},
+	}
+
+	var (
+		requesterConnects int
+		writeReq          swvfsdaemon.VolumeRDMAWriteRequest
+	)
+	volumeRequester := swvfsdaemon.RDMALocalEndpoint{
+		ConnectionID:  88,
+		ABIVersion:    swvfsproto.RDMAABIVersion,
+		Device:        "mlx5_1",
+		Port:          1,
+		QPNum:         41,
+		PSN:           0x414141,
+		LID:           0x41,
+		LinkLayer:     swvfsproto.RDMALinkInfiniBand,
+		KernelEnabled: true,
+		EndpointReady: true,
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case swvfsdaemon.VolumeRDMARequesterLocalPath:
+			writeTestJSON(t, w, volumeRequester)
+		case swvfsdaemon.VolumeRDMARequesterConnectPath:
+			requesterConnects++
+			if r.URL.Query().Get("connection_id") != "88" {
+				t.Errorf("requester connect connection_id = %q", r.URL.Query().Get("connection_id"))
+			}
+			var local swvfsdaemon.RDMALocalEndpoint
+			if err := json.NewDecoder(r.Body).Decode(&local); err != nil {
+				t.Errorf("decode requester connect: %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if local.QPNum != native.local.QPNum {
+				t.Errorf("posted worker endpoint = %+v", local)
+			}
+			writeTestJSON(t, w, map[string]bool{"connected": true})
+		case swvfsdaemon.VolumeRDMAWritePath:
+			if err := json.NewDecoder(r.Body).Decode(&writeReq); err != nil {
+				t.Errorf("decode write: %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			writeTestJSON(t, w, swvfsdaemon.VolumeRDMAWriteResponse{
+				FileID: writeReq.FileID,
+				Size:   writeReq.Size,
+				Source: "native-volume-rdma-write",
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	client := &SeaweedFSRDMAClient{
+		nativeEngine:     native,
+		logger:           logrus.New(),
+		nativeVolumeRDMA: true,
+		operationTimeout: time.Second,
+		nativePeers:      make(map[string]nativeVolumePeer),
+	}
+	resp, err := client.WriteNeedle(t.Context(), &NeedleWriteRequest{
+		VolumeID:     7,
+		NeedleID:     8,
+		Cookie:       9,
+		Data:         []byte("payload"),
+		VolumeServer: server.URL,
+	})
+	if err != nil {
+		t.Fatalf("WriteNeedle: %v", err)
+	}
+	if !resp.IsRDMA || !resp.RealRDMA || resp.Source != "native-volume-rdma-write" || resp.DataSource != "volume-native-write" {
+		t.Fatalf("unexpected response metadata: %+v", resp)
+	}
+	if requesterConnects != 1 {
+		t.Fatalf("requesterConnects = %d, want 1", requesterConnects)
+	}
+	if native.providerConnectConnectionID != 55 || native.providerRemote.QPN != volumeRequester.QPNum {
+		t.Fatalf("native provider was not connected to volume requester: conn=%d remote=%+v", native.providerConnectConnectionID, native.providerRemote)
+	}
+	if native.registerConnectionID != 55 || string(native.registeredData) != "payload" {
+		t.Fatalf("registered conn=%d data=%q", native.registerConnectionID, native.registeredData)
+	}
+	if native.releasedSession != 66 {
+		t.Fatalf("released session = %d, want 66", native.releasedSession)
+	}
+	if writeReq.ConnectionID != 88 || writeReq.VolumeID != 7 || writeReq.NeedleID != 8 || writeReq.Cookie != 9 || writeReq.Size != 7 {
+		t.Fatalf("unexpected native write request: %+v", writeReq)
+	}
+	if writeReq.Desc.RemoteAddr != native.registerDesc.RemoteAddr || writeReq.Desc.RKey != native.registerDesc.RKey {
+		t.Fatalf("write desc = %+v, want %+v", writeReq.Desc, native.registerDesc)
+	}
+}
+
 type fakeNativeVolumeEngine struct {
-	local               swvfsdaemon.RDMALocalEndpoint
-	remote              swvfsproto.RDMARemoteInfo
-	readDesc            swvfsproto.RDMADataDesc
-	data                []byte
-	requesterConnection uint64
-	connected           bool
-	readConnectionID    uint64
-	connectConnectionID uint64
+	local                       swvfsdaemon.RDMALocalEndpoint
+	remote                      swvfsproto.RDMARemoteInfo
+	providerRemote              swvfsproto.RDMARemoteInfo
+	readDesc                    swvfsproto.RDMADataDesc
+	registerDesc                swvfsproto.RDMADataDesc
+	data                        []byte
+	registeredData              []byte
+	requesterConnection         uint64
+	providerConnection          uint64
+	connected                   bool
+	providerConnected           bool
+	readConnectionID            uint64
+	connectConnectionID         uint64
+	providerConnectConnectionID uint64
+	registerConnectionID        uint64
+	releasedSession             uint64
 }
 
 func (e *fakeNativeVolumeEngine) RequesterLocal(context.Context) (swvfsdaemon.RDMALocalEndpoint, error) {
@@ -272,6 +392,45 @@ func (e *fakeNativeVolumeEngine) ReadRemote(_ context.Context, desc swvfsproto.R
 func (e *fakeNativeVolumeEngine) ReadRemoteFor(_ context.Context, connectionID uint64, desc swvfsproto.RDMADataDesc, timeout time.Duration) ([]byte, error) {
 	e.readConnectionID = connectionID
 	return e.ReadRemote(context.Background(), desc, timeout)
+}
+
+func (e *fakeNativeVolumeEngine) ProviderLocal(context.Context) (swvfsdaemon.RDMALocalEndpoint, error) {
+	return e.local, nil
+}
+
+func (e *fakeNativeVolumeEngine) ProviderLocalFor(context.Context, uint64) (swvfsdaemon.RDMALocalEndpoint, uint64, error) {
+	if e.providerConnection == 0 {
+		e.providerConnection = 55
+	}
+	local := e.local
+	local.ConnectionID = e.providerConnection
+	return local, e.providerConnection, nil
+}
+
+func (e *fakeNativeVolumeEngine) ProviderConnect(_ context.Context, remote swvfsproto.RDMARemoteInfo) error {
+	e.providerRemote = remote
+	e.providerConnected = true
+	return nil
+}
+
+func (e *fakeNativeVolumeEngine) ProviderConnectFor(_ context.Context, connectionID uint64, remote swvfsproto.RDMARemoteInfo) error {
+	e.providerConnectConnectionID = connectionID
+	return e.ProviderConnect(context.Background(), remote)
+}
+
+func (e *fakeNativeVolumeEngine) RegisterReadBufferFor(_ context.Context, connectionID uint64, data []byte) (swvfsproto.RDMADataDesc, uint64, error) {
+	e.registerConnectionID = connectionID
+	e.registeredData = append([]byte(nil), data...)
+	desc := e.registerDesc
+	if desc.RemoteAddr == 0 {
+		desc = swvfsproto.RDMADataDesc{RemoteAddr: 0xabcd, RKey: 1, Length: uint32(len(data))}
+	}
+	return desc, 66, nil
+}
+
+func (e *fakeNativeVolumeEngine) ReleaseRead(_ context.Context, sessionID uint64) error {
+	e.releasedSession = sessionID
+	return nil
 }
 
 func writeTestJSON(t *testing.T, w http.ResponseWriter, value interface{}) {

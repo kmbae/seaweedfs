@@ -20,7 +20,7 @@ func TestClientRequesterLocalConnectAndReadRemote(t *testing.T) {
 	}
 	defer listener.Close()
 
-	requests := make(chan request, 4)
+	requests := make(chan request, 8)
 	go func() {
 		for {
 			conn, err := listener.Accept()
@@ -60,6 +60,31 @@ func TestClientRequesterLocalConnectAndReadRemote(t *testing.T) {
 					}
 					resp.DataSideband = true
 					sideband = []byte("needle")
+				case "local":
+					resp.Endpoint = &testEndpoint
+					resp.ConnectionID = 77
+				case "connect":
+					if req.ConnectionID != 77 || req.Remote == nil || req.Remote.QPN != 7 {
+						t.Errorf("unexpected provider connect request: %+v", req)
+					}
+				case "register_read":
+					if req.ConnectionID != 77 || !req.DataSideband {
+						t.Errorf("unexpected register_read request: %+v", req)
+					}
+					payload, err := readFrame(conn)
+					if err != nil {
+						t.Errorf("read register_read sideband: %v", err)
+						return
+					}
+					if string(payload) != "payload" {
+						t.Errorf("register_read sideband = %q", payload)
+					}
+					resp.Desc = &rdmaDataDesc{RemoteAddr: 0xcafe, RKey: 12, Length: 7}
+					resp.SessionID = 88
+				case "release":
+					if req.SessionID != 88 {
+						t.Errorf("unexpected release request: %+v", req)
+					}
 				default:
 					resp.OK = false
 					resp.Error = "unknown op"
@@ -113,8 +138,34 @@ func TestClientRequesterLocalConnectAndReadRemote(t *testing.T) {
 	if string(data) != "needle" {
 		t.Fatalf("data = %q", data)
 	}
+	providerLocal, providerConnectionID, err := client.ProviderLocalFor(t.Context(), 0)
+	if err != nil {
+		t.Fatalf("ProviderLocal: %v", err)
+	}
+	if providerConnectionID != 77 || providerLocal.ConnectionID != 77 {
+		t.Fatalf("provider connectionID = %d local=%+v", providerConnectionID, providerLocal)
+	}
+	if err := client.ProviderConnectFor(t.Context(), providerConnectionID, swvfsproto.RDMARemoteInfo{
+		ABIVersion: swvfsproto.RDMAABIVersion,
+		QPN:        7,
+		LID:        8,
+		PSN:        9,
+		Port:       1,
+	}); err != nil {
+		t.Fatalf("ProviderConnect: %v", err)
+	}
+	desc, sessionID, err := client.RegisterReadBufferFor(t.Context(), providerConnectionID, []byte("payload"))
+	if err != nil {
+		t.Fatalf("RegisterReadBuffer: %v", err)
+	}
+	if desc.RemoteAddr != 0xcafe || desc.RKey != 12 || desc.Length != 7 || sessionID != 88 {
+		t.Fatalf("register desc=%+v session=%d", desc, sessionID)
+	}
+	if err := client.ReleaseRead(t.Context(), sessionID); err != nil {
+		t.Fatalf("ReleaseRead: %v", err)
+	}
 
-	for _, want := range []string{"requester_local", "requester_connect", "read_remote"} {
+	for _, want := range []string{"requester_local", "requester_connect", "read_remote", "local", "connect", "register_read", "release"} {
 		select {
 		case got := <-requests:
 			if got.Op != want {

@@ -19,6 +19,9 @@ const (
 	volumeRdmaEngineOpRegisterRead       = "register_read"
 	volumeRdmaEngineOpRegisterReadStream = "register_read_stream"
 	volumeRdmaEngineOpRelease            = "release"
+	volumeRdmaEngineOpRequesterLocal     = "requester_local"
+	volumeRdmaEngineOpRequesterConnect   = "requester_connect"
+	volumeRdmaEngineOpReadRemote         = "read_remote"
 
 	volumeRdmaEngineMaxFrameSize = 64 << 20
 )
@@ -34,7 +37,9 @@ type volumeRdmaEngineRequest struct {
 	Op           string                `json:"op"`
 	ConnectionID uint64                `json:"connection_id,omitempty"`
 	Remote       *VolumeRdmaRemoteInfo `json:"remote,omitempty"`
+	Desc         *VolumeRdmaDataDesc   `json:"desc,omitempty"`
 	SessionID    uint64                `json:"session_id,omitempty"`
+	TimeoutMs    uint64                `json:"timeout_ms,omitempty"`
 	DataSideband bool                  `json:"data_sideband,omitempty"`
 	Data         []byte                `json:"data,omitempty"`
 }
@@ -46,6 +51,8 @@ type volumeRdmaEngineResponse struct {
 	Desc         *VolumeRdmaDataDesc     `json:"desc,omitempty"`
 	ConnectionID uint64                  `json:"connection_id,omitempty"`
 	SessionID    uint64                  `json:"session_id,omitempty"`
+	DataSideband bool                    `json:"data_sideband,omitempty"`
+	Data         []byte                  `json:"data,omitempty"`
 }
 
 type volumeRdmaEngineRegisteredBuffer struct {
@@ -113,6 +120,63 @@ func (c *VolumeRdmaEngineClient) ConnectEndpointFor(ctx context.Context, connect
 		Remote:       &remote,
 	})
 	return err
+}
+
+func (c *VolumeRdmaEngineClient) RequesterLocalEndpoint(ctx context.Context) (VolumeRdmaEndpointInfo, error) {
+	endpoint, _, err := c.RequesterLocalEndpointFor(ctx, 0)
+	return endpoint, err
+}
+
+func (c *VolumeRdmaEngineClient) RequesterLocalEndpointFor(ctx context.Context, connectionID uint64) (VolumeRdmaEndpointInfo, uint64, error) {
+	var endpoint VolumeRdmaEndpointInfo
+	resp, err := c.roundTrip(ctx, volumeRdmaEngineRequest{
+		Op:           volumeRdmaEngineOpRequesterLocal,
+		ConnectionID: connectionID,
+	})
+	if err != nil {
+		return endpoint, 0, err
+	}
+	if resp.Endpoint == nil {
+		return endpoint, 0, fmt.Errorf("%w: requester_local response missing endpoint", ErrVolumeRdmaEngineUnavailable)
+	}
+	endpoint = *resp.Endpoint
+	if resp.ConnectionID != 0 {
+		endpoint.ConnectionID = resp.ConnectionID
+	}
+	return endpoint, endpoint.ConnectionID, nil
+}
+
+func (c *VolumeRdmaEngineClient) RequesterConnectEndpoint(ctx context.Context, remote VolumeRdmaRemoteInfo) error {
+	return c.RequesterConnectEndpointFor(ctx, 0, remote)
+}
+
+func (c *VolumeRdmaEngineClient) RequesterConnectEndpointFor(ctx context.Context, connectionID uint64, remote VolumeRdmaRemoteInfo) error {
+	_, err := c.roundTrip(ctx, volumeRdmaEngineRequest{
+		Op:           volumeRdmaEngineOpRequesterConnect,
+		ConnectionID: connectionID,
+		Remote:       &remote,
+	})
+	return err
+}
+
+func (c *VolumeRdmaEngineClient) ReadRemoteFor(ctx context.Context, connectionID uint64, desc VolumeRdmaDataDesc, timeout time.Duration) ([]byte, error) {
+	timeoutMs := uint64(timeout.Milliseconds())
+	if timeoutMs == 0 && timeout > 0 {
+		timeoutMs = 1
+	}
+	resp, err := c.roundTrip(ctx, volumeRdmaEngineRequest{
+		Op:           volumeRdmaEngineOpReadRemote,
+		ConnectionID: connectionID,
+		Desc:         &desc,
+		TimeoutMs:    timeoutMs,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if len(resp.Data) == 0 && desc.Length > 0 {
+		return nil, fmt.Errorf("%w: read_remote returned empty data for %d byte descriptor", ErrVolumeRdmaEngineUnavailable, desc.Length)
+	}
+	return resp.Data, nil
 }
 
 func (c *VolumeRdmaEngineClient) RegisterReadBuffer(ctx context.Context, data []byte) (VolumeRdmaRegisteredBuffer, error) {
@@ -278,6 +342,15 @@ func (c *VolumeRdmaEngineClient) roundTripWrite(ctx context.Context, req volumeR
 			resp.Error = "native RDMA engine returned failure"
 		}
 		return nil, fmt.Errorf("%w: %s", ErrVolumeRdmaEngineUnavailable, resp.Error)
+	}
+	if resp.DataSideband {
+		if len(resp.Data) != 0 {
+			return nil, fmt.Errorf("%w: response must not include JSON data with data_sideband", ErrVolumeRdmaEngineUnavailable)
+		}
+		resp.Data, err = readVolumeRdmaEngineFrame(conn)
+		if err != nil {
+			return nil, fmt.Errorf("%w: read response sideband: %v", ErrVolumeRdmaEngineUnavailable, err)
+		}
 	}
 	return &resp, nil
 }

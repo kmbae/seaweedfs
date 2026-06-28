@@ -40,6 +40,7 @@ func TestVolumeRdmaEngineClientEndpointAndRegistrar(t *testing.T) {
 					return
 				}
 				resp := volumeRdmaEngineResponse{OK: true}
+				var responseSideband []byte
 				switch req.Op {
 				case volumeRdmaEngineOpLocal:
 					resp.Endpoint = &VolumeRdmaEndpointInfo{
@@ -53,7 +54,30 @@ func TestVolumeRdmaEngineClientEndpointAndRegistrar(t *testing.T) {
 						LID:           0x42,
 						LinkLayer:     VolumeRdmaLinkInfiniBand,
 					}
+				case volumeRdmaEngineOpRequesterLocal:
+					resp.Endpoint = &VolumeRdmaEndpointInfo{
+						ABIVersion:    VolumeRdmaABIVersion,
+						KernelEnabled: true,
+						EndpointReady: true,
+						Device:        "mlx5_0",
+						Port:          1,
+						QPNum:         456,
+						PSN:           0x654321,
+						LID:           0x45,
+						LinkLayer:     VolumeRdmaLinkInfiniBand,
+					}
+					resp.ConnectionID = 55
 				case volumeRdmaEngineOpConnect:
+				case volumeRdmaEngineOpRequesterConnect:
+					if req.ConnectionID != 55 {
+						t.Errorf("requester_connect connection_id = %d, want 55", req.ConnectionID)
+					}
+				case volumeRdmaEngineOpReadRemote:
+					if req.ConnectionID != 55 || req.Desc == nil || req.Desc.RemoteAddr != 0xfeed || req.TimeoutMs != 12 {
+						t.Errorf("unexpected read_remote request: %+v", req)
+					}
+					resp.DataSideband = true
+					responseSideband = []byte("remote-data")
 				case volumeRdmaEngineOpRegisterRead:
 					if !req.DataSideband {
 						t.Errorf("register_read did not request sideband data")
@@ -112,6 +136,11 @@ func TestVolumeRdmaEngineClientEndpointAndRegistrar(t *testing.T) {
 				if err := writeVolumeRdmaEngineFrame(conn, encoded); err != nil {
 					t.Errorf("write response: %v", err)
 				}
+				if responseSideband != nil {
+					if err := writeVolumeRdmaEngineFrame(conn, responseSideband); err != nil {
+						t.Errorf("write response sideband: %v", err)
+					}
+				}
 			}(conn)
 		}
 	}()
@@ -132,6 +161,33 @@ func TestVolumeRdmaEngineClientEndpointAndRegistrar(t *testing.T) {
 		Port:       1,
 	}); err != nil {
 		t.Fatalf("ConnectEndpoint: %v", err)
+	}
+	requesterLocal, requesterConnectionID, err := client.RequesterLocalEndpointFor(context.Background(), 0)
+	if err != nil {
+		t.Fatalf("RequesterLocalEndpointFor: %v", err)
+	}
+	if requesterConnectionID != 55 || requesterLocal.ConnectionID != 55 || requesterLocal.QPNum != 456 {
+		t.Fatalf("unexpected requester endpoint: id=%d endpoint=%+v", requesterConnectionID, requesterLocal)
+	}
+	if err := client.RequesterConnectEndpointFor(context.Background(), requesterConnectionID, VolumeRdmaRemoteInfo{
+		ABIVersion: VolumeRdmaABIVersion,
+		QPN:        654,
+		LID:        0x54,
+		PSN:        0x456789,
+		Port:       1,
+	}); err != nil {
+		t.Fatalf("RequesterConnectEndpointFor: %v", err)
+	}
+	remoteData, err := client.ReadRemoteFor(context.Background(), requesterConnectionID, VolumeRdmaDataDesc{
+		RemoteAddr: 0xfeed,
+		RKey:       66,
+		Length:     uint32(len("remote-data")),
+	}, 12*time.Millisecond)
+	if err != nil {
+		t.Fatalf("ReadRemoteFor: %v", err)
+	}
+	if string(remoteData) != "remote-data" {
+		t.Fatalf("remote data = %q", remoteData)
 	}
 	buffer, err := client.RegisterReadBuffer(context.Background(), []byte("needle-data"))
 	if err != nil {
@@ -159,6 +215,9 @@ func TestVolumeRdmaEngineClientEndpointAndRegistrar(t *testing.T) {
 	ops := []string{
 		volumeRdmaEngineOpLocal,
 		volumeRdmaEngineOpConnect,
+		volumeRdmaEngineOpRequesterLocal,
+		volumeRdmaEngineOpRequesterConnect,
+		volumeRdmaEngineOpReadRemote,
 		volumeRdmaEngineOpRegisterRead,
 		volumeRdmaEngineOpRegisterReadStream,
 		volumeRdmaEngineOpRelease,

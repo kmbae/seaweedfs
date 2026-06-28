@@ -48,13 +48,19 @@ type SeaweedFSRDMAClient struct {
 	tempDir     string
 	useZeroCopy bool
 
-	nativeMu    sync.Mutex
-	nativePeers map[string]nativeVolumePeer
+	nativeMu         sync.Mutex
+	nativePeers      map[string]nativeVolumePeer
+	nativeWritePeers map[string]nativeVolumeWritePeer
 }
 
 type nativeVolumePeer struct {
 	RequesterConnectionID uint64
 	VolumeConnectionID    uint64
+}
+
+type nativeVolumeWritePeer struct {
+	ProviderConnectionID        uint64
+	VolumeRequesterConnectionID uint64
 }
 
 // Config holds configuration for the SeaweedFS RDMA client
@@ -94,6 +100,12 @@ type nativeVolumeEngine interface {
 	RequesterLocalFor(context.Context, uint64) (swvfsdaemon.RDMALocalEndpoint, uint64, error)
 	RequesterConnectFor(context.Context, uint64, swvfsproto.RDMARemoteInfo) error
 	ReadRemoteFor(context.Context, uint64, swvfsproto.RDMADataDesc, time.Duration) ([]byte, error)
+	ProviderLocal(context.Context) (swvfsdaemon.RDMALocalEndpoint, error)
+	ProviderConnect(context.Context, swvfsproto.RDMARemoteInfo) error
+	ProviderLocalFor(context.Context, uint64) (swvfsdaemon.RDMALocalEndpoint, uint64, error)
+	ProviderConnectFor(context.Context, uint64, swvfsproto.RDMARemoteInfo) error
+	RegisterReadBufferFor(context.Context, uint64, []byte) (swvfsproto.RDMADataDesc, uint64, error)
+	ReleaseRead(context.Context, uint64) error
 }
 
 // NeedleReadRequest represents a SeaweedFS needle read request
@@ -174,6 +186,7 @@ func NewSeaweedFSRDMAClient(config *Config) (*SeaweedFSRDMAClient, error) {
 		remoteReadPort:     config.RemoteReadPort,
 		operationTimeout:   config.DefaultTimeout,
 		nativePeers:        make(map[string]nativeVolumePeer),
+		nativeWritePeers:   make(map[string]nativeVolumeWritePeer),
 	}
 	if client.remoteReadPort == 0 {
 		client.remoteReadPort = remote.DefaultRemotePort
@@ -540,6 +553,13 @@ func reqFileID(req *NeedleReadRequest) string {
 	return needle.NewFileId(needle.VolumeId(req.VolumeID), req.NeedleID, req.Cookie).String()
 }
 
+func writeReqFileID(req *NeedleWriteRequest) string {
+	if req == nil || req.VolumeID == 0 || req.NeedleID == 0 {
+		return ""
+	}
+	return needle.NewFileId(needle.VolumeId(req.VolumeID), req.NeedleID, req.Cookie).String()
+}
+
 func (c *SeaweedFSRDMAClient) readNeedleViaRemoteRDMA(ctx context.Context, req *NeedleReadRequest, rdmaReq *rdma.ReadRequest) ([]byte, string, string, bool, error) {
 	if c.rdmaClient == nil || !c.rdmaClient.IsRealRdma() {
 		return nil, "", "", false, nil
@@ -825,6 +845,36 @@ func (c *SeaweedFSRDMAClient) WriteNeedle(ctx context.Context, req *NeedleWriteR
 	start := time.Now()
 	var rdmaErr error
 
+	if c.nativeVolumeRDMA && c.nativeEngine != nil {
+		if fileID, ok, err := c.writeNeedleViaNativeVolumeRDMA(ctx, req); err == nil && ok {
+			c.logger.WithFields(logrus.Fields{
+				"volume_id":     req.VolumeID,
+				"needle_id":     req.NeedleID,
+				"source":        "native-volume-rdma-write",
+				"session_rdma":  true,
+				"real_rdma":     true,
+				"data_source":   "volume-native-write",
+				"bytes_written": len(req.Data),
+				"latency":       time.Since(start),
+				"file_id":       fileID,
+			}).Info("📝 Native volume RDMA write path completed")
+			return &NeedleWriteResponse{
+				Success:     true,
+				IsRDMA:      true,
+				Source:      "native-volume-rdma-write",
+				Latency:     time.Since(start),
+				FileID:      fileID,
+				Size:        len(req.Data),
+				SessionRDMA: true,
+				RealRDMA:    true,
+				DataSource:  "volume-native-write",
+			}, nil
+		} else if err != nil {
+			c.logger.WithError(err).Debug("native volume RDMA write path unavailable, trying configured RDMA path")
+			rdmaErr = err
+		}
+	}
+
 	if c.IsEnabled() {
 		c.logger.WithFields(logrus.Fields{
 			"volume_id": req.VolumeID,
@@ -1002,6 +1052,127 @@ func (c *SeaweedFSRDMAClient) WriteNeedleBlobGRPC(ctx context.Context, req *Need
 		Cookie:   types.Cookie(req.Cookie),
 	}
 	return fileID.String(), nil
+}
+
+func (c *SeaweedFSRDMAClient) writeNeedleViaNativeVolumeRDMA(ctx context.Context, req *NeedleWriteRequest) (string, bool, error) {
+	if c == nil || c.nativeEngine == nil || req == nil {
+		return "", false, nil
+	}
+	volumeServer := req.VolumeServer
+	if volumeServer == "" {
+		volumeServer = c.volumeServerURL
+	}
+	if volumeServer == "" || len(req.Data) == 0 {
+		return "", false, nil
+	}
+	if len(req.Data) > swvfsproto.RDMAIOMax {
+		return "", false, fmt.Errorf("native volume RDMA write too large: %d > %d", len(req.Data), swvfsproto.RDMAIOMax)
+	}
+
+	peer, err := c.ensureNativeVolumeWritePeer(ctx, volumeServer)
+	if err != nil {
+		return "", false, err
+	}
+
+	desc, sessionID, err := c.nativeEngine.RegisterReadBufferFor(ctx, peer.ProviderConnectionID, req.Data)
+	if err != nil {
+		return "", false, err
+	}
+	if sessionID != 0 {
+		defer func() {
+			releaseCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := c.nativeEngine.ReleaseRead(releaseCtx, sessionID); err != nil {
+				c.logger.WithError(err).Warn("native volume RDMA write descriptor release failed")
+			}
+		}()
+	}
+	if desc.RemoteAddr == 0 || desc.Length == 0 {
+		return "", false, fmt.Errorf("native volume RDMA write descriptor is not exportable")
+	}
+	if uint64(desc.Length) < uint64(len(req.Data)) {
+		return "", false, fmt.Errorf("native volume RDMA write descriptor length %d is smaller than payload %d", desc.Length, len(req.Data))
+	}
+
+	resp, err := swvfsdaemon.PostVolumeNativeWrite(ctx, nil, volumeServer, swvfsdaemon.VolumeRDMAWriteRequest{
+		ConnectionID: peer.VolumeRequesterConnectionID,
+		FileID:       writeReqFileID(req),
+		VolumeID:     req.VolumeID,
+		NeedleID:     req.NeedleID,
+		Cookie:       req.Cookie,
+		Size:         uint64(len(req.Data)),
+		Desc:         desc,
+		TimeoutMs:    uint64(c.nativeOperationTimeout().Milliseconds()),
+	})
+	if err != nil {
+		return "", false, err
+	}
+	fileID := resp.FileID
+	if fileID == "" {
+		fileID = writeReqFileID(req)
+	}
+	if c.localReader != nil {
+		c.localReader.Invalidate(req.VolumeID)
+	}
+	return fileID, true, nil
+}
+
+func (c *SeaweedFSRDMAClient) ensureNativeVolumeWritePeer(ctx context.Context, volumeServer string) (nativeVolumeWritePeer, error) {
+	key := nativeVolumePeerKey(volumeServer)
+	c.nativeMu.Lock()
+	if c.nativeWritePeers != nil {
+		if peer, ok := c.nativeWritePeers[key]; ok {
+			c.nativeMu.Unlock()
+			return peer, nil
+		}
+	}
+	c.nativeMu.Unlock()
+
+	volumeLocal, err := swvfsdaemon.FetchVolumeNativeRequesterEndpoint(ctx, nil, volumeServer, 0)
+	if err != nil {
+		return nativeVolumeWritePeer{}, err
+	}
+	volumeConnectionID := volumeLocal.ConnectionID
+	if volumeConnectionID == 0 {
+		return nativeVolumeWritePeer{}, fmt.Errorf("native volume requester endpoint did not return a connection_id")
+	}
+	if !volumeLocal.ReadyForConnect() {
+		return nativeVolumeWritePeer{}, fmt.Errorf("native volume requester endpoint is not ready: qpn=%d lid=%d", volumeLocal.QPNum, volumeLocal.LID)
+	}
+
+	workerLocal, workerConnectionID, err := c.nativeEngine.ProviderLocalFor(ctx, 0)
+	if err != nil {
+		return nativeVolumeWritePeer{}, err
+	}
+	if workerConnectionID == 0 {
+		return nativeVolumeWritePeer{}, fmt.Errorf("native worker provider endpoint did not return a connection_id")
+	}
+	if !workerLocal.ReadyForConnect() {
+		return nativeVolumeWritePeer{}, fmt.Errorf("native worker provider endpoint is not ready: qpn=%d lid=%d", workerLocal.QPNum, workerLocal.LID)
+	}
+
+	volumeRemote, err := volumeLocal.RemoteInfo(c.nativeServiceLevel)
+	if err != nil {
+		return nativeVolumeWritePeer{}, err
+	}
+	if err := c.nativeEngine.ProviderConnectFor(ctx, workerConnectionID, volumeRemote); err != nil {
+		return nativeVolumeWritePeer{}, err
+	}
+	if err := swvfsdaemon.PostVolumeNativeRequesterConnectFor(ctx, nil, volumeServer, volumeConnectionID, workerLocal, c.nativeServiceLevel); err != nil {
+		return nativeVolumeWritePeer{}, err
+	}
+
+	peer := nativeVolumeWritePeer{
+		ProviderConnectionID:        workerConnectionID,
+		VolumeRequesterConnectionID: volumeConnectionID,
+	}
+	c.nativeMu.Lock()
+	if c.nativeWritePeers == nil {
+		c.nativeWritePeers = make(map[string]nativeVolumeWritePeer)
+	}
+	c.nativeWritePeers[key] = peer
+	c.nativeMu.Unlock()
+	return peer, nil
 }
 
 func (c *SeaweedFSRDMAClient) writeNeedleViaRemoteRDMA(ctx context.Context, req *NeedleWriteRequest, writeReq *rdma.WriteRequest) (string, string, bool, error) {
