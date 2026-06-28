@@ -632,7 +632,7 @@ const (
 	embeddedVolumeRdmaDefaultPSN = 0xabcdef
 	embeddedVolumeRdmaErrLen     = 512
 
-	embeddedVolumeRdmaReadMRPoolLimit    = 8
+	embeddedVolumeRdmaReadMRPoolLimit    = volumeRdmaPipelineDepth
 	embeddedVolumeRdmaSessionMRPoolLimit = 8
 	embeddedVolumeRdmaReadMRMinSize      = 64 << 10
 	embeddedVolumeRdmaReadMRAlign        = 1 << 20
