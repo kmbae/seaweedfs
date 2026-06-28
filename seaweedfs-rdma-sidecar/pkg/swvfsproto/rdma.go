@@ -30,6 +30,8 @@ const (
 )
 
 const RDMADataDescSize = 48
+const RDMAWriteCommitEntrySize = 16
+const RDMAWriteCommitResultSize = 24
 const RDMATestMRSize = 104
 
 const (
@@ -121,6 +123,18 @@ type RDMADataDesc struct {
 	Reserved   [4]uint64
 }
 
+type RDMAWriteCommitEntry struct {
+	Offset uint64
+	Size   uint64
+}
+
+type RDMAWriteCommitResult struct {
+	Offset uint64
+	Size   uint64
+	Status int32
+	Pad0   uint32
+}
+
 type RDMATestMR struct {
 	ABIVersion uint32
 	Flags      uint32
@@ -167,6 +181,60 @@ func DecodeRDMADataDesc(buf []byte) (RDMADataDesc, error) {
 		desc.Reserved[i] = binary.LittleEndian.Uint64(buf[off : off+8])
 	}
 	return desc, nil
+}
+
+func EncodeRDMAWriteCommitEntries(entries []RDMAWriteCommitEntry) []byte {
+	out := make([]byte, len(entries)*RDMAWriteCommitEntrySize)
+	for i, entry := range entries {
+		off := i * RDMAWriteCommitEntrySize
+		binary.LittleEndian.PutUint64(out[off:off+8], entry.Offset)
+		binary.LittleEndian.PutUint64(out[off+8:off+16], entry.Size)
+	}
+	return out
+}
+
+func DecodeRDMAWriteCommitEntries(buf []byte) ([]RDMAWriteCommitEntry, error) {
+	if len(buf)%RDMAWriteCommitEntrySize != 0 {
+		return nil, fmt.Errorf("%w: rdma write commit entries got %d bytes", ErrBadLength, len(buf))
+	}
+	entries := make([]RDMAWriteCommitEntry, len(buf)/RDMAWriteCommitEntrySize)
+	for i := range entries {
+		off := i * RDMAWriteCommitEntrySize
+		entries[i] = RDMAWriteCommitEntry{
+			Offset: binary.LittleEndian.Uint64(buf[off : off+8]),
+			Size:   binary.LittleEndian.Uint64(buf[off+8 : off+16]),
+		}
+	}
+	return entries, nil
+}
+
+func EncodeRDMAWriteCommitResults(results []RDMAWriteCommitResult) []byte {
+	out := make([]byte, len(results)*RDMAWriteCommitResultSize)
+	for i, result := range results {
+		off := i * RDMAWriteCommitResultSize
+		binary.LittleEndian.PutUint64(out[off:off+8], result.Offset)
+		binary.LittleEndian.PutUint64(out[off+8:off+16], result.Size)
+		binary.LittleEndian.PutUint32(out[off+16:off+20], uint32(result.Status))
+		binary.LittleEndian.PutUint32(out[off+20:off+24], result.Pad0)
+	}
+	return out
+}
+
+func DecodeRDMAWriteCommitResults(buf []byte) ([]RDMAWriteCommitResult, error) {
+	if len(buf)%RDMAWriteCommitResultSize != 0 {
+		return nil, fmt.Errorf("%w: rdma write commit results got %d bytes", ErrBadLength, len(buf))
+	}
+	results := make([]RDMAWriteCommitResult, len(buf)/RDMAWriteCommitResultSize)
+	for i := range results {
+		off := i * RDMAWriteCommitResultSize
+		results[i] = RDMAWriteCommitResult{
+			Offset: binary.LittleEndian.Uint64(buf[off : off+8]),
+			Size:   binary.LittleEndian.Uint64(buf[off+8 : off+16]),
+			Status: int32(binary.LittleEndian.Uint32(buf[off+16 : off+20])),
+			Pad0:   binary.LittleEndian.Uint32(buf[off+20 : off+24]),
+		}
+	}
+	return results, nil
 }
 
 func DecodeGIDHex(raw string) ([16]byte, bool) {

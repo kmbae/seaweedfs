@@ -879,6 +879,27 @@ func (b *Backend) CommitWriteRDMA(ctx context.Context, fullPath string, offset, 
 	return b.WriteDescriptorBackend.CommitWriteRDMA(ctx, cleanFullPath(fullPath), offset, size)
 }
 
+func (b *Backend) CommitWriteRDMABatch(ctx context.Context, fullPath string, entries []swvfsproto.RDMAWriteCommitEntry) ([]swvfsproto.RDMAWriteCommitResult, *swvfsproto.Attr, error) {
+	if b == nil {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma write descriptor backend is not configured"}
+	}
+	fullPath = cleanFullPath(fullPath)
+	results := make([]swvfsproto.RDMAWriteCommitResult, len(entries))
+	var lastAttr *swvfsproto.Attr
+	for i, entry := range entries {
+		attr, err := b.CommitWriteRDMA(ctx, fullPath, entry.Offset, entry.Size)
+		results[i] = swvfsproto.RDMAWriteCommitResult{
+			Offset: entry.Offset,
+			Size:   entry.Size,
+			Status: swvfsdaemon.ErrnoForError(err),
+		}
+		if err == nil && attr != nil {
+			lastAttr = attr
+		}
+	}
+	return results, lastAttr, nil
+}
+
 func (b *Backend) WriteFile(ctx context.Context, fullPath string, offset uint64, data []byte, mode, uid, gid uint32, preferRDMA bool) (*swvfsproto.Attr, error) {
 	if b == nil || b.Store == nil || b.Router == nil {
 		return nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "swvfs filer backend is not configured"}

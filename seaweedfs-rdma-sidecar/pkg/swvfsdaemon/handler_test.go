@@ -48,6 +48,8 @@ type fakeRDMAFileBackend struct {
 	commitPath       string
 	commitOffset     uint64
 	commitSize       uint64
+	batchPath        string
+	batchEntries     []swvfsproto.RDMAWriteCommitEntry
 	releaseLeaseID   uint64
 	releaseStatus    int32
 	releaseBytes     uint64
@@ -93,6 +95,18 @@ func (f *fakeRDMAFileBackend) CommitWriteRDMA(ctx context.Context, path string, 
 	f.commitOffset = offset
 	f.commitSize = size
 	return &swvfsproto.Attr{Ino: 10, Size: offset + size, Mode: 0100644, Nlink: 1}, nil
+}
+
+func (f *fakeRDMAFileBackend) CommitWriteRDMABatch(ctx context.Context, path string, entries []swvfsproto.RDMAWriteCommitEntry) ([]swvfsproto.RDMAWriteCommitResult, *swvfsproto.Attr, error) {
+	f.batchPath = path
+	f.batchEntries = append([]swvfsproto.RDMAWriteCommitEntry(nil), entries...)
+	results := make([]swvfsproto.RDMAWriteCommitResult, len(entries))
+	var attr *swvfsproto.Attr
+	for i, entry := range entries {
+		results[i] = swvfsproto.RDMAWriteCommitResult{Offset: entry.Offset, Size: entry.Size}
+		attr = &swvfsproto.Attr{Ino: 10, Size: entry.Offset + entry.Size, Mode: 0100644, Nlink: 1}
+	}
+	return results, attr, nil
 }
 
 func (f *fakeRDMAFileBackend) ReleaseReadDescriptor(ctx context.Context, leaseID uint64, status int32, bytes uint64) error {
@@ -370,6 +384,37 @@ func TestHandlerRDMAWritePrepareCommit(t *testing.T) {
 	}
 	if commit.Attr.Size != 8704 || backend.commitPath != "/write-file" || backend.commitOffset != 512 || backend.commitSize != 8192 {
 		t.Fatalf("commit mismatch: attr=%+v path=%q off=%d size=%d", commit.Attr, backend.commitPath, backend.commitOffset, backend.commitSize)
+	}
+}
+
+func TestHandlerRDMAWriteCommitBatch(t *testing.T) {
+	backend := &fakeRDMAFileBackend{}
+	h := &Handler{Backend: backend}
+	entries := []swvfsproto.RDMAWriteCommitEntry{
+		{Offset: 0, Size: 4096},
+		{Offset: 4096, Size: 4096},
+	}
+
+	reply, err := h.Handle(context.Background(), &swvfsproto.Request{
+		Header: swvfsproto.RequestHeader{Tag: 7, Op: swvfsproto.OpWriteRDMACommitBatch},
+		Path1:  "/write-file",
+		Data:   swvfsproto.EncodeRDMAWriteCommitEntries(entries),
+	})
+	if err != nil {
+		t.Fatalf("batch Handle: %v", err)
+	}
+	results, err := swvfsproto.DecodeRDMAWriteCommitResults(reply.Data)
+	if err != nil {
+		t.Fatalf("DecodeRDMAWriteCommitResults: %v", err)
+	}
+	if reply.Tag != 7 || reply.Attr.Size != 8192 {
+		t.Fatalf("reply mismatch: %+v", reply)
+	}
+	if backend.batchPath != "/write-file" || len(backend.batchEntries) != len(entries) || backend.batchEntries[1] != entries[1] {
+		t.Fatalf("backend batch mismatch: path=%q entries=%+v", backend.batchPath, backend.batchEntries)
+	}
+	if len(results) != len(entries) || results[0].Status != 0 || results[1].Offset != entries[1].Offset {
+		t.Fatalf("batch results mismatch: %+v", results)
 	}
 }
 

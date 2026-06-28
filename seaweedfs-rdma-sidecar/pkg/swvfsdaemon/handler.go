@@ -53,6 +53,10 @@ type RDMAWriteDescriptorBackend interface {
 	CommitWriteRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.Attr, error)
 }
 
+type RDMAWriteBatchCommitBackend interface {
+	CommitWriteRDMABatch(ctx context.Context, path string, entries []swvfsproto.RDMAWriteCommitEntry) ([]swvfsproto.RDMAWriteCommitResult, *swvfsproto.Attr, error)
+}
+
 type MetadataBackend interface {
 	LookupFile(ctx context.Context, path string) (*swvfsproto.Attr, error)
 	ReadDir(ctx context.Context, path string, offset uint64, limit uint32) ([]swvfsproto.Dirent, bool, error)
@@ -319,6 +323,55 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 			reply.Attr = *attr
 		}
 		return reply, nil
+	case swvfsproto.OpWriteRDMACommitBatch:
+		backend, ok := h.Backend.(RDMAWriteDescriptorBackend)
+		if !ok {
+			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma write commit batch is not implemented"}
+		}
+		entries, err := swvfsproto.DecodeRDMAWriteCommitEntries(req.Data)
+		if err != nil {
+			return nil, ErrnoError{Errno: ErrnoInval, Msg: err.Error()}
+		}
+		if len(entries) == 0 {
+			return nil, ErrnoError{Errno: ErrnoInval, Msg: "rdma write commit batch is empty"}
+		}
+		h.Stats.Inc("handler_write_rdma_commit_batch_requests")
+		h.Stats.Add("handler_write_rdma_commit_batch_entries", uint64(len(entries)))
+		var totalBytes uint64
+		for _, entry := range entries {
+			totalBytes += entry.Size
+		}
+		h.Stats.Add("handler_write_rdma_commit_batch_bytes", totalBytes)
+		commitStart := time.Now()
+		var results []swvfsproto.RDMAWriteCommitResult
+		var attr *swvfsproto.Attr
+		if batch, ok := h.Backend.(RDMAWriteBatchCommitBackend); ok {
+			results, attr, err = batch.CommitWriteRDMABatch(ctx, req.Path1, entries)
+		} else {
+			results, attr, err = commitWriteRDMABatchSlow(ctx, backend, req.Path1, entries)
+		}
+		h.Stats.Observe("handler_write_rdma_commit_batch", time.Since(commitStart))
+		if err != nil {
+			h.Stats.Inc("handler_write_rdma_commit_batch_errors")
+			return nil, err
+		}
+		if len(results) != len(entries) {
+			h.Stats.Inc("handler_write_rdma_commit_batch_errors")
+			return nil, ErrnoError{Errno: ErrnoIO, Msg: "rdma write commit batch returned mismatched result count"}
+		}
+		for _, result := range results {
+			if result.Status != 0 {
+				h.Stats.Inc("handler_write_rdma_commit_batch_entry_errors")
+			}
+		}
+		reply := &swvfsproto.Reply{
+			Tag:  req.Header.Tag,
+			Data: swvfsproto.EncodeRDMAWriteCommitResults(results),
+		}
+		if attr != nil {
+			reply.Attr = *attr
+		}
+		return reply, nil
 	case swvfsproto.OpRDMAReleaseRead:
 		backend, ok := h.Backend.(RDMAReadDescriptorReleaseBackend)
 		if !ok {
@@ -525,4 +578,32 @@ func ReplyForError(tag uint64, err error) *swvfsproto.Reply {
 		return swvfsproto.ErrorReply(tag, errno.Errno)
 	}
 	return swvfsproto.ErrorReply(tag, ErrnoIO)
+}
+
+func ErrnoForError(err error) int32 {
+	if err == nil {
+		return 0
+	}
+	var errno ErrnoError
+	if errors.As(err, &errno) {
+		return errno.Errno
+	}
+	return ErrnoIO
+}
+
+func commitWriteRDMABatchSlow(ctx context.Context, backend RDMAWriteDescriptorBackend, path string, entries []swvfsproto.RDMAWriteCommitEntry) ([]swvfsproto.RDMAWriteCommitResult, *swvfsproto.Attr, error) {
+	results := make([]swvfsproto.RDMAWriteCommitResult, len(entries))
+	var lastAttr *swvfsproto.Attr
+	for i, entry := range entries {
+		attr, err := backend.CommitWriteRDMA(ctx, path, entry.Offset, entry.Size)
+		results[i] = swvfsproto.RDMAWriteCommitResult{
+			Offset: entry.Offset,
+			Size:   entry.Size,
+			Status: ErrnoForError(err),
+		}
+		if err == nil && attr != nil {
+			lastAttr = attr
+		}
+	}
+	return results, lastAttr, nil
 }
