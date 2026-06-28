@@ -6,6 +6,7 @@ gen: dev
 
 cgo ?= 0
 ldflags_extra ?= -extldflags -static
+rdma_tags ?= seaweedfs_rdmaverbs,5BytesOffset
 
 binary:
 	export SWCOMMIT=$(shell git rev-parse --short HEAD)
@@ -36,6 +37,9 @@ build_e2e: binary_race
 
 go_build: # make go_build tags=elastic,ydb,gocdk,hdfs,5BytesOffset,tarantool
 	docker build --build-arg TAGS=$(tags) --no-cache -t chrislusf/seaweedfs:go_build -f Dockerfile.go_build .
+
+go_build_rdma: # make go_build_rdma tags=seaweedfs_rdmaverbs,5BytesOffset image=kmbae27/seaweedfs:rdma-embedded
+	cd .. ; docker build --build-arg TAGS="$(or $(tags),$(rdma_tags))" --no-cache -t $(or $(image),chrislusf/seaweedfs:go_build_rdma) -f docker/Dockerfile.go_build_rdma .
 
 go_build_large_disk:
 	docker build --build-arg TAGS=large_disk --no-cache -t chrislusf/seaweedfs:large_disk -f Dockerfile.go_build .

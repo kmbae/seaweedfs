@@ -11,6 +11,7 @@ package weed_server
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #define SWRDMA_ABI_VERSION 1
 #define SWRDMA_LINK_INFINIBAND 1
@@ -19,6 +20,7 @@ package weed_server
 #define SWRDMA_REMOTE_F_GRH_REQUIRED (1U << 1)
 #define SWRDMA_MR_READ 1
 #define SWRDMA_MR_WRITE 2
+#define SWRDMA_MR_LOCAL 3
 
 typedef struct swrdma_endpoint {
 	uint32_t abi_version;
@@ -75,6 +77,7 @@ typedef struct swrdma_mr {
 } swrdma_mr;
 
 static void swrdma_close_conn(swrdma_conn *conn);
+static void swrdma_free_mr(swrdma_mr *mr);
 
 static void swrdma_set_error(char *err, size_t err_len, const char *fmt, ...) {
 	if (err == NULL || err_len == 0) {
@@ -391,6 +394,8 @@ static swrdma_mr *swrdma_alloc_mr(swrdma_conn *conn, size_t length, int kind, ch
 		access |= IBV_ACCESS_REMOTE_READ;
 	} else if (kind == SWRDMA_MR_WRITE) {
 		access |= IBV_ACCESS_REMOTE_WRITE;
+	} else if (kind == SWRDMA_MR_LOCAL) {
+		access |= IBV_ACCESS_LOCAL_WRITE;
 	} else {
 		free(addr);
 		swrdma_set_error(err, err_len, "unknown MR kind %d", kind);
@@ -417,6 +422,96 @@ static swrdma_mr *swrdma_alloc_mr(swrdma_conn *conn, size_t length, int kind, ch
 	return out;
 }
 
+static uint64_t swrdma_now_ms(void) {
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ((uint64_t)ts.tv_sec * 1000ULL) + ((uint64_t)ts.tv_nsec / 1000000ULL);
+}
+
+static int swrdma_poll_completion(swrdma_conn *conn, uint64_t wr_id, uint64_t timeout_ms, enum ibv_wc_opcode expected_opcode, char *err, size_t err_len) {
+	uint64_t deadline = swrdma_now_ms() + (timeout_ms == 0 ? 5000 : timeout_ms);
+	struct timespec sleep_time;
+	sleep_time.tv_sec = 0;
+	sleep_time.tv_nsec = 50000;
+	for (;;) {
+		struct ibv_wc wc;
+		memset(&wc, 0, sizeof(wc));
+		int n = ibv_poll_cq(conn->cq, 1, &wc);
+		if (n < 0) {
+			swrdma_set_error(err, err_len, "ibv_poll_cq failed");
+			return -1;
+		}
+		if (n > 0) {
+			if (wc.wr_id != wr_id) {
+				swrdma_set_error(err, err_len, "unexpected RDMA completion wr_id=%llu expected=%llu", (unsigned long long)wc.wr_id, (unsigned long long)wr_id);
+				return -1;
+			}
+			if (wc.status != IBV_WC_SUCCESS) {
+				swrdma_set_error(err, err_len, "RDMA completion failed status=%d vendor_err=%u", wc.status, wc.vendor_err);
+				return -1;
+			}
+			if (wc.opcode != expected_opcode) {
+				swrdma_set_error(err, err_len, "unexpected RDMA completion opcode=%d expected=%d", wc.opcode, expected_opcode);
+				return -1;
+			}
+			return 0;
+		}
+		if (swrdma_now_ms() > deadline) {
+			swrdma_set_error(err, err_len, "timed out waiting for RDMA completion wr_id=%llu", (unsigned long long)wr_id);
+			return -1;
+		}
+		nanosleep(&sleep_time, NULL);
+	}
+}
+
+static swrdma_mr *swrdma_read_remote(swrdma_conn *conn, uint64_t remote_addr, uint32_t rkey, size_t length, uint64_t timeout_ms, char *err, size_t err_len) {
+	if (conn == NULL || conn->qp == NULL) {
+		swrdma_set_error(err, err_len, "RDMA connection is not open");
+		return NULL;
+	}
+	if (!conn->connected || conn->qp_state != IBV_QPS_RTS) {
+		swrdma_set_error(err, err_len, "RDMA READ requires connected RTS QP");
+		return NULL;
+	}
+	if (remote_addr == 0 || length == 0) {
+		swrdma_set_error(err, err_len, "RDMA READ requires non-empty remote descriptor");
+		return NULL;
+	}
+
+	swrdma_mr *local = swrdma_alloc_mr(conn, length, SWRDMA_MR_LOCAL, err, err_len);
+	if (local == NULL) {
+		return NULL;
+	}
+
+	struct ibv_sge sge;
+	memset(&sge, 0, sizeof(sge));
+	sge.addr = (uintptr_t)local->addr;
+	sge.length = (uint32_t)length;
+	sge.lkey = local->lkey;
+
+	struct ibv_send_wr wr;
+	memset(&wr, 0, sizeof(wr));
+	struct ibv_send_wr *bad_wr = NULL;
+	wr.wr_id = (uint64_t)(uintptr_t)local;
+	wr.sg_list = &sge;
+	wr.num_sge = 1;
+	wr.opcode = IBV_WR_RDMA_READ;
+	wr.send_flags = IBV_SEND_SIGNALED;
+	wr.wr.rdma.remote_addr = remote_addr;
+	wr.wr.rdma.rkey = rkey;
+
+	if (ibv_post_send(conn->qp, &wr, &bad_wr) != 0) {
+		swrdma_set_error(err, err_len, "ibv_post_send RDMA_READ failed: %s", strerror(errno));
+		swrdma_free_mr(local);
+		return NULL;
+	}
+	if (swrdma_poll_completion(conn, wr.wr_id, timeout_ms, IBV_WC_RDMA_READ, err, err_len) != 0) {
+		swrdma_free_mr(local);
+		return NULL;
+	}
+	return local;
+}
+
 static void swrdma_free_mr(swrdma_mr *mr) {
 	if (mr == NULL) {
 		return;
@@ -438,6 +533,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 	"unsafe"
 )
 
@@ -547,6 +643,71 @@ func (t *embeddedVolumeRdmaTransport) ConnectEndpointFor(ctx context.Context, co
 	conn.endpoint.QPConnected = true
 	conn.endpoint.QPState = uint32(C.IBV_QPS_RTS)
 	return nil
+}
+
+func (t *embeddedVolumeRdmaTransport) RequesterLocalEndpoint(ctx context.Context) (VolumeRdmaEndpointInfo, error) {
+	endpoint, _, err := t.RequesterLocalEndpointFor(ctx, 1)
+	return endpoint, err
+}
+
+func (t *embeddedVolumeRdmaTransport) RequesterLocalEndpointFor(ctx context.Context, connectionID uint64) (VolumeRdmaEndpointInfo, uint64, error) {
+	return t.LocalEndpointFor(ctx, connectionID)
+}
+
+func (t *embeddedVolumeRdmaTransport) RequesterConnectEndpoint(ctx context.Context, remote VolumeRdmaRemoteInfo) error {
+	return t.RequesterConnectEndpointFor(ctx, 1, remote)
+}
+
+func (t *embeddedVolumeRdmaTransport) RequesterConnectEndpointFor(ctx context.Context, connectionID uint64, remote VolumeRdmaRemoteInfo) error {
+	return t.ConnectEndpointFor(ctx, connectionID, remote)
+}
+
+func (t *embeddedVolumeRdmaTransport) ReadRemoteFor(ctx context.Context, connectionID uint64, desc VolumeRdmaDataDesc, timeout time.Duration) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if connectionID == 0 {
+		return nil, fmt.Errorf("embedded RDMA read_remote requires connection_id")
+	}
+	if desc.RemoteAddr == 0 || desc.Length == 0 {
+		return nil, fmt.Errorf("embedded RDMA read_remote requires non-empty descriptor")
+	}
+	if desc.Length > volumeRdmaEngineMaxFrameSize {
+		return nil, fmt.Errorf("embedded RDMA read_remote frame too large: %d bytes", desc.Length)
+	}
+	timeoutMs := uint64(timeout.Milliseconds())
+	if timeoutMs == 0 && timeout > 0 {
+		timeoutMs = 1
+	}
+
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	conn, err := t.ensureConnectionLocked(connectionID)
+	if err != nil {
+		return nil, err
+	}
+	if !conn.connected {
+		return nil, fmt.Errorf("embedded RDMA connection %d is not connected", connectionID)
+	}
+	var errBuf [embeddedVolumeRdmaErrLen]C.char
+	mr := C.swrdma_read_remote(
+		conn.handle,
+		C.uint64_t(desc.RemoteAddr),
+		C.uint32_t(desc.RKey),
+		C.size_t(desc.Length),
+		C.uint64_t(timeoutMs),
+		&errBuf[0],
+		C.size_t(len(errBuf)),
+	)
+	if mr == nil {
+		return nil, fmt.Errorf("embedded RDMA read_remote: %s", cErrorString(&errBuf[0]))
+	}
+	defer C.swrdma_free_mr(mr)
+	data := C.GoBytes(mr.addr, C.int(mr.length))
+	if uint32(len(data)) < desc.Length {
+		return nil, fmt.Errorf("embedded RDMA read_remote returned %d bytes for %d byte descriptor", len(data), desc.Length)
+	}
+	return data[:int(desc.Length)], nil
 }
 
 func (t *embeddedVolumeRdmaTransport) RegisterReadBuffer(ctx context.Context, data []byte) (VolumeRdmaRegisteredBuffer, error) {

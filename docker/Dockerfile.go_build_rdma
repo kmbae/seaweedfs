@@ -1,0 +1,57 @@
+FROM golang:1.25-bookworm AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+      build-essential \
+      ca-certificates \
+      git \
+      libibverbs-dev \
+      pkg-config \
+      rdma-core \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /go/src/github.com/seaweedfs/seaweedfs
+COPY . .
+
+ARG TAGS=seaweedfs_rdmaverbs,5BytesOffset
+RUN cd weed \
+    && export LDFLAGS="-X github.com/seaweedfs/seaweedfs/weed/util/version.COMMIT=$(git rev-parse --short HEAD)" \
+    && CGO_ENABLED=1 GOOS=linux go install -tags "$TAGS" -ldflags "-s -w ${LDFLAGS}"
+
+FROM debian:bookworm-slim AS final
+LABEL author="Chris Lu"
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+      ca-certificates \
+      curl \
+      fuse3 \
+      gosu \
+      ibverbs-providers \
+      libibverbs1 \
+      libssl3 \
+      procps \
+      rdma-core \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd -g 1000 seaweed \
+    && useradd -u 1000 -g seaweed -M -s /usr/sbin/nologin seaweed \
+    && ln -s /usr/sbin/gosu /usr/local/bin/su-exec
+
+COPY --from=builder /go/bin/weed /usr/bin/weed
+RUN touch /usr/bin/weed-volume && chmod 0755 /usr/bin/weed /usr/bin/weed-volume
+
+RUN mkdir -p /etc/seaweedfs
+COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/filer.toml /etc/seaweedfs/filer.toml
+COPY --from=builder /go/src/github.com/seaweedfs/seaweedfs/docker/entrypoint.sh /entrypoint.sh
+
+EXPOSE 18080 8080 18888 8888 19333 9333 8333 7333
+
+RUN mkdir -p /data/filerldb2 \
+    && chown -R seaweed:seaweed /data /etc/seaweedfs \
+    && chmod 755 /entrypoint.sh
+
+VOLUME /data
+WORKDIR /data
+
+ENTRYPOINT ["/entrypoint.sh"]
+CMD ["mini", "-dir=/data"]
