@@ -58,6 +58,7 @@ type VolumeServer struct {
 	metricsAddress                string
 	metricsIntervalSec            int
 	fileSizeLimitBytes            int64
+	rdmaTransport                 string
 	rdmaEndpoint                  VolumeRdmaEndpoint
 	rdmaReadExporter              VolumeRdmaReadExporter
 	isHeartbeating                bool

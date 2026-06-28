@@ -77,6 +77,11 @@ type VolumeServerOptions struct {
 	allowUntrustedRemoteEndpoints *bool
 	rdmaEngineSocket              *string
 	rdmaEngineTimeout             *time.Duration
+	rdmaEmbedded                  *bool
+	rdmaEmbeddedFallbackSocket    *bool
+	rdmaDevice                    *string
+	rdmaPort                      *int
+	rdmaGIDIndex                  *int
 	rdmaReadMaxSizeMB             *int
 	rdmaReadLeaseTTL              *time.Duration
 	rdmaReadBufferSizeMB          *int
@@ -128,6 +133,11 @@ func init() {
 	v.allowUntrustedRemoteEndpoints = cmdVolume.Flag.Bool("volume.allowUntrustedRemoteEndpoints", false, "if true, FetchAndWriteNeedle accepts arbitrary remote S3 endpoints including loopback / link-local hosts. Default rejects internal / metadata endpoints.")
 	v.rdmaEngineSocket = cmdVolume.Flag.String("volume.rdma.engineSocket", "", "<experimental> Unix socket for the native volume RDMA engine")
 	v.rdmaEngineTimeout = cmdVolume.Flag.Duration("volume.rdma.engineTimeout", 5*time.Second, "<experimental> timeout for native volume RDMA engine IPC")
+	v.rdmaEmbedded = cmdVolume.Flag.Bool("volume.rdma.embedded", false, "<experimental> use in-process embedded native volume RDMA transport")
+	v.rdmaEmbeddedFallbackSocket = cmdVolume.Flag.Bool("volume.rdma.embeddedFallbackSocket", true, "<experimental> fall back to -volume.rdma.engineSocket when embedded RDMA is unavailable")
+	v.rdmaDevice = cmdVolume.Flag.String("volume.rdma.device", "auto", "<experimental> RDMA device name for embedded native volume RDMA")
+	v.rdmaPort = cmdVolume.Flag.Int("volume.rdma.port", 1, "<experimental> RDMA HCA port for embedded native volume RDMA")
+	v.rdmaGIDIndex = cmdVolume.Flag.Int("volume.rdma.gidIndex", 0, "<experimental> RDMA GID index for embedded native volume RDMA")
 	v.rdmaReadMaxSizeMB = cmdVolume.Flag.Int("volume.rdma.readMaxSizeMB", 16, "<experimental> max native volume RDMA read descriptor size in MiB")
 	v.rdmaReadLeaseTTL = cmdVolume.Flag.Duration("volume.rdma.readLeaseTTL", 30*time.Second, "<experimental> native volume RDMA read lease TTL")
 	v.rdmaReadBufferSizeMB = cmdVolume.Flag.Int("volume.rdma.readBufferSizeMB", 1, "<experimental> buffer size used while filling native volume RDMA read leases in MiB")
@@ -322,15 +332,33 @@ func (v VolumeServerOptions) startVolumeServer(volumeFolders, maxVolumeCounts, v
 		*v.ldbTimeout,
 		*v.allowUntrustedRemoteEndpoints,
 	)
-	if v.rdmaEngineSocket != nil && strings.TrimSpace(*v.rdmaEngineSocket) != "" {
-		if err := volumeServer.ConfigureRdmaEngine(strings.TrimSpace(*v.rdmaEngineSocket), *v.rdmaEngineTimeout, weed_server.VolumeRdmaReadExporterConfig{
-			MaxSize:        uint64(nonNegativeInt(*v.rdmaReadMaxSizeMB)) << 20,
-			LeaseTTL:       *v.rdmaReadLeaseTTL,
-			ReadBufferSize: nonNegativeInt(*v.rdmaReadBufferSizeMB) << 20,
-		}); err != nil {
-			glog.Fatalf("configure native volume RDMA engine: %v", err)
+	rdmaTransport := ""
+	if v.rdmaEmbedded != nil && *v.rdmaEmbedded {
+		rdmaTransport = weed_server.VolumeRdmaTransportEmbedded
+	} else if v.rdmaEngineSocket != nil && strings.TrimSpace(*v.rdmaEngineSocket) != "" {
+		rdmaTransport = weed_server.VolumeRdmaTransportSocket
+	}
+	if rdmaTransport != "" {
+		cfg := weed_server.VolumeRdmaTransportConfig{
+			Transport:              rdmaTransport,
+			EngineSocket:           strings.TrimSpace(*v.rdmaEngineSocket),
+			EngineTimeout:          *v.rdmaEngineTimeout,
+			EmbeddedFallbackSocket: *v.rdmaEmbeddedFallbackSocket,
+			Embedded: weed_server.VolumeRdmaEmbeddedConfig{
+				Device:   strings.TrimSpace(*v.rdmaDevice),
+				Port:     uint32(nonNegativeInt(*v.rdmaPort)),
+				GIDIndex: uint32(nonNegativeInt(*v.rdmaGIDIndex)),
+			},
+			ReadExporter: weed_server.VolumeRdmaReadExporterConfig{
+				MaxSize:        uint64(nonNegativeInt(*v.rdmaReadMaxSizeMB)) << 20,
+				LeaseTTL:       *v.rdmaReadLeaseTTL,
+				ReadBufferSize: nonNegativeInt(*v.rdmaReadBufferSizeMB) << 20,
+			},
 		}
-		glog.V(0).Infof("native volume RDMA engine enabled via %s", strings.TrimSpace(*v.rdmaEngineSocket))
+		if err := volumeServer.ConfigureRdmaTransport(cfg); err != nil {
+			glog.Fatalf("configure native volume RDMA transport: %v", err)
+		}
+		glog.V(0).Infof("native volume RDMA transport enabled: %s", volumeServer.RdmaTransport())
 	}
 	// starting grpc server
 	grpcS := v.startGrpcService(volumeServer)

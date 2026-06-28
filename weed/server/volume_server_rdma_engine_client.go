@@ -75,17 +75,12 @@ func NewVolumeRdmaEngineClient(socketPath string, timeout time.Duration) *Volume
 }
 
 func (vs *VolumeServer) ConfigureRdmaEngine(socketPath string, timeout time.Duration, cfg VolumeRdmaReadExporterConfig) error {
-	if vs == nil {
-		return fmt.Errorf("volume server is nil")
-	}
-	socketPath = strings.TrimSpace(socketPath)
-	if socketPath == "" {
-		return fmt.Errorf("native RDMA engine socket path is required")
-	}
-	client := NewVolumeRdmaEngineClient(socketPath, timeout)
-	vs.SetRdmaEndpoint(client)
-	vs.SetRdmaReadExporter(NewVolumeStoreRdmaReadExporter(vs.store, client, cfg))
-	return nil
+	return vs.ConfigureRdmaTransport(VolumeRdmaTransportConfig{
+		Transport:     VolumeRdmaTransportSocket,
+		EngineSocket:  socketPath,
+		EngineTimeout: timeout,
+		ReadExporter:  cfg,
+	})
 }
 
 func (c *VolumeRdmaEngineClient) LocalEndpoint(ctx context.Context) (VolumeRdmaEndpointInfo, error) {

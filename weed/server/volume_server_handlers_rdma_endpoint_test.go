@@ -105,6 +105,7 @@ func TestVolumeRdmaStatusHandlerReportsConfiguration(t *testing.T) {
 	vs := &VolumeServer{
 		rdmaEndpoint:     &fakeVolumeRdmaEndpoint{},
 		rdmaReadExporter: &fakeVolumeRdmaReadExporter{},
+		rdmaTransport:    VolumeRdmaTransportSocket,
 	}
 	req := httptest.NewRequest(http.MethodGet, VolumeRdmaNativeStatusPath, nil)
 	rec := httptest.NewRecorder()
@@ -120,6 +121,9 @@ func TestVolumeRdmaStatusHandlerReportsConfiguration(t *testing.T) {
 	}
 	if !resp.EndpointConfigured || !resp.ReadExporterConfigured {
 		t.Fatalf("unexpected status response: %+v", resp)
+	}
+	if resp.Transport != VolumeRdmaTransportSocket {
+		t.Fatalf("transport = %q, want %q", resp.Transport, VolumeRdmaTransportSocket)
 	}
 	if resp.LocalPath != VolumeRdmaNativeLocalPath || resp.ConnectPath != VolumeRdmaNativeConnectPath || resp.WriteCommitBatchPath != VolumeRdmaNativeWriteCommitBatchPath {
 		t.Fatalf("unexpected endpoint paths: %+v", resp)

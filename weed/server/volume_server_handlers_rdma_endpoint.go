@@ -89,6 +89,7 @@ type VolumeRdmaRemoteInfo struct {
 type volumeRdmaNativeStatusResponse struct {
 	ReadExporterConfigured bool   `json:"read_exporter_configured"`
 	EndpointConfigured     bool   `json:"endpoint_configured"`
+	Transport              string `json:"transport,omitempty"`
 	ABIVersion             uint32 `json:"abi_version"`
 	StatusPath             string `json:"status_path"`
 	LocalPath              string `json:"local_path"`
@@ -152,9 +153,14 @@ func (vs *VolumeServer) volumeRdmaStatusHandler(w http.ResponseWriter, r *http.R
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	transport := ""
+	if vs != nil {
+		transport = vs.rdmaTransport
+	}
 	writeJsonQuiet(w, r, http.StatusOK, volumeRdmaNativeStatusResponse{
 		ReadExporterConfigured: vs != nil && vs.rdmaReadExporter != nil,
 		EndpointConfigured:     vs != nil && vs.rdmaEndpoint != nil,
+		Transport:              transport,
 		ABIVersion:             VolumeRdmaABIVersion,
 		StatusPath:             VolumeRdmaNativeStatusPath,
 		LocalPath:              VolumeRdmaNativeLocalPath,
