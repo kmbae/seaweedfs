@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"syscall"
 	"testing"
 	"time"
 
@@ -201,6 +202,92 @@ func TestVolumeNativeRDMAReadDescriptorClientConnectsNativePeer(t *testing.T) {
 	}
 	if postedLocal.QPNum != 111 || postedLocal.LID != 0x11 {
 		t.Fatalf("posted local endpoint = %+v", postedLocal)
+	}
+}
+
+func TestVolumeNativePeerManagerRetriesEAGAINWithFreshLocal(t *testing.T) {
+	var (
+		localRequests   int
+		connectRequests int
+		postedLocal     RDMALocalEndpoint
+	)
+	remoteEndpoints := []RDMALocalEndpoint{
+		{
+			ConnectionID:  55,
+			ABIVersion:    swvfsproto.RDMAABIVersion,
+			KernelEnabled: true,
+			EndpointReady: true,
+			Device:        "mlx5_0",
+			Port:          1,
+			QPNum:         222,
+			PSN:           0x222222,
+			LID:           0x22,
+			LinkLayer:     swvfsproto.RDMALinkInfiniBand,
+		},
+		{
+			ConnectionID:  56,
+			ABIVersion:    swvfsproto.RDMAABIVersion,
+			KernelEnabled: true,
+			EndpointReady: true,
+			Device:        "mlx5_0",
+			Port:          1,
+			QPNum:         333,
+			PSN:           0x333333,
+			LID:           0x22,
+			LinkLayer:     swvfsproto.RDMALinkInfiniBand,
+		},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case VolumeRDMALocalPath:
+			idx := localRequests
+			localRequests++
+			if idx >= len(remoteEndpoints) {
+				idx = len(remoteEndpoints) - 1
+			}
+			writeJSON(w, remoteEndpoints[idx])
+		case VolumeRDMAConnectPath:
+			connectRequests++
+			if r.URL.Query().Get("connection_id") != "56" {
+				t.Errorf("connection_id = %q", r.URL.Query().Get("connection_id"))
+			}
+			if err := json.NewDecoder(r.Body).Decode(&postedLocal); err != nil {
+				t.Errorf("decode connect request: %v", err)
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			writeJSON(w, map[string]bool{"connected": true})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	control := &fakeRDMAControl{
+		locals: []swvfsproto.RDMALocalInfo{
+			readyInfo(0x11, 111, 0x111111),
+			readyInfo(0x11, 112, 0x111112),
+		},
+		connectErrs: []error{syscall.EAGAIN, nil},
+	}
+	manager := &VolumeNativePeerManager{
+		Client:       server.Client(),
+		Control:      control,
+		ServiceLevel: 2,
+		Stats:        NewStats(),
+	}
+	peer, err := manager.Ensure(context.Background(), server.URL+"/3,01637037d6")
+	if err != nil {
+		t.Fatalf("Ensure: %v", err)
+	}
+	if peer.VolumeConnectionID != 56 {
+		t.Fatalf("connection id = %d, want 56", peer.VolumeConnectionID)
+	}
+	if control.connectCalls != 2 || localRequests != 2 || connectRequests != 1 {
+		t.Fatalf("calls connect/local/post = %d/%d/%d, want 2/2/1", control.connectCalls, localRequests, connectRequests)
+	}
+	if postedLocal.QPNum != 112 || postedLocal.PSN != 0x111112 {
+		t.Fatalf("posted stale local endpoint after retry: %+v", postedLocal)
 	}
 }
 

@@ -11,9 +11,14 @@ import (
 )
 
 type fakeRDMAControl struct {
-	local     swvfsproto.RDMALocalInfo
-	remote    swvfsproto.RDMARemoteInfo
-	connected bool
+	local       swvfsproto.RDMALocalInfo
+	locals      []swvfsproto.RDMALocalInfo
+	remote      swvfsproto.RDMARemoteInfo
+	connectErrs []error
+	connected   bool
+
+	getLocalCalls int
+	connectCalls  int
 }
 
 type fakeReadStager struct {
@@ -41,11 +46,27 @@ type fakeWriteStager struct {
 }
 
 func (f *fakeRDMAControl) GetLocal() (swvfsproto.RDMALocalInfo, error) {
+	defer func() { f.getLocalCalls++ }()
+	if len(f.locals) > 0 {
+		idx := f.getLocalCalls
+		if idx >= len(f.locals) {
+			idx = len(f.locals) - 1
+		}
+		return f.locals[idx], nil
+	}
 	return f.local, nil
 }
 
 func (f *fakeRDMAControl) Connect(remote swvfsproto.RDMARemoteInfo) error {
+	f.connectCalls++
 	f.remote = remote
+	if len(f.connectErrs) > 0 {
+		err := f.connectErrs[0]
+		f.connectErrs = f.connectErrs[1:]
+		if err != nil {
+			return err
+		}
+	}
 	f.connected = true
 	return nil
 }

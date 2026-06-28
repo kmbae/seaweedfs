@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"net/url"
 	"sync"
 	"time"
 
@@ -15,16 +14,13 @@ import (
 type NativeVolumeWriteDescriptorClient struct {
 	Client       *http.Client
 	Control      swvfsdaemon.RDMAPeerConnectorControl
+	PeerManager  *swvfsdaemon.VolumeNativePeerManager
 	Timeout      time.Duration
 	ServiceLevel uint32
 	Stats        *swvfsdaemon.Stats
 
 	peerMu sync.Mutex
-	peers  map[string]nativeVolumeWritePeer
-}
-
-type nativeVolumeWritePeer struct {
-	VolumeConnectionID uint64
+	peer   *swvfsdaemon.VolumeNativePeerManager
 }
 
 type nativeVolumeWriteKey struct {
@@ -239,57 +235,39 @@ func (c *NativeVolumeWriteDescriptorClient) AbortNeedleWriteRDMA(ctx context.Con
 	return nil
 }
 
-func (c *NativeVolumeWriteDescriptorClient) ensureVolumeNativePeer(ctx context.Context, volumeServer string) (nativeVolumeWritePeer, error) {
-	if c == nil || c.Control == nil {
-		return nativeVolumeWritePeer{}, fmt.Errorf("kernel RDMA control is not configured")
+func (c *NativeVolumeWriteDescriptorClient) ensureVolumeNativePeer(ctx context.Context, volumeServer string) (swvfsdaemon.VolumeNativePeer, error) {
+	manager := c.volumeNativePeerManager()
+	if manager == nil {
+		return swvfsdaemon.VolumeNativePeer{}, fmt.Errorf("kernel RDMA control is not configured")
 	}
-	key := nativeVolumeServerKey(volumeServer)
+	peer, err := manager.Ensure(ctx, volumeServer)
+	if err == nil && peer.VolumeConnectionID != 0 {
+		c.Stats.Inc("volume_native_rdma_write_peer_connect_success")
+	}
+	return peer, err
+}
+
+func (c *NativeVolumeWriteDescriptorClient) volumeNativePeerManager() *swvfsdaemon.VolumeNativePeerManager {
+	if c == nil {
+		return nil
+	}
+	if c.PeerManager != nil {
+		return c.PeerManager
+	}
+	if c.Control == nil {
+		return nil
+	}
 	c.peerMu.Lock()
-	if c.peers != nil {
-		if peer, ok := c.peers[key]; ok {
-			c.peerMu.Unlock()
-			return peer, nil
+	defer c.peerMu.Unlock()
+	if c.peer == nil {
+		c.peer = &swvfsdaemon.VolumeNativePeerManager{
+			Client:       c.Client,
+			Control:      c.Control,
+			ServiceLevel: c.ServiceLevel,
+			Stats:        c.Stats,
 		}
 	}
-	c.peerMu.Unlock()
-
-	localInfo, err := c.Control.GetLocal()
-	if err != nil {
-		return nativeVolumeWritePeer{}, err
-	}
-	local := swvfsdaemon.RDMALocalEndpointFromInfo(localInfo)
-	if !local.ReadyForConnect() {
-		return nativeVolumeWritePeer{}, fmt.Errorf("local kernel RDMA endpoint is not ready: qpn=%d lid=%d flags=0x%x", local.QPNum, local.LID, local.Flags)
-	}
-	remote, err := swvfsdaemon.FetchVolumeNativeEndpoint(ctx, c.Client, volumeServer)
-	if err != nil {
-		return nativeVolumeWritePeer{}, err
-	}
-	if !remote.ReadyForConnect() {
-		return nativeVolumeWritePeer{}, fmt.Errorf("volume RDMA endpoint is not ready: qpn=%d lid=%d flags=0x%x", remote.QPNum, remote.LID, remote.Flags)
-	}
-	if c.ServiceLevel > 15 {
-		return nativeVolumeWritePeer{}, fmt.Errorf("RDMA service level must be 0..15")
-	}
-	remoteInfo, err := remote.RemoteInfo(c.ServiceLevel)
-	if err != nil {
-		return nativeVolumeWritePeer{}, err
-	}
-	if err := c.Control.Connect(remoteInfo); err != nil {
-		return nativeVolumeWritePeer{}, err
-	}
-	if err := swvfsdaemon.PostVolumeNativeConnectFor(ctx, c.Client, volumeServer, remote.ConnectionID, local, c.ServiceLevel); err != nil {
-		return nativeVolumeWritePeer{}, err
-	}
-	peer := nativeVolumeWritePeer{VolumeConnectionID: remote.ConnectionID}
-	c.peerMu.Lock()
-	if c.peers == nil {
-		c.peers = make(map[string]nativeVolumeWritePeer)
-	}
-	c.peers[key] = peer
-	c.peerMu.Unlock()
-	c.Stats.Inc("volume_native_rdma_write_peer_connect_success")
-	return peer, nil
+	return c.peer
 }
 
 func (c *NativeVolumeWriteDescriptorClient) timeout() time.Duration {
@@ -297,30 +275,4 @@ func (c *NativeVolumeWriteDescriptorClient) timeout() time.Duration {
 		return 5 * time.Second
 	}
 	return c.Timeout
-}
-
-func nativeVolumeServerKey(volumeServer string) string {
-	if volumeServer == "" {
-		return ""
-	}
-	if !hasURLScheme(volumeServer) {
-		volumeServer = "http://" + volumeServer
-	}
-	u, err := url.Parse(volumeServer)
-	if err != nil {
-		return volumeServer
-	}
-	return u.Scheme + "://" + u.Host
-}
-
-func hasURLScheme(raw string) bool {
-	for i := 0; i < len(raw); i++ {
-		switch raw[i] {
-		case ':':
-			return i > 0
-		case '/', '?', '#':
-			return false
-		}
-	}
-	return false
 }

@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"seaweedfs-rdma-sidecar/pkg/swvfsproto"
@@ -131,6 +132,7 @@ type VolumeRDMAStatusResponse struct {
 type VolumeNativeRDMAReadDescriptorClient struct {
 	Client       *http.Client
 	Control      RDMAPeerConnectorControl
+	PeerManager  *VolumeNativePeerManager
 	Timeout      time.Duration
 	ReleaseDelay time.Duration
 	ServiceLevel uint32
@@ -141,7 +143,7 @@ type VolumeNativeRDMAReadDescriptorClient struct {
 	leases      map[uint64]volumeNativeReadLease
 
 	peerMu sync.Mutex
-	peers  map[string]volumeNativePeer
+	peer   *VolumeNativePeerManager
 }
 
 type volumeNativeReadLease struct {
@@ -150,8 +152,21 @@ type volumeNativeReadLease struct {
 	Created      time.Time
 }
 
-type volumeNativePeer struct {
+type VolumeNativePeer struct {
 	VolumeConnectionID uint64
+	LocalQPNum         uint32
+	LocalPSN           uint32
+	LocalLID           uint32
+}
+
+type VolumeNativePeerManager struct {
+	Client       *http.Client
+	Control      RDMAPeerConnectorControl
+	ServiceLevel uint32
+	Stats        *Stats
+
+	mu    sync.Mutex
+	peers map[string]VolumeNativePeer
 }
 
 func MarkNativeReadLease(leaseID uint64) uint64 {
@@ -238,59 +253,137 @@ func (c *VolumeNativeRDMAReadDescriptorClient) ReadNeedleRDMA(ctx context.Contex
 	return desc, attr, nil
 }
 
-func (c *VolumeNativeRDMAReadDescriptorClient) ensureVolumeNativePeer(ctx context.Context, volumeServer string) (volumeNativePeer, error) {
-	if c == nil || c.Control == nil {
-		return volumeNativePeer{}, nil
+func (c *VolumeNativeRDMAReadDescriptorClient) ensureVolumeNativePeer(ctx context.Context, volumeServer string) (VolumeNativePeer, error) {
+	if c == nil {
+		return VolumeNativePeer{}, nil
 	}
-	key := volumeNativeServerKey(volumeServer)
+	manager := c.volumeNativePeerManager()
+	if manager == nil {
+		return VolumeNativePeer{}, nil
+	}
+	peer, err := manager.Ensure(ctx, volumeServer)
+	if err == nil && peer.VolumeConnectionID != 0 {
+		c.Stats.Inc("volume_native_rdma_peer_connect_success")
+	}
+	return peer, err
+}
+
+func (c *VolumeNativeRDMAReadDescriptorClient) volumeNativePeerManager() *VolumeNativePeerManager {
+	if c == nil {
+		return nil
+	}
+	if c.PeerManager != nil {
+		return c.PeerManager
+	}
+	if c.Control == nil {
+		return nil
+	}
 	c.peerMu.Lock()
-	if c.peers != nil {
-		if peer, ok := c.peers[key]; ok {
-			c.peerMu.Unlock()
-			return peer, nil
+	defer c.peerMu.Unlock()
+	if c.peer == nil {
+		c.peer = &VolumeNativePeerManager{
+			Client:       c.Client,
+			Control:      c.Control,
+			ServiceLevel: c.ServiceLevel,
+			Stats:        c.Stats,
 		}
 	}
-	c.peerMu.Unlock()
+	return c.peer
+}
 
-	localInfo, err := c.Control.GetLocal()
+func (m *VolumeNativePeerManager) Ensure(ctx context.Context, volumeServer string) (VolumeNativePeer, error) {
+	if m == nil || m.Control == nil {
+		return VolumeNativePeer{}, fmt.Errorf("kernel RDMA control is not configured")
+	}
+	key := volumeNativeServerKey(volumeServer)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.peers != nil {
+		if peer, ok := m.peers[key]; ok {
+			if m.cachedPeerStillLocal(peer) {
+				m.Stats.Inc("volume_native_rdma_peer_cache_hits")
+				return peer, nil
+			}
+			delete(m.peers, key)
+			m.Stats.Inc("volume_native_rdma_peer_cache_stale")
+		}
+	}
+
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		peer, err := m.connectOnce(ctx, volumeServer)
+		if err == nil {
+			if m.peers == nil {
+				m.peers = make(map[string]VolumeNativePeer)
+			}
+			m.peers[key] = peer
+			m.Stats.Inc("volume_native_rdma_peer_connect_success")
+			if attempt > 0 {
+				m.Stats.Add("volume_native_rdma_peer_connect_retry_success", uint64(attempt))
+			}
+			return peer, nil
+		}
+		lastErr = err
+		if !errors.Is(err, syscall.EAGAIN) {
+			break
+		}
+		m.Stats.Inc("volume_native_rdma_peer_connect_eagain_retries")
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("native volume RDMA peer handshake did not complete")
+	}
+	return VolumeNativePeer{}, lastErr
+}
+
+func (m *VolumeNativePeerManager) cachedPeerStillLocal(peer VolumeNativePeer) bool {
+	localInfo, err := m.Control.GetLocal()
 	if err != nil {
-		return volumeNativePeer{}, err
+		return false
+	}
+	local := RDMALocalEndpointFromInfo(localInfo)
+	return local.ReadyForConnect() &&
+		local.QPNum == peer.LocalQPNum &&
+		local.PSN == peer.LocalPSN &&
+		local.LID == peer.LocalLID
+}
+
+func (m *VolumeNativePeerManager) connectOnce(ctx context.Context, volumeServer string) (VolumeNativePeer, error) {
+	localInfo, err := m.Control.GetLocal()
+	if err != nil {
+		return VolumeNativePeer{}, err
 	}
 	local := RDMALocalEndpointFromInfo(localInfo)
 	if !local.ReadyForConnect() {
-		return volumeNativePeer{}, ErrnoError{Errno: ErrnoNoSys, Msg: fmt.Sprintf("local kernel RDMA endpoint is not ready: qpn=%d lid=%d flags=0x%x", local.QPNum, local.LID, local.Flags)}
+		return VolumeNativePeer{}, ErrnoError{Errno: ErrnoNoSys, Msg: fmt.Sprintf("local kernel RDMA endpoint is not ready: qpn=%d lid=%d flags=0x%x", local.QPNum, local.LID, local.Flags)}
 	}
-	remote, err := FetchVolumeNativeEndpoint(ctx, c.Client, volumeServer)
+	remote, err := FetchVolumeNativeEndpoint(ctx, m.Client, volumeServer)
 	if err != nil {
-		return volumeNativePeer{}, err
+		return VolumeNativePeer{}, err
 	}
 	if !remote.ReadyForConnect() {
-		return volumeNativePeer{}, ErrnoError{Errno: ErrnoNoSys, Msg: fmt.Sprintf("volume RDMA endpoint is not ready: qpn=%d lid=%d flags=0x%x", remote.QPNum, remote.LID, remote.Flags)}
+		return VolumeNativePeer{}, ErrnoError{Errno: ErrnoNoSys, Msg: fmt.Sprintf("volume RDMA endpoint is not ready: qpn=%d lid=%d flags=0x%x", remote.QPNum, remote.LID, remote.Flags)}
 	}
 
-	if c.ServiceLevel > 15 {
-		return volumeNativePeer{}, fmt.Errorf("RDMA service level must be 0..15")
+	if m.ServiceLevel > 15 {
+		return VolumeNativePeer{}, fmt.Errorf("RDMA service level must be 0..15")
 	}
-	remoteInfo, err := remote.RemoteInfo(c.ServiceLevel)
+	remoteInfo, err := remote.RemoteInfo(m.ServiceLevel)
 	if err != nil {
-		return volumeNativePeer{}, err
+		return VolumeNativePeer{}, err
 	}
-	if err := c.Control.Connect(remoteInfo); err != nil {
-		return volumeNativePeer{}, err
+	if err := m.Control.Connect(remoteInfo); err != nil {
+		return VolumeNativePeer{}, err
 	}
-	if err := PostVolumeNativeConnectFor(ctx, c.Client, volumeServer, remote.ConnectionID, local, c.ServiceLevel); err != nil {
-		return volumeNativePeer{}, err
+	if err := PostVolumeNativeConnectFor(ctx, m.Client, volumeServer, remote.ConnectionID, local, m.ServiceLevel); err != nil {
+		return VolumeNativePeer{}, err
 	}
-
-	peer := volumeNativePeer{VolumeConnectionID: remote.ConnectionID}
-	c.peerMu.Lock()
-	if c.peers == nil {
-		c.peers = make(map[string]volumeNativePeer)
-	}
-	c.peers[key] = peer
-	c.peerMu.Unlock()
-	c.Stats.Inc("volume_native_rdma_peer_connect_success")
-	return peer, nil
+	return VolumeNativePeer{
+		VolumeConnectionID: remote.ConnectionID,
+		LocalQPNum:         local.QPNum,
+		LocalPSN:           local.PSN,
+		LocalLID:           local.LID,
+	}, nil
 }
 
 func volumeNativePeerHandshakeError(err error) error {

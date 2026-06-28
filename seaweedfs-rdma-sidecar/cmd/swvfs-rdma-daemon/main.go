@@ -163,14 +163,21 @@ func run(cmd *cobra.Command, args []string) error {
 		Router: router,
 	}
 	if enableVolumeNativeRDMA {
+		volumeNativePeerManager := &swvfsdaemon.VolumeNativePeerManager{
+			Control:      rdmaControl,
+			ServiceLevel: rdmaPeerSL,
+			Stats:        stats,
+		}
 		backend.NativeReadDescriptor = &swvfsdaemon.VolumeNativeRDMAReadDescriptorClient{
 			Control:      rdmaControl,
+			PeerManager:  volumeNativePeerManager,
 			Timeout:      rdmaPeerTimeout,
 			ServiceLevel: rdmaPeerSL,
 			Stats:        stats,
 		}
 		backend.NativeWriteDescriptor = &swvfsfiler.NativeVolumeWriteDescriptorClient{
 			Control:      rdmaControl,
+			PeerManager:  volumeNativePeerManager,
 			Timeout:      rdmaPeerTimeout,
 			ServiceLevel: rdmaPeerSL,
 			Stats:        stats,
