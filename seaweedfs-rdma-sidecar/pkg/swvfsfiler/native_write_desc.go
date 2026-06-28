@@ -109,6 +109,59 @@ func (b *Backend) prepareWriteNativeRDMA(ctx context.Context, fullPath string, o
 	return desc, nil, nil
 }
 
+func (b *Backend) prepareWriteNativeRDMABatch(ctx context.Context, fullPath string, entries []swvfsproto.RDMAWriteCommitEntry) ([]swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
+	if b == nil || b.Store == nil || b.NativeWriteDescriptor == nil {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native volume rdma write descriptor backend is not configured"}
+	}
+	if len(entries) == 0 {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoInval, Msg: "native volume rdma write descriptor batch requires entries"}
+	}
+	fullPath = cleanFullPath(fullPath)
+	descs := make([]swvfsproto.RDMADataDesc, len(entries))
+	prepared := make([]nativeVolumeWriteKey, 0, len(entries))
+	var lastAttr *swvfsproto.Attr
+	cleanup := true
+	defer func() {
+		if !cleanup {
+			return
+		}
+		for _, key := range prepared {
+			lease, ok := b.popNativeWriteLease(key)
+			if ok && lease.SessionID != 0 {
+				_ = b.NativeWriteDescriptor.AbortNeedleWriteRDMA(context.Background(), lease.VolumeServer, lease.SessionID)
+			}
+		}
+	}()
+
+	b.NativeWriteDescriptor.Stats.Inc("volume_native_rdma_write_desc_batch_requests")
+	b.NativeWriteDescriptor.Stats.Add("volume_native_rdma_write_desc_batch_entries", uint64(len(entries)))
+	for i, entry := range entries {
+		desc, attr, err := b.prepareWriteNativeRDMA(ctx, fullPath, entry.Offset, entry.Size)
+		if err != nil {
+			b.NativeWriteDescriptor.Stats.Inc("volume_native_rdma_write_desc_batch_errors")
+			return nil, nil, err
+		}
+		if desc == nil {
+			b.NativeWriteDescriptor.Stats.Inc("volume_native_rdma_write_desc_batch_errors")
+			return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native volume rdma write descriptor batch returned no descriptor"}
+		}
+		descs[i] = *desc
+		descs[i].Length = uint32(entry.Size)
+		descs[i].Reserved[2] = entry.Offset
+		prepared = append(prepared, nativeVolumeWriteKey{
+			Path:   fullPath,
+			Offset: entry.Offset,
+			Size:   entry.Size,
+		})
+		if attr != nil {
+			lastAttr = attr
+		}
+	}
+	cleanup = false
+	b.NativeWriteDescriptor.Stats.Inc("volume_native_rdma_write_desc_batch_success")
+	return descs, lastAttr, nil
+}
+
 func (b *Backend) commitWriteNativeRDMA(ctx context.Context, fullPath string, offset, size uint64) (*swvfsproto.Attr, error) {
 	if b == nil || b.NativeWriteDescriptor == nil {
 		return nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "native volume rdma write descriptor backend is not configured"}

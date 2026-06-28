@@ -59,6 +59,10 @@ type RDMAWriteDescriptorBackend interface {
 	CommitWriteRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.Attr, error)
 }
 
+type RDMAWriteDescriptorBatchBackend interface {
+	PrepareWriteRDMABatch(ctx context.Context, path string, entries []swvfsproto.RDMAWriteCommitEntry) ([]swvfsproto.RDMADataDesc, *swvfsproto.Attr, error)
+}
+
 type RDMAWriteBatchCommitBackend interface {
 	CommitWriteRDMABatch(ctx context.Context, path string, entries []swvfsproto.RDMAWriteCommitEntry) ([]swvfsproto.RDMAWriteCommitResult, *swvfsproto.Attr, error)
 }
@@ -367,6 +371,70 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 			reply.Attr = *attr
 		}
 		return reply, nil
+	case swvfsproto.OpWriteRDMAPrepareBatch:
+		entries, err := swvfsproto.DecodeRDMAWriteCommitEntries(req.Data)
+		if err != nil {
+			return nil, ErrnoError{Errno: ErrnoInval, Msg: err.Error()}
+		}
+		if len(entries) == 0 {
+			return nil, ErrnoError{Errno: ErrnoInval, Msg: "rdma write prepare batch is empty"}
+		}
+		h.Stats.Inc("handler_write_rdma_prepare_batch_requests")
+		h.Stats.Add("handler_write_rdma_prepare_batch_entries", uint64(len(entries)))
+		var totalBytes uint64
+		for _, entry := range entries {
+			totalBytes += entry.Size
+			if !h.shouldUseRDMAWriteDescriptor(entry.Size) {
+				h.Stats.Inc("handler_write_rdma_prepare_batch_policy_too_small")
+				return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma write prepare batch entry below minimum size"}
+			}
+		}
+		h.Stats.Add("handler_write_rdma_prepare_batch_bytes", totalBytes)
+		prepareStart := time.Now()
+		var descs []swvfsproto.RDMADataDesc
+		var attr *swvfsproto.Attr
+		if batch, ok := h.Backend.(RDMAWriteDescriptorBatchBackend); ok {
+			descs, attr, err = batch.PrepareWriteRDMABatch(ctx, req.Path1, entries)
+		} else if single, ok := h.Backend.(RDMAWriteDescriptorBackend); ok {
+			descs, attr, err = PrepareWriteRDMABatchSlow(ctx, single, req.Path1, entries)
+		} else {
+			return nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma write prepare batch is not implemented"}
+		}
+		h.Stats.Observe("handler_write_rdma_prepare_batch", time.Since(prepareStart))
+		if err != nil {
+			h.Stats.Inc("handler_write_rdma_prepare_batch_errors")
+			return nil, err
+		}
+		if len(descs) != len(entries) {
+			h.Stats.Inc("handler_write_rdma_prepare_batch_errors")
+			return nil, ErrnoError{Errno: ErrnoIO, Msg: "rdma write prepare batch returned mismatched descriptor count"}
+		}
+		var descBytes uint64
+		for i := range descs {
+			if descs[i].Length == 0 {
+				h.Stats.Inc("handler_write_rdma_prepare_batch_errors")
+				return nil, ErrnoError{Errno: ErrnoIO, Msg: "rdma write prepare batch returned an empty descriptor"}
+			}
+			if uint64(descs[i].Length) < entries[i].Size {
+				h.Stats.Inc("handler_write_rdma_prepare_batch_errors")
+				return nil, ErrnoError{Errno: ErrnoIO, Msg: "rdma write prepare batch descriptor is smaller than requested entry"}
+			}
+			descs[i].Length = uint32(entries[i].Size)
+			descs[i].Reserved[2] = entries[i].Offset
+			descBytes += uint64(descs[i].Length)
+		}
+		h.Stats.Inc("handler_write_rdma_prepare_batch_replies")
+		h.Stats.Add("handler_write_rdma_prepare_batch_descs", uint64(len(descs)))
+		h.Stats.Add("handler_write_rdma_prepare_batch_desc_bytes", descBytes)
+		reply := &swvfsproto.Reply{
+			Tag:  req.Header.Tag,
+			EOF:  swvfsproto.ReplyFRDMAWriteDesc,
+			Data: swvfsproto.EncodeRDMADataDescs(descs),
+		}
+		if attr != nil {
+			reply.Attr = *attr
+		}
+		return reply, nil
 	case swvfsproto.OpWriteRDMACommit:
 		backend, ok := h.Backend.(RDMAWriteDescriptorBackend)
 		if !ok {
@@ -652,6 +720,26 @@ func ErrnoForError(err error) int32 {
 		return errno.Errno
 	}
 	return ErrnoIO
+}
+
+func PrepareWriteRDMABatchSlow(ctx context.Context, backend RDMAWriteDescriptorBackend, path string, entries []swvfsproto.RDMAWriteCommitEntry) ([]swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
+	descs := make([]swvfsproto.RDMADataDesc, len(entries))
+	var lastAttr *swvfsproto.Attr
+	for i, entry := range entries {
+		desc, attr, err := backend.PrepareWriteRDMA(ctx, path, entry.Offset, entry.Size)
+		if err != nil {
+			return nil, nil, err
+		}
+		if desc == nil {
+			return nil, nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma write prepare returned no descriptor"}
+		}
+		descs[i] = *desc
+		descs[i].Reserved[2] = entry.Offset
+		if attr != nil {
+			lastAttr = attr
+		}
+	}
+	return descs, lastAttr, nil
 }
 
 func commitWriteRDMABatchSlow(ctx context.Context, backend RDMAWriteDescriptorBackend, path string, entries []swvfsproto.RDMAWriteCommitEntry) ([]swvfsproto.RDMAWriteCommitResult, *swvfsproto.Attr, error) {

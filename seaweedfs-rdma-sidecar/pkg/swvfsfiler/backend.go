@@ -1007,6 +1007,24 @@ func (b *Backend) PrepareWriteRDMA(ctx context.Context, fullPath string, offset,
 	return b.WriteDescriptorBackend.PrepareWriteRDMA(ctx, cleanFullPath(fullPath), offset, size)
 }
 
+func (b *Backend) PrepareWriteRDMABatch(ctx context.Context, fullPath string, entries []swvfsproto.RDMAWriteCommitEntry) ([]swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
+	if b == nil {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma write descriptor backend is not configured"}
+	}
+	fullPath = cleanFullPath(fullPath)
+	if b.NativeWriteDescriptor != nil {
+		if descs, attr, err := b.prepareWriteNativeRDMABatch(ctx, fullPath, entries); err == nil {
+			return descs, attr, nil
+		} else if !isDescriptorFallback(err) {
+			return nil, nil, err
+		}
+	}
+	if b.WriteDescriptorBackend == nil {
+		return nil, nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma write descriptor backend is not configured"}
+	}
+	return swvfsdaemon.PrepareWriteRDMABatchSlow(ctx, b.WriteDescriptorBackend, fullPath, entries)
+}
+
 func (b *Backend) CommitWriteRDMA(ctx context.Context, fullPath string, offset, size uint64) (*swvfsproto.Attr, error) {
 	if b == nil {
 		return nil, swvfsdaemon.ErrnoError{Errno: swvfsdaemon.ErrnoNoSys, Msg: "rdma write descriptor backend is not configured"}

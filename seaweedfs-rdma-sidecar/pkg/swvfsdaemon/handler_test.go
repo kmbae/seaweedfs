@@ -37,26 +37,29 @@ type fakeXAttrBackend struct {
 
 type fakeRDMAFileBackend struct {
 	fakeFileBackend
-	readDesc         *swvfsproto.RDMADataDesc
-	readBatchDescs   []swvfsproto.RDMADataDesc
-	readDescPath     string
-	readDescOffset   uint64
-	readDescSize     uint64
-	readBatchMax     uint32
-	writeDesc        *swvfsproto.RDMADataDesc
-	preparePath      string
-	prepareOffset    uint64
-	prepareSize      uint64
-	commitPath       string
-	commitOffset     uint64
-	commitSize       uint64
-	batchPath        string
-	batchEntries     []swvfsproto.RDMAWriteCommitEntry
-	releaseLeaseID   uint64
-	releaseStatus    int32
-	releaseBytes     uint64
-	readDescFallback bool
-	readDescErr      error
+	readDesc            *swvfsproto.RDMADataDesc
+	readBatchDescs      []swvfsproto.RDMADataDesc
+	readDescPath        string
+	readDescOffset      uint64
+	readDescSize        uint64
+	readBatchMax        uint32
+	writeDesc           *swvfsproto.RDMADataDesc
+	writeBatchDescs     []swvfsproto.RDMADataDesc
+	preparePath         string
+	prepareOffset       uint64
+	prepareSize         uint64
+	prepareBatchPath    string
+	prepareBatchEntries []swvfsproto.RDMAWriteCommitEntry
+	commitPath          string
+	commitOffset        uint64
+	commitSize          uint64
+	batchPath           string
+	batchEntries        []swvfsproto.RDMAWriteCommitEntry
+	releaseLeaseID      uint64
+	releaseStatus       int32
+	releaseBytes        uint64
+	readDescFallback    bool
+	readDescErr         error
 }
 
 func (f *fakeFileBackend) ReadFile(ctx context.Context, path string, offset, size uint64, preferRDMA bool) ([]byte, *swvfsproto.Attr, error) {
@@ -112,6 +115,18 @@ func (f *fakeRDMAFileBackend) PrepareWriteRDMA(ctx context.Context, path string,
 	f.prepareOffset = offset
 	f.prepareSize = size
 	return f.writeDesc, &swvfsproto.Attr{Ino: 10, Size: offset + size, Mode: 0100644, Nlink: 1}, nil
+}
+
+func (f *fakeRDMAFileBackend) PrepareWriteRDMABatch(ctx context.Context, path string, entries []swvfsproto.RDMAWriteCommitEntry) ([]swvfsproto.RDMADataDesc, *swvfsproto.Attr, error) {
+	f.prepareBatchPath = path
+	f.prepareBatchEntries = append([]swvfsproto.RDMAWriteCommitEntry(nil), entries...)
+	descs := append([]swvfsproto.RDMADataDesc(nil), f.writeBatchDescs...)
+	var attr *swvfsproto.Attr
+	for i := range descs {
+		descs[i].Reserved[2] = entries[i].Offset
+		attr = &swvfsproto.Attr{Ino: 10, Size: entries[i].Offset + entries[i].Size, Mode: 0100644, Nlink: 1}
+	}
+	return descs, attr, nil
 }
 
 func (f *fakeRDMAFileBackend) CommitWriteRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.Attr, error) {
@@ -440,6 +455,42 @@ func TestHandlerRDMAWritePrepareCommit(t *testing.T) {
 	}
 	if commit.Attr.Size != 8704 || backend.commitPath != "/write-file" || backend.commitOffset != 512 || backend.commitSize != 8192 {
 		t.Fatalf("commit mismatch: attr=%+v path=%q off=%d size=%d", commit.Attr, backend.commitPath, backend.commitOffset, backend.commitSize)
+	}
+}
+
+func TestHandlerRDMAWritePrepareBatch(t *testing.T) {
+	backend := &fakeRDMAFileBackend{
+		writeBatchDescs: []swvfsproto.RDMADataDesc{
+			{RemoteAddr: 0x2000, RKey: 11, Length: 4096, Reserved: [4]uint64{101, 7}},
+			{RemoteAddr: 0x3000, RKey: 12, Length: 8192, Reserved: [4]uint64{102, 7}},
+		},
+	}
+	h := &Handler{Backend: backend}
+	entries := []swvfsproto.RDMAWriteCommitEntry{
+		{Offset: 0, Size: 4096},
+		{Offset: 4096, Size: 8192},
+	}
+
+	reply, err := h.Handle(context.Background(), &swvfsproto.Request{
+		Header: swvfsproto.RequestHeader{Tag: 17, Op: swvfsproto.OpWriteRDMAPrepareBatch},
+		Path1:  "/write-file",
+		Data:   swvfsproto.EncodeRDMAWriteCommitEntries(entries),
+	})
+	if err != nil {
+		t.Fatalf("batch prepare Handle: %v", err)
+	}
+	if reply.EOF&swvfsproto.ReplyFRDMAWriteDesc == 0 {
+		t.Fatalf("RDMA write desc flag not set: eof=0x%x", reply.EOF)
+	}
+	descs, err := swvfsproto.DecodeRDMADataDescs(reply.Data)
+	if err != nil {
+		t.Fatalf("DecodeRDMADataDescs: %v", err)
+	}
+	if backend.prepareBatchPath != "/write-file" || len(backend.prepareBatchEntries) != len(entries) {
+		t.Fatalf("backend batch prepare mismatch: path=%q entries=%+v", backend.prepareBatchPath, backend.prepareBatchEntries)
+	}
+	if len(descs) != len(entries) || descs[1].RemoteAddr != 0x3000 || descs[1].Length != 8192 || descs[1].Reserved[2] != entries[1].Offset {
+		t.Fatalf("batch descriptors mismatch: %+v", descs)
 	}
 }
 

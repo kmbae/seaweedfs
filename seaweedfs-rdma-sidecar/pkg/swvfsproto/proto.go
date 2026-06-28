@@ -31,12 +31,13 @@ const (
 	OpStatFS    uint32 = 21
 	OpLock      uint32 = 22
 
-	OpWriteRDMAPrepare     uint32 = 23
-	OpWriteRDMACommit      uint32 = 24
-	OpRDMAReleaseRead      uint32 = 25
-	OpRDMAReadPrepare      uint32 = 26
-	OpWriteRDMACommitBatch uint32 = 27
-	OpRDMAReadPrepareBatch uint32 = 28
+	OpWriteRDMAPrepare      uint32 = 23
+	OpWriteRDMACommit       uint32 = 24
+	OpRDMAReleaseRead       uint32 = 25
+	OpRDMAReadPrepare       uint32 = 26
+	OpWriteRDMACommitBatch  uint32 = 27
+	OpRDMAReadPrepareBatch  uint32 = 28
+	OpWriteRDMAPrepareBatch uint32 = 29
 )
 
 const (
