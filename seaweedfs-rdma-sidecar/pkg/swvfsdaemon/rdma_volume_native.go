@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -176,6 +177,18 @@ type VolumeNativePeer struct {
 	LocalQPNum         uint32
 	LocalPSN           uint32
 	LocalLID           uint32
+}
+
+type VolumeNativePeerStatus struct {
+	VolumeServer       string            `json:"volume_server"`
+	VolumeConnectionID uint64            `json:"volume_connection_id"`
+	LocalQPNum         uint32            `json:"local_qp_num"`
+	LocalPSN           uint32            `json:"local_psn"`
+	LocalLID           uint32            `json:"local_lid"`
+	Local              RDMALocalEndpoint `json:"local,omitempty"`
+	Ready              bool              `json:"ready"`
+	Connected          bool              `json:"connected"`
+	Error              string            `json:"error,omitempty"`
 }
 
 type VolumeNativePeerManager struct {
@@ -356,6 +369,46 @@ func (m *VolumeNativePeerManager) Ensure(ctx context.Context, volumeServer strin
 		lastErr = fmt.Errorf("native volume RDMA peer handshake did not complete")
 	}
 	return VolumeNativePeer{}, lastErr
+}
+
+func (m *VolumeNativePeerManager) Snapshot() []VolumeNativePeerStatus {
+	if m == nil {
+		return nil
+	}
+	m.mu.Lock()
+	peers := make(map[string]VolumeNativePeer, len(m.peers))
+	for key, peer := range m.peers {
+		peers[key] = peer
+	}
+	m.mu.Unlock()
+
+	keys := make([]string, 0, len(peers))
+	for key := range peers {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	out := make([]VolumeNativePeerStatus, 0, len(keys))
+	for _, key := range keys {
+		peer := peers[key]
+		status := VolumeNativePeerStatus{
+			VolumeServer:       key,
+			VolumeConnectionID: peer.VolumeConnectionID,
+			LocalQPNum:         peer.LocalQPNum,
+			LocalPSN:           peer.LocalPSN,
+			LocalLID:           peer.LocalLID,
+		}
+		localInfo, err := m.getLocalInfo(peer.VolumeConnectionID)
+		if err != nil {
+			status.Error = err.Error()
+		} else {
+			status.Local = RDMALocalEndpointFromInfo(localInfo)
+			status.Ready = status.Local.ReadyForConnect()
+			status.Connected = status.Local.QPConnected
+		}
+		out = append(out, status)
+	}
+	return out
 }
 
 func (m *VolumeNativePeerManager) cachedPeerStillLocal(peer VolumeNativePeer) bool {

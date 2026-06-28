@@ -25,6 +25,7 @@ const (
 	RDMAPeerWriteCommit     = "/rdma/write-commit"
 	RDMAPeerWriteAbort      = "/rdma/write-abort"
 	RDMAPeerWriteFlush      = "/rdma/write-flush"
+	RDMAPeerNativePeersPath = "/rdma/native-peers"
 )
 
 var ErrRDMAPeerUnpaired = errors.New("no deterministic RDMA pair selected")
@@ -141,6 +142,7 @@ type RDMAPeerControlServer struct {
 	Control     RDMAPeerConnectorControl
 	ReadStager  RDMAReadDescriptorStager
 	WriteStager RDMAWriteDescriptorBackend
+	NativePeers *VolumeNativePeerManager
 	Stats       *Stats
 }
 
@@ -154,6 +156,7 @@ func (s *RDMAPeerControlServer) Handler() http.Handler {
 	mux.HandleFunc(RDMAPeerWriteCommit, s.handleWriteCommit)
 	mux.HandleFunc(RDMAPeerWriteAbort, s.handleWriteAbort)
 	mux.HandleFunc(RDMAPeerWriteFlush, s.handleWriteFlush)
+	mux.HandleFunc(RDMAPeerNativePeersPath, s.handleNativePeers)
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNoContent)
 	})
@@ -212,6 +215,21 @@ func (s *RDMAPeerControlServer) handleConnect(w http.ResponseWriter, r *http.Req
 	}
 	s.Stats.Inc("peer_control_connect_success")
 	writeJSON(w, map[string]any{"connected": true})
+}
+
+func (s *RDMAPeerControlServer) handleNativePeers(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	s.Stats.Inc("peer_control_native_peers_requests")
+	if s.NativePeers == nil {
+		s.Stats.Inc("peer_control_native_peers_not_configured")
+		http.Error(w, "native volume RDMA peers are not configured", http.StatusNotImplemented)
+		return
+	}
+	s.Stats.Inc("peer_control_native_peers_success")
+	writeJSON(w, map[string]any{"peers": s.NativePeers.Snapshot()})
 }
 
 type RDMAPeerReadDescRequest struct {

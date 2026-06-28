@@ -2,6 +2,7 @@ package swvfsdaemon
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -250,6 +251,46 @@ func TestRDMAPeerControlServerWritePrepareCommit(t *testing.T) {
 	}
 	if stager.abortSession != 55 {
 		t.Fatalf("abort session = %d, want 55", stager.abortSession)
+	}
+}
+
+func TestRDMAPeerControlServerNativePeers(t *testing.T) {
+	local := readyInfo(7, 11, 13)
+	local.Flags |= swvfsproto.RDMAFQPConnected
+	manager := &VolumeNativePeerManager{
+		Control: &fakeRDMAControl{local: local},
+		peers: map[string]VolumeNativePeer{
+			"http://volume.example": {
+				VolumeConnectionID: 55,
+				LocalQPNum:         11,
+				LocalPSN:           13,
+				LocalLID:           7,
+			},
+		},
+	}
+	server := httptest.NewServer((&RDMAPeerControlServer{
+		Control:     &fakeRDMAControl{local: local},
+		NativePeers: manager,
+		Stats:       NewStats(),
+	}).Handler())
+	defer server.Close()
+
+	resp, err := server.Client().Get(server.URL + RDMAPeerNativePeersPath)
+	if err != nil {
+		t.Fatalf("GET native peers: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", resp.StatusCode)
+	}
+	var out struct {
+		Peers []VolumeNativePeerStatus `json:"peers"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("decode native peers: %v", err)
+	}
+	if len(out.Peers) != 1 || !out.Peers[0].Connected || out.Peers[0].VolumeConnectionID != 55 {
+		t.Fatalf("unexpected native peers response: %+v", out)
 	}
 }
 

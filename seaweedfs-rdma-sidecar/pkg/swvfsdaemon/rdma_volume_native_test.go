@@ -306,6 +306,38 @@ func TestVolumeNativePeerManagerRetriesEAGAINWithFreshLocal(t *testing.T) {
 	}
 }
 
+func TestVolumeNativePeerManagerSnapshotReportsConnectionLocal(t *testing.T) {
+	local := readyInfo(0x11, 111, 0x111111)
+	local.Flags |= swvfsproto.RDMAFQPConnected
+	control := &fakeRDMAControl{local: local}
+	manager := &VolumeNativePeerManager{
+		Control: control,
+		peers: map[string]VolumeNativePeer{
+			"http://volume.example": {
+				VolumeConnectionID: 55,
+				LocalQPNum:         111,
+				LocalPSN:           0x111111,
+				LocalLID:           0x11,
+			},
+		},
+	}
+
+	statuses := manager.Snapshot()
+	if len(statuses) != 1 {
+		t.Fatalf("statuses = %d, want 1", len(statuses))
+	}
+	status := statuses[0]
+	if status.VolumeServer != "http://volume.example" || status.VolumeConnectionID != 55 {
+		t.Fatalf("unexpected peer status key/id: %+v", status)
+	}
+	if !status.Ready || !status.Connected || status.Local.ConnectionID != 55 {
+		t.Fatalf("unexpected connection status: %+v", status)
+	}
+	if status.Local.QPNum != 111 || status.Local.LID != 0x11 {
+		t.Fatalf("unexpected local endpoint: %+v", status.Local)
+	}
+}
+
 func TestFetchVolumeNativeStatus(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != VolumeRDMAStatusPath {

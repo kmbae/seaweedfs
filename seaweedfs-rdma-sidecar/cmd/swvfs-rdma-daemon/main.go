@@ -162,8 +162,9 @@ func run(cmd *cobra.Command, args []string) error {
 		Store:  store,
 		Router: router,
 	}
+	var volumeNativePeerManager *swvfsdaemon.VolumeNativePeerManager
 	if enableVolumeNativeRDMA {
-		volumeNativePeerManager := &swvfsdaemon.VolumeNativePeerManager{
+		volumeNativePeerManager = &swvfsdaemon.VolumeNativePeerManager{
 			Control:      rdmaControl,
 			ServiceLevel: rdmaPeerSL,
 			Stats:        stats,
@@ -230,7 +231,7 @@ func run(cmd *cobra.Command, args []string) error {
 	if rdmaControlListen != "" {
 		server := &http.Server{
 			Addr:    rdmaControlListen,
-			Handler: (&swvfsdaemon.RDMAPeerControlServer{Control: rdmaControl, ReadStager: readStager, WriteStager: writeStager, Stats: stats}).Handler(),
+			Handler: (&swvfsdaemon.RDMAPeerControlServer{Control: rdmaControl, ReadStager: readStager, WriteStager: writeStager, NativePeers: volumeNativePeerManager, Stats: stats}).Handler(),
 		}
 		go func() {
 			logger.WithField("addr", rdmaControlListen).Info("starting RDMA peer-control server")
