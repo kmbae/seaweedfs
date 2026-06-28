@@ -31,6 +31,7 @@ func newTestClient(t *testing.T, handler http.Handler) (*RDMAMountClient, *httpt
 
 	client := &RDMAMountClient{
 		sidecarAddr:   addr,
+		mode:          rdmaMountModeSidecar,
 		maxConcurrent: 64,
 		timeout:       5 * time.Second,
 		httpClient:    server.Client(),
@@ -403,6 +404,13 @@ func TestRDMAMountClient_NativeReadNeedleTo(t *testing.T) {
 	if requester.lastReadID.Load() != 1 {
 		t.Fatalf("requester read connection id = %d, want 1", requester.lastReadID.Load())
 	}
+	stats := client.GetStats()
+	if stats["native_read_requests"].(int64) != 2 || stats["native_read_successes"].(int64) != 2 {
+		t.Fatalf("unexpected native read stats: %+v", stats)
+	}
+	if stats["native_read_bytes"].(int64) != int64(len(readPayload))*2 || stats["rdma_bytes_read"].(int64) != int64(len(readPayload))*2 {
+		t.Fatalf("unexpected native read bytes: %+v", stats)
+	}
 }
 
 func TestRDMAMountClient_WriteNeedle(t *testing.T) {
@@ -591,6 +599,17 @@ func TestRDMAMountClient_GetStats(t *testing.T) {
 	}
 	if stats["successful_reads"].(int64) != 1 {
 		t.Fatalf("unexpected successful reads: %v", stats["successful_reads"])
+	}
+	if stats["sidecar_read_requests"].(int64) != 1 || stats["sidecar_read_successes"].(int64) != 1 {
+		t.Fatalf("unexpected sidecar read stats: %+v", stats)
+	}
+	if stats["rdma_bytes_read"].(int64) != 4 || stats["sidecar_read_bytes"].(int64) != 4 {
+		t.Fatalf("unexpected RDMA read bytes: %+v", stats)
+	}
+	client.RecordFallbackRead(32, io.EOF)
+	stats = client.GetStats()
+	if stats["fallback_read_requests"].(int64) != 1 || stats["fallback_read_successes"].(int64) != 1 || stats["fallback_read_bytes"].(int64) != 32 {
+		t.Fatalf("unexpected fallback stats: %+v", stats)
 	}
 	if stats["successful_writes"].(int64) != 1 {
 		t.Fatalf("unexpected successful writes: %v", stats["successful_writes"])

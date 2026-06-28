@@ -113,6 +113,9 @@ func TestVolumeRdmaStatusHandlerReportsConfiguration(t *testing.T) {
 		rdmaReadExporter: &fakeVolumeRdmaReadExporter{},
 		rdmaTransport:    VolumeRdmaTransportSocket,
 	}
+	vs.rdmaStats.readDescRequests.Add(2)
+	vs.rdmaStats.readDescSuccesses.Add(1)
+	vs.rdmaStats.readDescBytes.Add(8192)
 	req := httptest.NewRequest(http.MethodGet, VolumeRdmaNativeStatusPath, nil)
 	rec := httptest.NewRecorder()
 
@@ -133,6 +136,9 @@ func TestVolumeRdmaStatusHandlerReportsConfiguration(t *testing.T) {
 	}
 	if resp.LocalPath != VolumeRdmaNativeLocalPath || resp.ConnectPath != VolumeRdmaNativeConnectPath || resp.WriteCommitBatchPath != VolumeRdmaNativeWriteCommitBatchPath {
 		t.Fatalf("unexpected endpoint paths: %+v", resp)
+	}
+	if resp.Counters["read_desc_requests"] != 2 || resp.Counters["read_desc_successes"] != 1 || resp.Counters["read_desc_bytes"] != 8192 {
+		t.Fatalf("unexpected counters: %+v", resp.Counters)
 	}
 }
 

@@ -124,6 +124,19 @@ func (vs *VolumeServer) volumeRdmaReadDescHandler(w http.ResponseWriter, r *http
 		http.Error(w, "native RDMA read exporter is not configured", http.StatusNotImplemented)
 		return
 	}
+	start := time.Now()
+	success := false
+	var bytesExported uint64
+	vs.rdmaStats.readDescRequests.Add(1)
+	defer func() {
+		recordLatency(&vs.rdmaStats.readDescLatencyNs, start)
+		if success {
+			vs.rdmaStats.readDescSuccesses.Add(1)
+			vs.rdmaStats.readDescBytes.Add(int64(bytesExported))
+		} else {
+			vs.rdmaStats.readDescFailures.Add(1)
+		}
+	}()
 
 	var req VolumeRdmaReadRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -144,6 +157,8 @@ func (vs *VolumeServer) volumeRdmaReadDescHandler(w http.ResponseWriter, r *http
 		writeJsonError(w, r, http.StatusNotImplemented, fmt.Errorf("native RDMA read exporter returned no exportable descriptor"))
 		return
 	}
+	success = true
+	bytesExported = req.Size
 	writeJsonQuiet(w, r, http.StatusOK, volumeRdmaReadDescResponse{
 		Desc:         lease.Desc,
 		ConnectionID: lease.ConnectionID,
@@ -160,6 +175,17 @@ func (vs *VolumeServer) volumeRdmaReleaseDescHandler(w http.ResponseWriter, r *h
 		http.Error(w, "native RDMA read exporter is not configured", http.StatusNotImplemented)
 		return
 	}
+	start := time.Now()
+	success := false
+	vs.rdmaStats.releaseDescRequests.Add(1)
+	defer func() {
+		recordLatency(&vs.rdmaStats.releaseDescLatencyNs, start)
+		if success {
+			vs.rdmaStats.releaseDescSuccesses.Add(1)
+		} else {
+			vs.rdmaStats.releaseDescFailures.Add(1)
+		}
+	}()
 
 	var req volumeRdmaReleaseDescRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -174,6 +200,7 @@ func (vs *VolumeServer) volumeRdmaReleaseDescHandler(w http.ResponseWriter, r *h
 		writeJsonError(w, r, volumeRdmaReadHTTPStatus(err), err)
 		return
 	}
+	success = true
 	writeJsonQuiet(w, r, http.StatusOK, map[string]bool{"released": true})
 }
 
@@ -187,6 +214,19 @@ func (vs *VolumeServer) volumeRdmaWriteHandler(w http.ResponseWriter, r *http.Re
 		http.Error(w, "native RDMA requester endpoint is not configured", http.StatusNotImplemented)
 		return
 	}
+	start := time.Now()
+	success := false
+	var bytesWritten uint64
+	vs.rdmaStats.writeRequests.Add(1)
+	defer func() {
+		recordLatency(&vs.rdmaStats.writeLatencyNs, start)
+		if success {
+			vs.rdmaStats.writeSuccesses.Add(1)
+			vs.rdmaStats.writeBytes.Add(int64(bytesWritten))
+		} else {
+			vs.rdmaStats.writeFailures.Add(1)
+		}
+	}()
 
 	var req VolumeRdmaWriteRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -223,6 +263,8 @@ func (vs *VolumeServer) volumeRdmaWriteHandler(w http.ResponseWriter, r *http.Re
 			Size:   req.Size,
 			Source: "native-volume-rdma-write-stream",
 		})
+		success = true
+		bytesWritten = req.Size
 		stats.VolumeServerRdmaTransferBytes.WithLabelValues("write_stream").Add(float64(req.Size))
 		stats.VolumeServerRdmaTransferChunks.WithLabelValues("write_stream").Inc()
 		return
@@ -248,6 +290,8 @@ func (vs *VolumeServer) volumeRdmaWriteHandler(w http.ResponseWriter, r *http.Re
 		Size:   req.Size,
 		Source: "native-volume-rdma-write",
 	})
+	success = true
+	bytesWritten = req.Size
 }
 
 func (vs *VolumeServer) volumeRdmaWriteDescHandler(w http.ResponseWriter, r *http.Request) {
@@ -260,6 +304,19 @@ func (vs *VolumeServer) volumeRdmaWriteDescHandler(w http.ResponseWriter, r *htt
 		http.Error(w, "native RDMA write target endpoint is not configured", http.StatusNotImplemented)
 		return
 	}
+	start := time.Now()
+	success := false
+	var bytesRegistered uint64
+	vs.rdmaStats.writeDescRequests.Add(1)
+	defer func() {
+		recordLatency(&vs.rdmaStats.writeDescLatencyNs, start)
+		if success {
+			vs.rdmaStats.writeDescSuccesses.Add(1)
+			vs.rdmaStats.writeDescBytes.Add(int64(bytesRegistered))
+		} else {
+			vs.rdmaStats.writeDescFailures.Add(1)
+		}
+	}()
 
 	var req VolumeRdmaWriteDescRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -297,6 +354,8 @@ func (vs *VolumeServer) volumeRdmaWriteDescHandler(w http.ResponseWriter, r *htt
 		ConnectionID: req.ConnectionID,
 		SessionID:    sessionID,
 	})
+	success = true
+	bytesRegistered = req.Size
 }
 
 func (vs *VolumeServer) volumeRdmaWriteCommitHandler(w http.ResponseWriter, r *http.Request) {
@@ -309,6 +368,19 @@ func (vs *VolumeServer) volumeRdmaWriteCommitHandler(w http.ResponseWriter, r *h
 		http.Error(w, "native RDMA write target endpoint is not configured", http.StatusNotImplemented)
 		return
 	}
+	start := time.Now()
+	success := false
+	var bytesCommitted uint64
+	vs.rdmaStats.writeCommitRequests.Add(1)
+	defer func() {
+		recordLatency(&vs.rdmaStats.writeCommitLatencyNs, start)
+		if success {
+			vs.rdmaStats.writeCommitSuccesses.Add(1)
+			vs.rdmaStats.writeCommitBytes.Add(int64(bytesCommitted))
+		} else {
+			vs.rdmaStats.writeCommitFailures.Add(1)
+		}
+	}()
 
 	var req VolumeRdmaWriteCommitRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -329,6 +401,8 @@ func (vs *VolumeServer) volumeRdmaWriteCommitHandler(w http.ResponseWriter, r *h
 		Size:   req.Size,
 		Source: "native-volume-rdma-write-desc",
 	})
+	success = true
+	bytesCommitted = req.Size
 }
 
 func (vs *VolumeServer) volumeRdmaWriteCommitBatchHandler(w http.ResponseWriter, r *http.Request) {
@@ -341,6 +415,27 @@ func (vs *VolumeServer) volumeRdmaWriteCommitBatchHandler(w http.ResponseWriter,
 		http.Error(w, "native RDMA write target endpoint is not configured", http.StatusNotImplemented)
 		return
 	}
+	start := time.Now()
+	var entries int64
+	var successEntries int64
+	var failedEntries int64
+	var bytesCommitted uint64
+	vs.rdmaStats.writeCommitBatchRequests.Add(1)
+	defer func() {
+		recordLatency(&vs.rdmaStats.writeCommitBatchLatencyNs, start)
+		if entries > 0 {
+			vs.rdmaStats.writeCommitBatchEntries.Add(entries)
+		}
+		if successEntries > 0 {
+			vs.rdmaStats.writeCommitBatchEntrySuccesses.Add(successEntries)
+		}
+		if failedEntries > 0 {
+			vs.rdmaStats.writeCommitBatchEntryFailures.Add(failedEntries)
+		}
+		if bytesCommitted > 0 {
+			vs.rdmaStats.writeCommitBatchBytes.Add(int64(bytesCommitted))
+		}
+	}()
 
 	var req VolumeRdmaWriteCommitBatchRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -351,6 +446,7 @@ func (vs *VolumeServer) volumeRdmaWriteCommitBatchHandler(w http.ResponseWriter,
 		writeJsonError(w, r, http.StatusBadRequest, fmt.Errorf("entries are required"))
 		return
 	}
+	entries = int64(len(req.Entries))
 	results := make([]volumeRdmaWriteCommitResult, len(req.Entries))
 	for i, entry := range req.Entries {
 		results[i] = volumeRdmaWriteCommitResult{
@@ -361,16 +457,20 @@ func (vs *VolumeServer) volumeRdmaWriteCommitBatchHandler(w http.ResponseWriter,
 		if err := validateVolumeRdmaWriteCommitRequest(entry); err != nil {
 			results[i].Status = -int32(syscall.EINVAL)
 			results[i].Error = err.Error()
+			failedEntries++
 			continue
 		}
 		fileID, err := vs.commitVolumeRdmaWriteRequest(r.Context(), reader, entry)
 		if err != nil {
 			results[i].Status = volumeRdmaWriteCommitStatus(err)
 			results[i].Error = err.Error()
+			failedEntries++
 			continue
 		}
 		results[i].FileID = fileID
 		results[i].Source = "native-volume-rdma-write-desc"
+		successEntries++
+		bytesCommitted += entry.Size
 	}
 	writeJsonQuiet(w, r, http.StatusOK, volumeRdmaWriteCommitBatchResponse{Results: results})
 }
@@ -385,6 +485,17 @@ func (vs *VolumeServer) volumeRdmaWriteAbortHandler(w http.ResponseWriter, r *ht
 		http.Error(w, "native RDMA write target endpoint is not configured", http.StatusNotImplemented)
 		return
 	}
+	start := time.Now()
+	success := false
+	vs.rdmaStats.writeAbortRequests.Add(1)
+	defer func() {
+		recordLatency(&vs.rdmaStats.writeAbortLatencyNs, start)
+		if success {
+			vs.rdmaStats.writeAbortSuccesses.Add(1)
+		} else {
+			vs.rdmaStats.writeAbortFailures.Add(1)
+		}
+	}()
 	var req VolumeRdmaWriteAbortRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJsonError(w, r, http.StatusBadRequest, err)
@@ -398,6 +509,7 @@ func (vs *VolumeServer) volumeRdmaWriteAbortHandler(w http.ResponseWriter, r *ht
 		writeJsonError(w, r, http.StatusServiceUnavailable, err)
 		return
 	}
+	success = true
 	writeJsonQuiet(w, r, http.StatusOK, map[string]bool{"aborted": true})
 }
 

@@ -88,6 +88,10 @@ func TestVolumeRdmaReadDescHandlerReturnsDescriptor(t *testing.T) {
 	if resp.Desc.RemoteAddr != 0xbeef || resp.Desc.RKey != 77 || resp.Desc.Length != 4096 || resp.SessionID != 99 {
 		t.Fatalf("unexpected response: %+v", resp)
 	}
+	counters := vs.rdmaStats.snapshot()
+	if counters["read_desc_requests"] != 1 || counters["read_desc_successes"] != 1 || counters["read_desc_bytes"] != 4096 {
+		t.Fatalf("unexpected read descriptor counters: %+v", counters)
+	}
 }
 
 func TestVolumeRdmaReadDescHandlerNotConfigured(t *testing.T) {
@@ -115,5 +119,9 @@ func TestVolumeRdmaReleaseDescHandler(t *testing.T) {
 	}
 	if exporter.releasedSession != 99 {
 		t.Fatalf("released session = %d", exporter.releasedSession)
+	}
+	counters := vs.rdmaStats.snapshot()
+	if counters["release_desc_requests"] != 1 || counters["release_desc_successes"] != 1 {
+		t.Fatalf("unexpected release descriptor counters: %+v", counters)
 	}
 }

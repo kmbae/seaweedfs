@@ -89,24 +89,25 @@ type VolumeRdmaRemoteInfo struct {
 }
 
 type volumeRdmaNativeStatusResponse struct {
-	ReadExporterConfigured bool   `json:"read_exporter_configured"`
-	EndpointConfigured     bool   `json:"endpoint_configured"`
-	Transport              string `json:"transport,omitempty"`
-	ABIVersion             uint32 `json:"abi_version"`
-	StatusPath             string `json:"status_path"`
-	LocalPath              string `json:"local_path"`
-	ConnectPath            string `json:"connect_path"`
-	ReadDescPath           string `json:"read_desc_path"`
-	ReleaseDescPath        string `json:"release_desc_path"`
-	RequesterLocalPath     string `json:"requester_local_path"`
-	RequesterConnectPath   string `json:"requester_connect_path"`
-	WritePath              string `json:"write_path"`
-	WriteDescPath          string `json:"write_desc_path"`
-	WriteCommitPath        string `json:"write_commit_path"`
-	WriteCommitBatchPath   string `json:"write_commit_batch_path"`
-	WriteAbortPath         string `json:"write_abort_path"`
-	ReadChunkSize          int    `json:"read_chunk_size"`
-	ReadPipelineDepth      int    `json:"read_pipeline_depth"`
+	ReadExporterConfigured bool             `json:"read_exporter_configured"`
+	EndpointConfigured     bool             `json:"endpoint_configured"`
+	Transport              string           `json:"transport,omitempty"`
+	ABIVersion             uint32           `json:"abi_version"`
+	StatusPath             string           `json:"status_path"`
+	LocalPath              string           `json:"local_path"`
+	ConnectPath            string           `json:"connect_path"`
+	ReadDescPath           string           `json:"read_desc_path"`
+	ReleaseDescPath        string           `json:"release_desc_path"`
+	RequesterLocalPath     string           `json:"requester_local_path"`
+	RequesterConnectPath   string           `json:"requester_connect_path"`
+	WritePath              string           `json:"write_path"`
+	WriteDescPath          string           `json:"write_desc_path"`
+	WriteCommitPath        string           `json:"write_commit_path"`
+	WriteCommitBatchPath   string           `json:"write_commit_batch_path"`
+	WriteAbortPath         string           `json:"write_abort_path"`
+	ReadChunkSize          int              `json:"read_chunk_size"`
+	ReadPipelineDepth      int              `json:"read_pipeline_depth"`
+	Counters               map[string]int64 `json:"counters,omitempty"`
 }
 
 func (e VolumeRdmaEndpointInfo) ReadyForConnect() bool {
@@ -158,8 +159,10 @@ func (vs *VolumeServer) volumeRdmaStatusHandler(w http.ResponseWriter, r *http.R
 		return
 	}
 	transport := ""
+	counters := map[string]int64{}
 	if vs != nil {
 		transport = vs.rdmaTransport
+		counters = vs.rdmaStats.snapshot()
 	}
 	writeJsonQuiet(w, r, http.StatusOK, volumeRdmaNativeStatusResponse{
 		ReadExporterConfigured: vs != nil && vs.rdmaReadExporter != nil,
@@ -180,6 +183,7 @@ func (vs *VolumeServer) volumeRdmaStatusHandler(w http.ResponseWriter, r *http.R
 		WriteAbortPath:         VolumeRdmaNativeWriteAbortPath,
 		ReadChunkSize:          volumeRdmaPipelineChunkSize,
 		ReadPipelineDepth:      volumeRdmaPipelineDepth,
+		Counters:               counters,
 	})
 }
 

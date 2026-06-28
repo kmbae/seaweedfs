@@ -32,6 +32,7 @@ func (fh *FileHandle) readFromChunksWithContext(ctx context.Context, buff []byte
 	defer fh.entryLock.RUnlock()
 
 	fileFullPath := fh.FullPath()
+	rdmaFallbackPending := false
 
 	entry := fh.GetEntry()
 
@@ -75,6 +76,7 @@ func (fh *FileHandle) readFromChunksWithContext(ctx context.Context, buff []byte
 		if !fh.wfs.option.RdmaFallback {
 			return 0, 0, fmt.Errorf("RDMA read failed (no fallback): %w", err)
 		}
+		rdmaFallbackPending = true
 		glog.V(4).Infof("RDMA read failed for %s, falling back to HTTP: %v", fileFullPath, err)
 	}
 
@@ -97,6 +99,9 @@ func (fh *FileHandle) readFromChunksWithContext(ctx context.Context, buff []byte
 
 	// Fall back to normal chunk reading
 	totalRead, ts, err := fh.entryChunkGroup.ReadDataAt(ctx, fileSize, buff, offset)
+	if rdmaFallbackPending && fh.wfs.rdmaClient != nil {
+		fh.wfs.rdmaClient.RecordFallbackRead(int64(totalRead), err)
+	}
 
 	if err != nil && err != io.EOF {
 		glog.Errorf("file handle read %s: %v", fileFullPath, err)

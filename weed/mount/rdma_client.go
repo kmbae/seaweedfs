@@ -52,6 +52,25 @@ type RDMAMountClient struct {
 	totalBytesRead  atomic.Int64
 	totalLatencyNs  atomic.Int64
 
+	nativeReadRequests   atomic.Int64
+	nativeReadSuccesses  atomic.Int64
+	nativeReadFailures   atomic.Int64
+	nativeReadBytes      atomic.Int64
+	nativeReadLatencyNs  atomic.Int64
+	sidecarReadRequests  atomic.Int64
+	sidecarReadSuccesses atomic.Int64
+	sidecarReadFailures  atomic.Int64
+	sidecarReadBytes     atomic.Int64
+	sidecarReadLatencyNs atomic.Int64
+	nonRdmaReadResponses atomic.Int64
+	nonRdmaReadBytes     atomic.Int64
+	rdmaReadBytes        atomic.Int64
+
+	fallbackReadRequests  atomic.Int64
+	fallbackReadSuccesses atomic.Int64
+	fallbackReadFailures  atomic.Int64
+	fallbackReadBytes     atomic.Int64
+
 	// Write statistics
 	totalWriteRequests  atomic.Int64
 	successfulWrites    atomic.Int64
@@ -191,6 +210,13 @@ func newRDMAMountClientBase(mode string, sidecarAddr string, lookupFileIdFn wdcl
 	}
 }
 
+func (c *RDMAMountClient) normalizedMode() string {
+	if c.mode == rdmaMountModeNative {
+		return rdmaMountModeNative
+	}
+	return rdmaMountModeSidecar
+}
+
 // lookupVolumeLocationByFileID finds the best volume server for a given file ID
 func (c *RDMAMountClient) lookupVolumeLocationByFileID(ctx context.Context, fileID string) (string, error) {
 	glog.V(4).Infof("Looking up volume location for file ID %s", fileID)
@@ -307,6 +333,7 @@ func (c *RDMAMountClient) ReadNeedleTo(ctx context.Context, fileID string, offse
 
 	duration := time.Since(startTime)
 	c.totalLatencyNs.Add(duration.Nanoseconds())
+	c.recordReadAttempt(c.normalizedMode(), written, isRDMA, duration, err)
 	if err != nil {
 		c.failedReads.Add(1)
 		return written, false, err
@@ -319,6 +346,54 @@ func (c *RDMAMountClient) ReadNeedleTo(ctx context.Context, fileID string, offse
 		c.mode, fileID, offset, size, written, duration, isRDMA, volumeServer)
 
 	return written, isRDMA, nil
+}
+
+func (c *RDMAMountClient) recordReadAttempt(mode string, written int64, isRDMA bool, duration time.Duration, err error) {
+	switch mode {
+	case rdmaMountModeNative:
+		c.nativeReadRequests.Add(1)
+		c.nativeReadLatencyNs.Add(duration.Nanoseconds())
+		if err != nil {
+			c.nativeReadFailures.Add(1)
+			return
+		}
+		c.nativeReadSuccesses.Add(1)
+		if written > 0 {
+			c.nativeReadBytes.Add(written)
+			c.rdmaReadBytes.Add(written)
+		}
+	default:
+		c.sidecarReadRequests.Add(1)
+		c.sidecarReadLatencyNs.Add(duration.Nanoseconds())
+		if err != nil {
+			c.sidecarReadFailures.Add(1)
+			return
+		}
+		if isRDMA {
+			c.sidecarReadSuccesses.Add(1)
+			if written > 0 {
+				c.sidecarReadBytes.Add(written)
+				c.rdmaReadBytes.Add(written)
+			}
+			return
+		}
+		c.nonRdmaReadResponses.Add(1)
+		if written > 0 {
+			c.nonRdmaReadBytes.Add(written)
+		}
+	}
+}
+
+func (c *RDMAMountClient) RecordFallbackRead(bytesRead int64, err error) {
+	c.fallbackReadRequests.Add(1)
+	if bytesRead > 0 {
+		c.fallbackReadBytes.Add(bytesRead)
+	}
+	if err != nil && err != io.EOF {
+		c.fallbackReadFailures.Add(1)
+		return
+	}
+	c.fallbackReadSuccesses.Add(1)
 }
 
 func (c *RDMAMountClient) readNeedleSidecarTo(ctx context.Context, volumeServer string, fileID string, offset, size uint64, dst io.Writer) (int64, bool, error) {
@@ -723,6 +798,10 @@ func (c *RDMAMountClient) GetStats() map[string]interface{} {
 	failedReads := c.failedReads.Load()
 	totalBytesRead := c.totalBytesRead.Load()
 	totalLatencyNs := c.totalLatencyNs.Load()
+	nativeReadRequests := c.nativeReadRequests.Load()
+	nativeReadLatencyNs := c.nativeReadLatencyNs.Load()
+	sidecarReadRequests := c.sidecarReadRequests.Load()
+	sidecarReadLatencyNs := c.sidecarReadLatencyNs.Load()
 	totalWriteRequests := c.totalWriteRequests.Load()
 	successfulWrites := c.successfulWrites.Load()
 	failedWrites := c.failedWrites.Load()
@@ -738,6 +817,14 @@ func (c *RDMAMountClient) GetStats() map[string]interface{} {
 		readSuccessRate = float64(successfulReads) / float64(totalRequests) * 100
 		avgReadLatencyNs = totalLatencyNs / totalRequests
 	}
+	avgNativeReadLatencyNs := int64(0)
+	if nativeReadRequests > 0 {
+		avgNativeReadLatencyNs = nativeReadLatencyNs / nativeReadRequests
+	}
+	avgSidecarReadLatencyNs := int64(0)
+	if sidecarReadRequests > 0 {
+		avgSidecarReadLatencyNs = sidecarReadLatencyNs / sidecarReadRequests
+	}
 
 	writeSuccessRate := float64(0)
 	avgWriteLatencyNs := int64(0)
@@ -747,23 +834,40 @@ func (c *RDMAMountClient) GetStats() map[string]interface{} {
 	}
 
 	return map[string]interface{}{
-		"mode":                   c.mode,
-		"sidecar_addr":           c.sidecarAddr,
-		"max_concurrent":         c.maxConcurrent,
-		"timeout_ms":             int(c.timeout / time.Millisecond),
-		"native_connections":     nativeConnections,
-		"total_read_requests":    totalRequests,
-		"successful_reads":       successfulReads,
-		"failed_reads":           failedReads,
-		"read_success_rate_pct":  fmt.Sprintf("%.1f", readSuccessRate),
-		"total_bytes_read":       totalBytesRead,
-		"avg_read_latency_ms":    fmt.Sprintf("%.3f", float64(avgReadLatencyNs)/1000000),
-		"total_write_requests":   totalWriteRequests,
-		"successful_writes":      successfulWrites,
-		"failed_writes":          failedWrites,
-		"write_success_rate_pct": fmt.Sprintf("%.1f", writeSuccessRate),
-		"total_bytes_written":    totalBytesWritten,
-		"avg_write_latency_ms":   fmt.Sprintf("%.3f", float64(avgWriteLatencyNs)/1000000),
+		"mode":                    c.mode,
+		"sidecar_addr":            c.sidecarAddr,
+		"max_concurrent":          c.maxConcurrent,
+		"timeout_ms":              int(c.timeout / time.Millisecond),
+		"native_connections":      nativeConnections,
+		"total_read_requests":     totalRequests,
+		"successful_reads":        successfulReads,
+		"failed_reads":            failedReads,
+		"read_success_rate_pct":   fmt.Sprintf("%.1f", readSuccessRate),
+		"total_bytes_read":        totalBytesRead,
+		"rdma_bytes_read":         c.rdmaReadBytes.Load(),
+		"avg_read_latency_ms":     fmt.Sprintf("%.3f", float64(avgReadLatencyNs)/1000000),
+		"native_read_requests":    nativeReadRequests,
+		"native_read_successes":   c.nativeReadSuccesses.Load(),
+		"native_read_failures":    c.nativeReadFailures.Load(),
+		"native_read_bytes":       c.nativeReadBytes.Load(),
+		"native_avg_read_ms":      fmt.Sprintf("%.3f", float64(avgNativeReadLatencyNs)/1000000),
+		"sidecar_read_requests":   sidecarReadRequests,
+		"sidecar_read_successes":  c.sidecarReadSuccesses.Load(),
+		"sidecar_read_failures":   c.sidecarReadFailures.Load(),
+		"sidecar_read_bytes":      c.sidecarReadBytes.Load(),
+		"sidecar_avg_read_ms":     fmt.Sprintf("%.3f", float64(avgSidecarReadLatencyNs)/1000000),
+		"non_rdma_read_responses": c.nonRdmaReadResponses.Load(),
+		"non_rdma_read_bytes":     c.nonRdmaReadBytes.Load(),
+		"fallback_read_requests":  c.fallbackReadRequests.Load(),
+		"fallback_read_successes": c.fallbackReadSuccesses.Load(),
+		"fallback_read_failures":  c.fallbackReadFailures.Load(),
+		"fallback_read_bytes":     c.fallbackReadBytes.Load(),
+		"total_write_requests":    totalWriteRequests,
+		"successful_writes":       successfulWrites,
+		"failed_writes":           failedWrites,
+		"write_success_rate_pct":  fmt.Sprintf("%.1f", writeSuccessRate),
+		"total_bytes_written":     totalBytesWritten,
+		"avg_write_latency_ms":    fmt.Sprintf("%.3f", float64(avgWriteLatencyNs)/1000000),
 	}
 }
 

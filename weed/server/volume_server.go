@@ -61,6 +61,7 @@ type VolumeServer struct {
 	rdmaTransport                 string
 	rdmaEndpoint                  VolumeRdmaEndpoint
 	rdmaReadExporter              VolumeRdmaReadExporter
+	rdmaStats                     volumeRdmaTelemetry
 	isHeartbeating                bool
 	stopChan                      chan bool
 }
