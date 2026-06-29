@@ -270,6 +270,7 @@ func TestVolumeRdmaWriteCommitBatchHandlerReportsEntryValidation(t *testing.T) {
 	body, err := json.Marshal(VolumeRdmaWriteCommitBatchRequest{
 		Entries: []VolumeRdmaWriteCommitRequest{
 			{SessionID: 0, FileID: "3,abc", VolumeID: 3, NeedleID: 1, Cookie: 2, Size: 4096},
+			{SessionID: 99, FileID: "3,def", VolumeID: 0, NeedleID: 2, Cookie: 3, Size: 4096},
 		},
 	})
 	if err != nil {
@@ -287,10 +288,13 @@ func TestVolumeRdmaWriteCommitBatchHandlerReportsEntryValidation(t *testing.T) {
 	if err := json.NewDecoder(rec.Body).Decode(&resp); err != nil {
 		t.Fatalf("decode response: %v", err)
 	}
-	if len(resp.Results) != 1 || resp.Results[0].Status == 0 || resp.Results[0].Error == "" {
+	if len(resp.Results) != 2 || resp.Results[0].Status == 0 || resp.Results[0].Error == "" || resp.Results[1].Status == 0 || resp.Results[1].Error == "" {
 		t.Fatalf("unexpected batch response: %+v", resp)
 	}
 	if endpoint.registeredReads != 0 {
 		t.Fatalf("registered reads = %d, want 0", endpoint.registeredReads)
+	}
+	if len(endpoint.releasedSessions) != 1 || endpoint.releasedSessions[0] != 99 {
+		t.Fatalf("released sessions = %+v, want [99]", endpoint.releasedSessions)
 	}
 }

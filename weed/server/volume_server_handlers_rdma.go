@@ -655,6 +655,9 @@ func (vs *VolumeServer) volumeRdmaWriteCommitBatchHandler(w http.ResponseWriter,
 		if err := validateVolumeRdmaWriteCommitRequest(entry); err != nil {
 			results[i].Status = -int32(syscall.EINVAL)
 			results[i].Error = err.Error()
+			if entry.SessionID != 0 {
+				_ = reader.ReleaseSession(context.Background(), entry.SessionID)
+			}
 			failedEntries++
 			continue
 		}
@@ -862,20 +865,20 @@ func (vs *VolumeServer) commitVolumeRdmaWriteRequest(ctx context.Context, reader
 
 func (vs *VolumeServer) commitVolumeRdmaWriteRequestBatch(ctx context.Context, reader volumeRdmaWriteTargetEndpoint, entries []volumeRdmaWriteCommitBatchEntry, results []volumeRdmaWriteCommitResult) {
 	if err := ctx.Err(); err != nil {
-		setVolumeRdmaWriteBatchError(results, entries, err)
+		setVolumeRdmaWriteBatchErrorAndRelease(reader, results, entries, err)
 		return
 	}
 	if vs == nil || vs.store == nil {
-		setVolumeRdmaWriteBatchError(results, entries, fmt.Errorf("volume store is not configured"))
+		setVolumeRdmaWriteBatchErrorAndRelease(reader, results, entries, fmt.Errorf("volume store is not configured"))
 		return
 	}
 	streamer, ok := reader.(volumeRdmaWriteStreamTargetEndpoint)
 	if !ok {
-		setVolumeRdmaWriteBatchError(results, entries, fmt.Errorf("native RDMA write stream is not configured"))
+		setVolumeRdmaWriteBatchErrorAndRelease(reader, results, entries, fmt.Errorf("native RDMA write stream is not configured"))
 		return
 	}
 	if err := vs.CheckMaintenanceMode(); err != nil {
-		setVolumeRdmaWriteBatchError(results, entries, err)
+		setVolumeRdmaWriteBatchErrorAndRelease(reader, results, entries, err)
 		return
 	}
 
@@ -894,7 +897,7 @@ func (vs *VolumeServer) commitVolumeRdmaWriteRequestBatch(ctx context.Context, r
 	for volumeID, group := range groups {
 		v := vs.store.GetVolume(needle.VolumeId(volumeID))
 		if v == nil {
-			setVolumeRdmaWriteBatchError(results, group, fmt.Errorf("not found volume id %d", volumeID))
+			setVolumeRdmaWriteBatchErrorAndRelease(reader, results, group, fmt.Errorf("not found volume id %d", volumeID))
 			continue
 		}
 		storageEntries := make([]storage.NeedleDataStreamBatchEntry, len(group))
@@ -928,6 +931,15 @@ func (vs *VolumeServer) commitVolumeRdmaWriteRequestBatch(ctx context.Context, r
 				results[item.Index].FileID = needle.NewFileId(needle.VolumeId(req.VolumeID), req.NeedleID, req.Cookie).String()
 			}
 			results[item.Index].Source = "native-volume-rdma-write-desc"
+		}
+	}
+}
+
+func setVolumeRdmaWriteBatchErrorAndRelease(reader volumeRdmaWriteTargetEndpoint, results []volumeRdmaWriteCommitResult, entries []volumeRdmaWriteCommitBatchEntry, err error) {
+	setVolumeRdmaWriteBatchError(results, entries, err)
+	for _, entry := range entries {
+		if entry.Request.SessionID != 0 {
+			_ = reader.ReleaseSession(context.Background(), entry.Request.SessionID)
 		}
 	}
 }
