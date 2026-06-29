@@ -274,12 +274,12 @@ func (c *VolumeNativeRDMAReadDescriptorClient) ReadNeedleRDMA(ctx context.Contex
 		return nil, nil, ErrnoError{Errno: ErrnoIO, Msg: "native volume rdma descriptor length exceeds request size"}
 	}
 	if peer.VolumeConnectionID != 0 {
-		desc.Reserved[1] = peer.VolumeConnectionID
+		desc.SetConnectionID(peer.VolumeConnectionID)
 	}
 	if sessionID != 0 {
 		leaseID := c.trackLease(req.VolumeServer, sessionID)
 		if leaseID != 0 {
-			desc.Reserved[0] = MarkNativeReadLease(leaseID)
+			desc.SetLeaseID(MarkNativeReadLease(leaseID))
 			c.scheduleRelease(leaseID)
 		}
 	}

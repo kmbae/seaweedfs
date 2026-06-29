@@ -1298,18 +1298,20 @@ func (t *embeddedVolumeRdmaTransport) allocateSessionBuffer(ctx context.Context,
 	if err != nil {
 		return nil, err
 	}
+	desc := VolumeRdmaDataDesc{
+		RemoteAddr: uint64(uintptr(mr.addr)),
+		RKey:       uint32(mr.rkey),
+		Length:     uint32(size),
+	}
+	desc.SetLeaseID(sessionID)
+	desc.SetConnectionID(conn.id)
 	buffer := &embeddedVolumeRdmaBuffer{
 		owner:        t,
 		sessionID:    sessionID,
 		connectionID: conn.id,
 		mr:           mr,
 		poolKey:      poolKey,
-		desc: VolumeRdmaDataDesc{
-			RemoteAddr: uint64(uintptr(mr.addr)),
-			RKey:       uint32(mr.rkey),
-			Length:     uint32(size),
-			Reserved:   [4]uint64{sessionID, conn.id, 0, 0},
-		},
+		desc:         desc,
 	}
 	t.sessions[sessionID] = buffer
 	return buffer, nil

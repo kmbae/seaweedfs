@@ -98,15 +98,16 @@ func (s *KernelMRReadStager) StageReadRDMA(ctx context.Context, path string, off
 		s.Stats.Inc("rdma_stager_mr_not_exportable")
 		return nil, fmt.Errorf("kernel RDMA test MR is not exportable: flags=0x%x addr=%#x rkey=%#x", mr.Flags, mr.RemoteAddr, mr.RKey)
 	}
+	desc := swvfsproto.RDMADataDesc{
+		RemoteAddr: mr.RemoteAddr,
+		RKey:       mr.RKey,
+		Length:     uint32(len(data)),
+	}
+	desc.SetLeaseID(sessionID)
 	s.Stats.Inc("rdma_stager_desc_success")
 	s.Stats.Add("rdma_stager_desc_bytes", uint64(len(data)))
 	return &RDMAReadDescriptorLease{
-		Desc: swvfsproto.RDMADataDesc{
-			RemoteAddr: mr.RemoteAddr,
-			RKey:       mr.RKey,
-			Length:     uint32(len(data)),
-			Reserved:   [4]uint64{sessionID},
-		},
+		Desc:      desc,
 		Attr:      attr,
 		SessionID: sessionID,
 	}, nil
@@ -252,7 +253,7 @@ func (c *RemoteRDMAReadDescriptorClient) ReadFileRDMA(ctx context.Context, path 
 	}
 	leaseID := c.trackLease(peerURL, sessionID)
 	if leaseID != 0 {
-		desc.Reserved[0] = leaseID
+		desc.SetLeaseID(leaseID)
 		c.scheduleRelease(leaseID)
 	}
 	c.Stats.Inc("rdma_read_desc_client_success")

@@ -308,7 +308,7 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 			var desc *swvfsproto.RDMADataDesc
 			desc, attr, err = singleBackend.ReadFileRDMA(ctx, req.Path1, req.Header.Offset, req.Header.Size)
 			if desc != nil {
-				desc.Reserved[2] = req.Header.Offset
+				desc.SetFileOffset(req.Header.Offset)
 				descs = []swvfsproto.RDMADataDesc{*desc}
 			}
 		} else {
@@ -420,7 +420,7 @@ func (h *Handler) Handle(ctx context.Context, req *swvfsproto.Request) (*swvfspr
 				return nil, ErrnoError{Errno: ErrnoIO, Msg: "rdma write prepare batch descriptor is smaller than requested entry"}
 			}
 			descs[i].Length = uint32(entries[i].Size)
-			descs[i].Reserved[2] = entries[i].Offset
+			descs[i].SetFileOffset(entries[i].Offset)
 			descBytes += uint64(descs[i].Length)
 		}
 		h.Stats.Inc("handler_write_rdma_prepare_batch_replies")
@@ -734,7 +734,7 @@ func PrepareWriteRDMABatchSlow(ctx context.Context, backend RDMAWriteDescriptorB
 			return nil, nil, ErrnoError{Errno: ErrnoNoSys, Msg: "rdma write prepare returned no descriptor"}
 		}
 		descs[i] = *desc
-		descs[i].Reserved[2] = entry.Offset
+		descs[i].SetFileOffset(entry.Offset)
 		if attr != nil {
 			lastAttr = attr
 		}

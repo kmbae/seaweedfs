@@ -29,6 +29,7 @@ func TestRDMAStructSizesMatchKernelABI(t *testing.T) {
 func TestRDMALocalInfoHelpers(t *testing.T) {
 	var info RDMALocalInfo
 	info.Flags = RDMAFKernelEnabled | RDMAFEndpointReady | RDMAFQPConnected | RDMAFGIDValid
+	info.SetConnectionID(44)
 	copy(info.Device[:], "mlx5_0")
 	for i := range info.GID {
 		info.GID[i] = byte(i)
@@ -42,6 +43,28 @@ func TestRDMALocalInfoHelpers(t *testing.T) {
 	}
 	if got := info.GIDHex(); got != "000102030405060708090a0b0c0d0e0f" {
 		t.Fatalf("GIDHex = %q", got)
+	}
+	if got := info.ConnectionID(); got != 44 || info.Reserved[RDMALocalConnectionIDIndex] != 44 {
+		t.Fatalf("ConnectionID = %d reserved=%d", got, info.Reserved[RDMALocalConnectionIDIndex])
+	}
+}
+
+func TestRDMADescriptorFieldHelpers(t *testing.T) {
+	var remote RDMARemoteInfo
+	remote.SetConnectionID(55)
+	if got := remote.ConnectionID(); got != 55 || remote.Reserved[RDMARemoteConnectionIDIndex] != 55 {
+		t.Fatalf("remote connection id = %d reserved=%d", got, remote.Reserved[RDMARemoteConnectionIDIndex])
+	}
+
+	var desc RDMADataDesc
+	desc.SetLeaseID(11)
+	desc.SetConnectionID(22)
+	desc.SetFileOffset(33)
+	if desc.LeaseID() != 11 || desc.ConnectionID() != 22 || desc.FileOffset() != 33 {
+		t.Fatalf("desc helpers returned lease=%d conn=%d off=%d", desc.LeaseID(), desc.ConnectionID(), desc.FileOffset())
+	}
+	if desc.Reserved != [4]uint64{11, 22, 33, 0} {
+		t.Fatalf("desc reserved fields = %#v", desc.Reserved)
 	}
 }
 

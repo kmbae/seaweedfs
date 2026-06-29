@@ -67,7 +67,7 @@ type RDMALocalEndpoint struct {
 
 func RDMALocalEndpointFromInfo(info swvfsproto.RDMALocalInfo) RDMALocalEndpoint {
 	return RDMALocalEndpoint{
-		ConnectionID:    info.Reserved[0],
+		ConnectionID:    info.ConnectionID(),
 		ABIVersion:      info.ABIVersion,
 		Flags:           info.Flags,
 		Device:          info.DeviceName(),
@@ -127,7 +127,7 @@ func (e RDMALocalEndpoint) RemoteInfo(serviceLevel uint32) (swvfsproto.RDMARemot
 		GIDIndex:   e.GIDIndex,
 		SL:         serviceLevel,
 	}
-	remote.Reserved[0] = e.ConnectionID
+	remote.SetConnectionID(e.ConnectionID)
 	if gid, ok := swvfsproto.DecodeGIDHex(e.GID); ok {
 		remote.GID = gid
 		remote.Flags |= swvfsproto.RDMARemoteFGIDValid
@@ -383,7 +383,7 @@ func (s *RDMAPeerControlServer) handleWritePrepare(w http.ResponseWriter, r *htt
 	}
 	s.Stats.Inc("peer_control_write_prepare_success")
 	s.Stats.Add("peer_control_write_prepare_bytes", uint64(desc.Length))
-	writeJSON(w, RDMAPeerWritePrepareResponse{Desc: *desc, Attr: attr, SessionID: desc.Reserved[0]})
+	writeJSON(w, RDMAPeerWritePrepareResponse{Desc: *desc, Attr: attr, SessionID: desc.LeaseID()})
 }
 
 func (s *RDMAPeerControlServer) handleWriteCommit(w http.ResponseWriter, r *http.Request) {

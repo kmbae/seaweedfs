@@ -94,13 +94,14 @@ func (s *KernelMRWriteStager) PrepareWriteRDMA(ctx context.Context, path string,
 		s.Stats.Inc("rdma_write_stager_prepare_replaced")
 	}
 
-	s.Stats.Inc("rdma_write_stager_prepare_success")
-	return &swvfsproto.RDMADataDesc{
+	desc := swvfsproto.RDMADataDesc{
 		RemoteAddr: mr.RemoteAddr,
 		RKey:       mr.RKey,
 		Length:     uint32(size),
-		Reserved:   [4]uint64{session.SessionID},
-	}, nil, nil
+	}
+	desc.SetLeaseID(session.SessionID)
+	s.Stats.Inc("rdma_write_stager_prepare_success")
+	return &desc, nil, nil
 }
 
 func (s *KernelMRWriteStager) CommitWriteRDMA(ctx context.Context, path string, offset, size uint64) (*swvfsproto.Attr, error) {
@@ -306,7 +307,7 @@ func (c *RemoteRDMAWriteDescriptorClient) PrepareWriteRDMA(ctx context.Context, 
 		Created:   time.Now(),
 	})
 	if leaseID != 0 {
-		desc.Reserved[0] = leaseID
+		desc.SetLeaseID(leaseID)
 		c.scheduleAbort(leaseID)
 	}
 	c.Stats.Inc("rdma_write_desc_client_prepare_success")

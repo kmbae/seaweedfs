@@ -37,6 +37,42 @@ type VolumeRdmaDataDesc struct {
 	Reserved   [4]uint64
 }
 
+const (
+	volumeRdmaDescLeaseIDIndex      = 0
+	volumeRdmaDescConnectionIDIndex = 1
+	volumeRdmaDescFileOffsetIndex   = 2
+)
+
+func (d VolumeRdmaDataDesc) LeaseID() uint64 {
+	return d.Reserved[volumeRdmaDescLeaseIDIndex]
+}
+
+func (d *VolumeRdmaDataDesc) SetLeaseID(leaseID uint64) {
+	if d != nil {
+		d.Reserved[volumeRdmaDescLeaseIDIndex] = leaseID
+	}
+}
+
+func (d VolumeRdmaDataDesc) ConnectionID() uint64 {
+	return d.Reserved[volumeRdmaDescConnectionIDIndex]
+}
+
+func (d *VolumeRdmaDataDesc) SetConnectionID(connectionID uint64) {
+	if d != nil {
+		d.Reserved[volumeRdmaDescConnectionIDIndex] = connectionID
+	}
+}
+
+func (d VolumeRdmaDataDesc) FileOffset() uint64 {
+	return d.Reserved[volumeRdmaDescFileOffsetIndex]
+}
+
+func (d *VolumeRdmaDataDesc) SetFileOffset(offset uint64) {
+	if d != nil {
+		d.Reserved[volumeRdmaDescFileOffsetIndex] = offset
+	}
+}
+
 type VolumeRdmaReadLease struct {
 	Desc         VolumeRdmaDataDesc
 	ConnectionID uint64
@@ -505,7 +541,7 @@ func (vs *VolumeServer) volumeRdmaWriteDescHandler(w http.ResponseWriter, r *htt
 		return
 	}
 	desc.Length = uint32(req.Size)
-	desc.Reserved[0] = sessionID
+	desc.SetLeaseID(sessionID)
 	writeJsonQuiet(w, r, http.StatusOK, volumeRdmaWriteDescResponse{
 		Desc:         desc,
 		ConnectionID: req.ConnectionID,

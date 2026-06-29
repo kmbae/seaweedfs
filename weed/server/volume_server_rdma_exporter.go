@@ -158,7 +158,7 @@ func (e *VolumeStoreRdmaReadExporter) PrepareRead(ctx context.Context, req Volum
 		return nil, fmt.Errorf("failed to allocate native RDMA read lease")
 	}
 	e.scheduleLeaseExpiry(sessionID)
-	desc.Reserved[0] = sessionID
+	desc.SetLeaseID(sessionID)
 
 	return &VolumeRdmaReadLease{
 		Desc:         desc,

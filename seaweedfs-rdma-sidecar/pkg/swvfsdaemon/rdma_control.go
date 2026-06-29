@@ -60,7 +60,7 @@ func (c *RDMAControl) GetLocalFor(connectionID uint64) (swvfsproto.RDMALocalInfo
 	if c == nil || c.file == nil {
 		return info, fmt.Errorf("nil RDMA control device")
 	}
-	info.Reserved[0] = connectionID
+	info.SetConnectionID(connectionID)
 	if err := ioctl(c.file.Fd(), ioctlRDMAGetLocalFor, uintptr(unsafe.Pointer(&info))); err != nil {
 		return info, fmt.Errorf("SWVFS_IOC_RDMA_GET_LOCAL_FOR: %w", err)
 	}

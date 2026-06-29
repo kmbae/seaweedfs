@@ -40,6 +40,14 @@ const (
 	RDMATestFRegisteredMR    uint32 = 1 << 2
 )
 
+const (
+	RDMALocalConnectionIDIndex  = 0
+	RDMARemoteConnectionIDIndex = 0
+	RDMADescLeaseIDIndex        = 0
+	RDMADescConnectionIDIndex   = 1
+	RDMADescFileOffsetIndex     = 2
+)
+
 type RDMALocalInfo struct {
 	ABIVersion           uint32
 	Flags                uint32
@@ -103,6 +111,16 @@ func (i RDMALocalInfo) GIDHex() string {
 	return hex.EncodeToString(i.GID[:])
 }
 
+func (i RDMALocalInfo) ConnectionID() uint64 {
+	return i.Reserved[RDMALocalConnectionIDIndex]
+}
+
+func (i *RDMALocalInfo) SetConnectionID(connectionID uint64) {
+	if i != nil {
+		i.Reserved[RDMALocalConnectionIDIndex] = connectionID
+	}
+}
+
 type RDMARemoteInfo struct {
 	ABIVersion uint32
 	Flags      uint32
@@ -116,11 +134,51 @@ type RDMARemoteInfo struct {
 	Reserved   [8]uint64
 }
 
+func (i RDMARemoteInfo) ConnectionID() uint64 {
+	return i.Reserved[RDMARemoteConnectionIDIndex]
+}
+
+func (i *RDMARemoteInfo) SetConnectionID(connectionID uint64) {
+	if i != nil {
+		i.Reserved[RDMARemoteConnectionIDIndex] = connectionID
+	}
+}
+
 type RDMADataDesc struct {
 	RemoteAddr uint64
 	RKey       uint32
 	Length     uint32
 	Reserved   [4]uint64
+}
+
+func (d RDMADataDesc) LeaseID() uint64 {
+	return d.Reserved[RDMADescLeaseIDIndex]
+}
+
+func (d *RDMADataDesc) SetLeaseID(leaseID uint64) {
+	if d != nil {
+		d.Reserved[RDMADescLeaseIDIndex] = leaseID
+	}
+}
+
+func (d RDMADataDesc) ConnectionID() uint64 {
+	return d.Reserved[RDMADescConnectionIDIndex]
+}
+
+func (d *RDMADataDesc) SetConnectionID(connectionID uint64) {
+	if d != nil {
+		d.Reserved[RDMADescConnectionIDIndex] = connectionID
+	}
+}
+
+func (d RDMADataDesc) FileOffset() uint64 {
+	return d.Reserved[RDMADescFileOffsetIndex]
+}
+
+func (d *RDMADataDesc) SetFileOffset(offset uint64) {
+	if d != nil {
+		d.Reserved[RDMADescFileOffsetIndex] = offset
+	}
 }
 
 type RDMAWriteCommitEntry struct {
