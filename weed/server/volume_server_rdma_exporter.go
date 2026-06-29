@@ -22,7 +22,7 @@ var (
 )
 
 const (
-	defaultVolumeRdmaReadMaxSize    = 16 << 20
+	defaultVolumeRdmaReadMaxSize    = 64 << 20
 	defaultVolumeRdmaReadLeaseTTL   = 30 * time.Second
 	defaultVolumeRdmaReadBufferSize = 1 << 20
 )

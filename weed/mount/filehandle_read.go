@@ -14,7 +14,7 @@ const (
 	rdmaReadAheadChunkCount    = 8
 	rdmaReadAheadMaxChunks     = 256
 	rdmaReadAheadMaxBytes      = 512 << 20
-	rdmaReadAheadMaxChunkBytes = 16 << 20
+	rdmaReadAheadMaxChunkBytes = 64 << 20
 )
 
 func (fh *FileHandle) lockForRead(startOffset int64, size int) {

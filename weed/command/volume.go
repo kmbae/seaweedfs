@@ -138,7 +138,7 @@ func init() {
 	v.rdmaDevice = cmdVolume.Flag.String("volume.rdma.device", "auto", "<experimental> RDMA device name for embedded native volume RDMA")
 	v.rdmaPort = cmdVolume.Flag.Int("volume.rdma.port", 1, "<experimental> RDMA HCA port for embedded native volume RDMA")
 	v.rdmaGIDIndex = cmdVolume.Flag.Int("volume.rdma.gidIndex", 0, "<experimental> RDMA GID index for embedded native volume RDMA")
-	v.rdmaReadMaxSizeMB = cmdVolume.Flag.Int("volume.rdma.readMaxSizeMB", 16, "<experimental> max native volume RDMA read descriptor size in MiB")
+	v.rdmaReadMaxSizeMB = cmdVolume.Flag.Int("volume.rdma.readMaxSizeMB", 64, "<experimental> max native volume RDMA read descriptor size in MiB")
 	v.rdmaReadLeaseTTL = cmdVolume.Flag.Duration("volume.rdma.readLeaseTTL", 30*time.Second, "<experimental> native volume RDMA read lease TTL")
 	v.rdmaReadBufferSizeMB = cmdVolume.Flag.Int("volume.rdma.readBufferSizeMB", 1, "<experimental> buffer size used while filling native volume RDMA read leases in MiB")
 	v.debug = cmdVolume.Flag.Bool("debug", false, "serves runtime profiling data via pprof on the port specified by -debug.port")
