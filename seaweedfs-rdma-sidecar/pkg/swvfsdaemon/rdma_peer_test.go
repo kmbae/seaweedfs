@@ -149,6 +149,28 @@ func TestRDMALocalEndpointFromInfo(t *testing.T) {
 	}
 }
 
+func TestRDMALocalEndpointReadyForConnectByLinkLayer(t *testing.T) {
+	ib := RDMALocalEndpointFromInfo(readyInfo(7, 11, 13))
+	if !ib.ReadyForConnect() {
+		t.Fatalf("InfiniBand endpoint should be ready: %+v", ib)
+	}
+	ib.LID = 0
+	if ib.ReadyForConnect() {
+		t.Fatalf("InfiniBand endpoint without LID should not be ready: %+v", ib)
+	}
+
+	roceInfo := readyInfo(0, 12, 14)
+	roceInfo.LinkLayer = swvfsproto.RDMALinkEthernet
+	roce := RDMALocalEndpointFromInfo(roceInfo)
+	if !roce.ReadyForConnect() {
+		t.Fatalf("RoCE endpoint with GID should be ready without LID: %+v", roce)
+	}
+	roce.GID = ""
+	if roce.ReadyForConnect() {
+		t.Fatalf("RoCE endpoint without GID should not be ready: %+v", roce)
+	}
+}
+
 func TestRDMALocalEndpointRemoteInfo(t *testing.T) {
 	endpoint := RDMALocalEndpointFromInfo(readyInfo(7, 11, 13))
 	remote, err := endpoint.RemoteInfo(3)

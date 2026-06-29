@@ -90,12 +90,21 @@ func RDMALocalEndpointFromInfo(info swvfsproto.RDMALocalInfo) RDMALocalEndpoint 
 }
 
 func (e RDMALocalEndpoint) ReadyForConnect() bool {
-	return e.ABIVersion == swvfsproto.RDMAABIVersion &&
-		e.KernelEnabled &&
-		e.EndpointReady &&
-		e.QPNum != 0 &&
-		e.PSN <= 0x00ffffff &&
-		e.LID != 0
+	if e.ABIVersion != swvfsproto.RDMAABIVersion ||
+		!e.KernelEnabled ||
+		!e.EndpointReady ||
+		e.QPNum == 0 ||
+		e.PSN > 0x00ffffff {
+		return false
+	}
+	switch e.LinkLayer {
+	case swvfsproto.RDMALinkInfiniBand:
+		return e.LID != 0
+	case swvfsproto.RDMALinkEthernet:
+		return e.GID != ""
+	default:
+		return e.LID != 0 || e.GID != ""
+	}
 }
 
 func (e RDMALocalEndpoint) PeerKey() string {
