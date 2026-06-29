@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,6 +26,27 @@ var ErrorSizeMismatch = errors.New("size mismatch")
 // affecting several replicas at once does not cascade into removal of
 // the last healthy copy.
 const IoErrorTolerance = 3
+
+type NeedleDataStreamBatchEntry struct {
+	NeedleID  NeedleId
+	Cookie    Cookie
+	DataSize  uint64
+	WriteData func(io.Writer) error
+}
+
+type NeedleDataStreamBatchResult struct {
+	Offset uint64
+	Size   Size
+	Err    error
+}
+
+type needleDataStreamReservation struct {
+	index      int
+	entry      NeedleDataStreamBatchEntry
+	offset     uint64
+	size       Size
+	appendAtNs uint64
+}
 
 func (v *Volume) checkReadWriteError(err error) {
 	if err == nil {
@@ -429,4 +451,144 @@ func (v *Volume) WriteNeedleDataStream(needleId NeedleId, cookie Cookie, dataSiz
 	}
 
 	return err
+}
+
+func (v *Volume) WriteNeedleDataStreamBatch(entries []NeedleDataStreamBatchEntry) []NeedleDataStreamBatchResult {
+	results := make([]NeedleDataStreamBatchResult, len(entries))
+	if len(entries) == 0 {
+		return results
+	}
+
+	v.dataFileAccessLock.Lock()
+	defer v.dataFileAccessLock.Unlock()
+
+	startOffset, _, err := v.DataBackend.GetStat()
+	if err != nil {
+		for i := range results {
+			results[i].Err = fmt.Errorf("get current volume position: %w", err)
+		}
+		v.checkReadWriteError(err)
+		return results
+	}
+
+	nextOffset := uint64(startOffset)
+	lastAppendAtNs := v.lastAppendAtNs
+	reservations := make([]needleDataStreamReservation, 0, len(entries))
+	for i, entry := range entries {
+		if entry.WriteData == nil {
+			results[i].Err = fmt.Errorf("nil needle data stream writer")
+			continue
+		}
+		size, actualSize, err := needle.NeedleDataStreamSize(entry.DataSize, v.Version())
+		if err != nil {
+			results[i].Err = err
+			continue
+		}
+		if uint64(actualSize) > MaxPossibleVolumeSize-nextOffset {
+			results[i].Err = fmt.Errorf("volume size limit %d exceeded! current offset is %d", MaxPossibleVolumeSize, nextOffset)
+			continue
+		}
+
+		nv, ok := v.nm.Get(entry.NeedleID)
+		if ok && !nv.Size.IsDeleted() {
+			existingNeedle, _, _, existingNeedleReadErr := needle.ReadNeedleHeader(v.DataBackend, v.Version(), nv.Offset.ToActualOffset())
+			if existingNeedleReadErr != nil {
+				results[i].Err = fmt.Errorf("reading existing needle: %w", existingNeedleReadErr)
+				continue
+			}
+			if existingNeedle.Cookie != entry.Cookie {
+				results[i].Err = fmt.Errorf("mismatching cookie %x", entry.Cookie)
+				continue
+			}
+		}
+
+		appendAtNs := needle.GetAppendAtNs(lastAppendAtNs)
+		lastAppendAtNs = appendAtNs
+		results[i].Offset = nextOffset
+		results[i].Size = size
+		reservations = append(reservations, needleDataStreamReservation{
+			index:      i,
+			entry:      entry,
+			offset:     nextOffset,
+			size:       size,
+			appendAtNs: appendAtNs,
+		})
+		nextOffset += uint64(actualSize)
+	}
+
+	if len(reservations) == 0 {
+		return results
+	}
+	if err := v.DataBackend.Truncate(int64(nextOffset)); err != nil {
+		for _, reservation := range reservations {
+			results[reservation.index].Err = fmt.Errorf("reserve volume write range: %w", err)
+		}
+		v.checkReadWriteError(err)
+		return results
+	}
+
+	var wg sync.WaitGroup
+	for _, reservation := range reservations {
+		reservation := reservation
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, err := needle.WriteNeedleDataStreamAt(
+				v.DataBackend,
+				reservation.offset,
+				reservation.entry.NeedleID,
+				reservation.entry.Cookie,
+				reservation.entry.DataSize,
+				uint64(time.Now().Unix()),
+				reservation.appendAtNs,
+				v.Version(),
+				reservation.entry.WriteData,
+			)
+			if err != nil {
+				results[reservation.index].Err = fmt.Errorf("write reserved needle stream: %w", err)
+			}
+		}()
+	}
+	wg.Wait()
+
+	var firstWriteErr error
+	for _, reservation := range reservations {
+		if results[reservation.index].Err != nil {
+			firstWriteErr = results[reservation.index].Err
+			break
+		}
+	}
+	if firstWriteErr != nil {
+		if truncateErr := v.DataBackend.Truncate(startOffset); truncateErr != nil {
+			firstWriteErr = fmt.Errorf("%w; rollback truncate failed: %v", firstWriteErr, truncateErr)
+		}
+		for _, reservation := range reservations {
+			if results[reservation.index].Err == nil {
+				results[reservation.index].Err = fmt.Errorf("reserved write batch rolled back: %w", firstWriteErr)
+			}
+		}
+		v.checkReadWriteError(firstWriteErr)
+		return results
+	}
+
+	v.lastAppendAtNs = lastAppendAtNs
+	for _, reservation := range reservations {
+		nv, ok := v.nm.Get(reservation.entry.NeedleID)
+		if !ok || uint64(nv.Offset.ToActualOffset()) < reservation.offset {
+			if err := v.nm.Put(reservation.entry.NeedleID, ToOffset(int64(reservation.offset)), reservation.size); err != nil {
+				glog.V(4).Infof("failed to put in needle map %d: %v", reservation.entry.NeedleID, err)
+				results[reservation.index].Err = err
+			}
+		}
+	}
+
+	var firstCommitErr error
+	for _, reservation := range reservations {
+		if results[reservation.index].Err != nil {
+			firstCommitErr = results[reservation.index].Err
+			break
+		}
+	}
+	v.checkReadWriteError(firstCommitErr)
+	return results
 }

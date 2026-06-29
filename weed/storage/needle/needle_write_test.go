@@ -2,6 +2,7 @@ package needle
 
 import (
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"testing"
@@ -135,6 +136,36 @@ func TestWriteNeedleDataStreamRoundTrip(t *testing.T) {
 	}
 }
 
+func TestWriteNeedleDataStreamAtRoundTrip(t *testing.T) {
+	prefix := []byte("reserved-prefix")
+	payload := []byte("reserved rdma payload")
+	for _, version := range []Version{Version1, Version2, Version3} {
+		t.Run(versionString(version), func(t *testing.T) {
+			buf := bytes.NewBuffer(append([]byte(nil), prefix...))
+			writer := &mockBackendWriter{buf: buf}
+
+			size, err := WriteNeedleDataStreamAt(writer, uint64(len(prefix)), 321, 654, uint64(len(payload)), 0xabc, 0xdef, version, func(w io.Writer) error {
+				_, err := w.Write(payload)
+				return err
+			})
+			if err != nil {
+				t.Fatalf("WriteNeedleDataStreamAt: %v", err)
+			}
+
+			decoded := new(Needle)
+			if err := decoded.ReadBytes(buf.Bytes()[len(prefix):], int64(len(prefix)), size, version); err != nil {
+				t.Fatalf("ReadBytes: %v", err)
+			}
+			if decoded.Id != 321 || decoded.Cookie != 654 || !bytes.Equal(decoded.Data, payload) {
+				t.Fatalf("decoded = id:%d cookie:%d data:%q", decoded.Id, decoded.Cookie, decoded.Data)
+			}
+			if version == Version3 && decoded.AppendAtNs != 0xdef {
+				t.Fatalf("decoded append timestamp = %#x", decoded.AppendAtNs)
+			}
+		})
+	}
+}
+
 func versionString(v Version) string {
 	switch v {
 	case Version1:
@@ -201,7 +232,28 @@ type mockBackendWriter struct {
 }
 
 func (m *mockBackendWriter) WriteAt(p []byte, off int64) (n int, err error) {
-	return m.buf.Write(p)
+	if off < 0 {
+		return 0, fmt.Errorf("negative offset")
+	}
+	if int(off) > m.buf.Len() {
+		padding := make([]byte, int(off)-m.buf.Len())
+		if _, err := m.buf.Write(padding); err != nil {
+			return 0, err
+		}
+	}
+	b := m.buf.Bytes()
+	if int(off)+len(p) <= len(b) {
+		copy(b[int(off):int(off)+len(p)], p)
+		return len(p), nil
+	}
+	if int(off) < len(b) {
+		prefix := len(b) - int(off)
+		copy(b[int(off):], p[:prefix])
+		p = p[prefix:]
+		n += prefix
+	}
+	written, err := m.buf.Write(p)
+	return n + written, err
 }
 
 func (m *mockBackendWriter) GetStat() (int64, time.Time, error) {

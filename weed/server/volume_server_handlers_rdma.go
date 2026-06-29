@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/seaweedfs/seaweedfs/weed/stats"
+	"github.com/seaweedfs/seaweedfs/weed/storage"
 	"github.com/seaweedfs/seaweedfs/weed/storage/needle"
 	"github.com/seaweedfs/seaweedfs/weed/storage/types"
 )
@@ -630,17 +631,21 @@ func (vs *VolumeServer) volumeRdmaWriteCommitBatchHandler(w http.ResponseWriter,
 		}
 	}()
 
+	decodeStart := time.Now()
 	var req VolumeRdmaWriteCommitBatchRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeJsonError(w, r, http.StatusBadRequest, err)
 		return
 	}
+	recordLatency(&vs.rdmaStats.writeCommitBatchDecodeLatencyNs, decodeStart)
 	if len(req.Entries) == 0 {
 		writeJsonError(w, r, http.StatusBadRequest, fmt.Errorf("entries are required"))
 		return
 	}
 	entries = int64(len(req.Entries))
 	results := make([]volumeRdmaWriteCommitResult, len(req.Entries))
+	validEntries := make([]volumeRdmaWriteCommitBatchEntry, 0, len(req.Entries))
+	validateStart := time.Now()
 	for i, entry := range req.Entries {
 		results[i] = volumeRdmaWriteCommitResult{
 			SessionID: entry.SessionID,
@@ -653,19 +658,48 @@ func (vs *VolumeServer) volumeRdmaWriteCommitBatchHandler(w http.ResponseWriter,
 			failedEntries++
 			continue
 		}
-		fileID, err := vs.commitVolumeRdmaWriteRequest(r.Context(), reader, entry)
-		if err != nil {
-			results[i].Status = volumeRdmaWriteCommitStatus(err)
-			results[i].Error = err.Error()
-			failedEntries++
-			continue
+		validEntries = append(validEntries, volumeRdmaWriteCommitBatchEntry{Index: i, Request: entry})
+	}
+	recordLatency(&vs.rdmaStats.writeCommitBatchValidateLatencyNs, validateStart)
+
+	if len(validEntries) > 0 {
+		storageStart := time.Now()
+		vs.rdmaStats.writeCommitBatchStorageRequests.Add(1)
+		if _, ok := reader.(volumeRdmaWriteStreamTargetEndpoint); ok {
+			vs.commitVolumeRdmaWriteRequestBatch(r.Context(), reader, validEntries, results)
+		} else {
+			vs.rdmaStats.writeCommitBatchStorageFallbacks.Add(int64(len(validEntries)))
+			for _, valid := range validEntries {
+				fileID, err := vs.commitVolumeRdmaWriteRequest(r.Context(), reader, valid.Request)
+				if err != nil {
+					results[valid.Index].Status = volumeRdmaWriteCommitStatus(err)
+					results[valid.Index].Error = err.Error()
+					continue
+				}
+				results[valid.Index].FileID = fileID
+				results[valid.Index].Source = "native-volume-rdma-write-desc"
+			}
 		}
-		results[i].FileID = fileID
-		results[i].Source = "native-volume-rdma-write-desc"
-		successEntries++
-		bytesCommitted += entry.Size
+		recordLatency(&vs.rdmaStats.writeCommitBatchStorageLatencyNs, storageStart)
+	}
+
+	successEntries = 0
+	failedEntries = 0
+	bytesCommitted = 0
+	for _, result := range results {
+		if result.Status == 0 {
+			successEntries++
+			bytesCommitted += result.Size
+		} else {
+			failedEntries++
+		}
 	}
 	writeJsonQuiet(w, r, http.StatusOK, volumeRdmaWriteCommitBatchResponse{Results: results})
+}
+
+type volumeRdmaWriteCommitBatchEntry struct {
+	Index   int
+	Request VolumeRdmaWriteCommitRequest
 }
 
 func (vs *VolumeServer) volumeRdmaWriteAbortHandler(w http.ResponseWriter, r *http.Request) {
@@ -824,6 +858,85 @@ func (vs *VolumeServer) commitVolumeRdmaWriteRequest(ctx context.Context, reader
 		Cookie:   req.Cookie,
 		Size:     req.Size,
 	}, data)
+}
+
+func (vs *VolumeServer) commitVolumeRdmaWriteRequestBatch(ctx context.Context, reader volumeRdmaWriteTargetEndpoint, entries []volumeRdmaWriteCommitBatchEntry, results []volumeRdmaWriteCommitResult) {
+	if err := ctx.Err(); err != nil {
+		setVolumeRdmaWriteBatchError(results, entries, err)
+		return
+	}
+	if vs == nil || vs.store == nil {
+		setVolumeRdmaWriteBatchError(results, entries, fmt.Errorf("volume store is not configured"))
+		return
+	}
+	streamer, ok := reader.(volumeRdmaWriteStreamTargetEndpoint)
+	if !ok {
+		setVolumeRdmaWriteBatchError(results, entries, fmt.Errorf("native RDMA write stream is not configured"))
+		return
+	}
+	if err := vs.CheckMaintenanceMode(); err != nil {
+		setVolumeRdmaWriteBatchError(results, entries, err)
+		return
+	}
+
+	groups := make(map[uint32][]volumeRdmaWriteCommitBatchEntry)
+	for _, entry := range entries {
+		v := vs.store.GetVolume(needle.VolumeId(entry.Request.VolumeID))
+		if v == nil {
+			results[entry.Index].Status = volumeRdmaWriteCommitStatus(fmt.Errorf("not found volume id %d", entry.Request.VolumeID))
+			results[entry.Index].Error = fmt.Sprintf("not found volume id %d", entry.Request.VolumeID)
+			_ = reader.ReleaseSession(context.Background(), entry.Request.SessionID)
+			continue
+		}
+		groups[entry.Request.VolumeID] = append(groups[entry.Request.VolumeID], entry)
+	}
+
+	for volumeID, group := range groups {
+		v := vs.store.GetVolume(needle.VolumeId(volumeID))
+		if v == nil {
+			setVolumeRdmaWriteBatchError(results, group, fmt.Errorf("not found volume id %d", volumeID))
+			continue
+		}
+		storageEntries := make([]storage.NeedleDataStreamBatchEntry, len(group))
+		for i, item := range group {
+			req := item.Request
+			storageEntries[i] = storage.NeedleDataStreamBatchEntry{
+				NeedleID: types.NeedleId(req.NeedleID),
+				Cookie:   types.Cookie(req.Cookie),
+				DataSize: req.Size,
+				WriteData: func(w io.Writer) error {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					return streamer.ReadRegisteredBufferTo(ctx, req.SessionID, req.Size, w)
+				},
+			}
+		}
+		storageResults := v.WriteNeedleDataStreamBatch(storageEntries)
+		for i, storageResult := range storageResults {
+			item := group[i]
+			req := item.Request
+			_ = reader.ReleaseSession(context.Background(), req.SessionID)
+			if storageResult.Err != nil {
+				results[item.Index].Status = volumeRdmaWriteCommitStatus(storageResult.Err)
+				results[item.Index].Error = storageResult.Err.Error()
+				continue
+			}
+			if req.FileID != "" {
+				results[item.Index].FileID = req.FileID
+			} else {
+				results[item.Index].FileID = needle.NewFileId(needle.VolumeId(req.VolumeID), req.NeedleID, req.Cookie).String()
+			}
+			results[item.Index].Source = "native-volume-rdma-write-desc"
+		}
+	}
+}
+
+func setVolumeRdmaWriteBatchError(results []volumeRdmaWriteCommitResult, entries []volumeRdmaWriteCommitBatchEntry, err error) {
+	for _, entry := range entries {
+		results[entry.Index].Status = volumeRdmaWriteCommitStatus(err)
+		results[entry.Index].Error = err.Error()
+	}
 }
 
 func (vs *VolumeServer) writeNeedleDataFromNativeRdmaStream(ctx context.Context, req VolumeRdmaWriteRequest, writeData func(io.Writer) error) (string, error) {

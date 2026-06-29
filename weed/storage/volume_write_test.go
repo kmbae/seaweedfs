@@ -1,8 +1,10 @@
 package storage
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"testing"
 	"time"
@@ -57,6 +59,102 @@ func TestSearchVolumesWithDeletedNeedles(t *testing.T) {
 	}
 	fmt.Printf("offset: %v, isLast: %v\n", offset.ToActualOffset(), isLast)
 
+}
+
+func TestWriteNeedleDataStreamBatchRoundTrip(t *testing.T) {
+	dir := t.TempDir()
+	v, err := NewVolume(dir, dir, "", 1, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
+	if err != nil {
+		t.Fatalf("volume creation: %v", err)
+	}
+	defer v.Close()
+
+	payloads := [][]byte{
+		[]byte("first rdma batch payload"),
+		[]byte("second rdma batch payload"),
+	}
+	results := v.WriteNeedleDataStreamBatch([]NeedleDataStreamBatchEntry{
+		{
+			NeedleID: 101,
+			Cookie:   1001,
+			DataSize: uint64(len(payloads[0])),
+			WriteData: func(w io.Writer) error {
+				_, err := w.Write(payloads[0])
+				return err
+			},
+		},
+		{
+			NeedleID: 102,
+			Cookie:   1002,
+			DataSize: uint64(len(payloads[1])),
+			WriteData: func(w io.Writer) error {
+				_, err := w.Write(payloads[1])
+				return err
+			},
+		},
+	})
+	for i, result := range results {
+		if result.Err != nil {
+			t.Fatalf("result[%d] err = %v", i, result.Err)
+		}
+	}
+
+	for i, payload := range payloads {
+		n := &needle.Needle{
+			Id:     types.NeedleId(101 + i),
+			Cookie: types.Cookie(1001 + i),
+		}
+		if _, err := v.readNeedle(n, &ReadOption{}, nil); err != nil {
+			t.Fatalf("read batch needle %d: %v", i, err)
+		}
+		if !bytes.Equal(n.Data, payload) {
+			t.Fatalf("needle %d data = %q, want %q", i, n.Data, payload)
+		}
+	}
+}
+
+func TestWriteNeedleDataStreamBatchRollback(t *testing.T) {
+	dir := t.TempDir()
+	v, err := NewVolume(dir, dir, "", 1, NeedleMapInMemory, &super_block.ReplicaPlacement{}, &needle.TTL{}, 0, needle.GetCurrentVersion(), 0, 0)
+	if err != nil {
+		t.Fatalf("volume creation: %v", err)
+	}
+	defer v.Close()
+
+	startSize, _, err := v.DataBackend.GetStat()
+	if err != nil {
+		t.Fatalf("stat volume: %v", err)
+	}
+	payload := []byte("rollback payload")
+	results := v.WriteNeedleDataStreamBatch([]NeedleDataStreamBatchEntry{
+		{
+			NeedleID: 201,
+			Cookie:   2001,
+			DataSize: uint64(len(payload)),
+			WriteData: func(w io.Writer) error {
+				_, err := w.Write(payload)
+				return err
+			},
+		},
+		{
+			NeedleID: 202,
+			Cookie:   2002,
+			DataSize: uint64(len(payload)),
+			WriteData: func(w io.Writer) error {
+				return fmt.Errorf("injected batch write failure")
+			},
+		},
+	})
+	if len(results) != 2 || results[0].Err == nil || results[1].Err == nil {
+		t.Fatalf("expected both results to fail after rollback: %+v", results)
+	}
+	endSize, _, err := v.DataBackend.GetStat()
+	if err != nil {
+		t.Fatalf("stat volume after rollback: %v", err)
+	}
+	if endSize != startSize {
+		t.Fatalf("volume size after rollback = %d, want %d", endSize, startSize)
+	}
 }
 
 func isFileExist(path string) (bool, error) {

@@ -35,12 +35,17 @@ type volumeRdmaTelemetry struct {
 	writeCommitBytes     atomic.Int64
 	writeCommitLatencyNs atomic.Int64
 
-	writeCommitBatchRequests       atomic.Int64
-	writeCommitBatchEntries        atomic.Int64
-	writeCommitBatchEntrySuccesses atomic.Int64
-	writeCommitBatchEntryFailures  atomic.Int64
-	writeCommitBatchBytes          atomic.Int64
-	writeCommitBatchLatencyNs      atomic.Int64
+	writeCommitBatchRequests          atomic.Int64
+	writeCommitBatchEntries           atomic.Int64
+	writeCommitBatchEntrySuccesses    atomic.Int64
+	writeCommitBatchEntryFailures     atomic.Int64
+	writeCommitBatchBytes             atomic.Int64
+	writeCommitBatchLatencyNs         atomic.Int64
+	writeCommitBatchDecodeLatencyNs   atomic.Int64
+	writeCommitBatchValidateLatencyNs atomic.Int64
+	writeCommitBatchStorageLatencyNs  atomic.Int64
+	writeCommitBatchStorageRequests   atomic.Int64
+	writeCommitBatchStorageFallbacks  atomic.Int64
 
 	writeAbortRequests  atomic.Int64
 	writeAbortSuccesses atomic.Int64
@@ -82,12 +87,17 @@ func (s *volumeRdmaTelemetry) snapshot() map[string]int64 {
 		"write_commit_bytes":     s.writeCommitBytes.Load(),
 		"write_commit_avg_ns":    avgNs(s.writeCommitLatencyNs.Load(), s.writeCommitRequests.Load()),
 
-		"write_commit_batch_requests":        s.writeCommitBatchRequests.Load(),
-		"write_commit_batch_entries":         s.writeCommitBatchEntries.Load(),
-		"write_commit_batch_entry_successes": s.writeCommitBatchEntrySuccesses.Load(),
-		"write_commit_batch_entry_failures":  s.writeCommitBatchEntryFailures.Load(),
-		"write_commit_batch_bytes":           s.writeCommitBatchBytes.Load(),
-		"write_commit_batch_avg_ns":          avgNs(s.writeCommitBatchLatencyNs.Load(), s.writeCommitBatchRequests.Load()),
+		"write_commit_batch_requests":          s.writeCommitBatchRequests.Load(),
+		"write_commit_batch_entries":           s.writeCommitBatchEntries.Load(),
+		"write_commit_batch_entry_successes":   s.writeCommitBatchEntrySuccesses.Load(),
+		"write_commit_batch_entry_failures":    s.writeCommitBatchEntryFailures.Load(),
+		"write_commit_batch_bytes":             s.writeCommitBatchBytes.Load(),
+		"write_commit_batch_avg_ns":            avgNs(s.writeCommitBatchLatencyNs.Load(), s.writeCommitBatchRequests.Load()),
+		"write_commit_batch_decode_avg_ns":     avgNs(s.writeCommitBatchDecodeLatencyNs.Load(), s.writeCommitBatchRequests.Load()),
+		"write_commit_batch_validate_avg_ns":   avgNs(s.writeCommitBatchValidateLatencyNs.Load(), s.writeCommitBatchRequests.Load()),
+		"write_commit_batch_storage_avg_ns":    avgNs(s.writeCommitBatchStorageLatencyNs.Load(), s.writeCommitBatchStorageRequests.Load()),
+		"write_commit_batch_storage_requests":  s.writeCommitBatchStorageRequests.Load(),
+		"write_commit_batch_storage_fallbacks": s.writeCommitBatchStorageFallbacks.Load(),
 
 		"write_abort_requests":  s.writeAbortRequests.Load(),
 		"write_abort_successes": s.writeAbortSuccesses.Load(),
